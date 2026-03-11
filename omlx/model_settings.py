@@ -10,7 +10,7 @@ import logging
 import threading
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +56,7 @@ class ModelSettings:
     thinking_budget_enabled: bool = False
     thinking_budget_tokens: Optional[int] = None
     reasoning_parser: Optional[str] = None  # xgrammar builtin name: "qwen", "harmony", "llama", etc.
+    aliases: Optional[List[str]] = None  # API-visible names (alternatives to directory name)
 
     # TurboQuant KV cache (mlx-vlm backend)
     turboquant_kv_enabled: bool = False

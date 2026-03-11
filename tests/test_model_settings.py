@@ -144,24 +144,32 @@ class TestModelSettings:
         d = settings.to_dict()
         assert "ttl_seconds" not in d
 
-    def test_model_alias_default(self):
-        """Test model_alias defaults to None."""
+    def test_aliases_default(self):
+        """Test aliases defaults to None."""
         settings = ModelSettings()
-        assert settings.model_alias is None
+        assert settings.aliases is None
 
-    def test_model_alias_roundtrip(self):
-        """Test model_alias survives to_dict -> from_dict roundtrip."""
-        original = ModelSettings(model_alias="gpt-4")
+    def test_aliases_roundtrip(self):
+        """Test aliases survives to_dict -> from_dict roundtrip."""
+        original = ModelSettings(aliases=["gpt-4", "chat"])
         d = original.to_dict()
-        assert d["model_alias"] == "gpt-4"
+        assert d["aliases"] == ["gpt-4", "chat"]
         restored = ModelSettings.from_dict(d)
-        assert restored.model_alias == "gpt-4"
+        assert restored.aliases == ["gpt-4", "chat"]
 
-    def test_model_alias_excluded_when_none(self):
-        """Test model_alias excluded from to_dict when None."""
+    def test_aliases_single_roundtrip(self):
+        """Test aliases with a single entry survives roundtrip."""
+        original = ModelSettings(aliases=["gpt-4"])
+        d = original.to_dict()
+        assert d["aliases"] == ["gpt-4"]
+        restored = ModelSettings.from_dict(d)
+        assert restored.aliases == ["gpt-4"]
+
+    def test_aliases_excluded_when_none(self):
+        """Test aliases excluded from to_dict when None."""
         settings = ModelSettings()
         d = settings.to_dict()
-        assert "model_alias" not in d
+        assert "aliases" not in d
 
     def test_model_type_override_default(self):
         """Test model_type_override defaults to None."""
@@ -360,31 +368,31 @@ class TestModelSettingsManager:
             assert loaded.forced_ct_kwargs == ["enable_thinking"]
             assert loaded.chat_template_kwargs == {"enable_thinking": False}
 
-    def test_model_alias_persist(self):
-        """Test model_alias survives save/load cycle."""
+    def test_aliases_persist(self):
+        """Test aliases survives save/load cycle."""
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = ModelSettingsManager(Path(tmpdir))
 
-            settings = ModelSettings(model_alias="my-model")
+            settings = ModelSettings(aliases=["my-model", "alt-name"])
             manager.set_settings("test-model", settings)
 
             manager2 = ModelSettingsManager(Path(tmpdir))
             loaded = manager2.get_settings("test-model")
-            assert loaded.model_alias == "my-model"
+            assert loaded.aliases == ["my-model", "alt-name"]
 
-    def test_model_alias_clear(self):
-        """Test clearing model_alias by setting to None."""
+    def test_aliases_clear(self):
+        """Test clearing aliases by setting to None."""
         with tempfile.TemporaryDirectory() as tmpdir:
             manager = ModelSettingsManager(Path(tmpdir))
 
-            settings = ModelSettings(model_alias="my-model")
+            settings = ModelSettings(aliases=["my-model"])
             manager.set_settings("test-model", settings)
-            assert manager.get_settings("test-model").model_alias == "my-model"
+            assert manager.get_settings("test-model").aliases == ["my-model"]
 
-            settings = ModelSettings(model_alias=None)
+            settings = ModelSettings(aliases=None)
             manager.set_settings("test-model", settings)
             loaded = manager.get_settings("test-model")
-            assert loaded.model_alias is None
+            assert loaded.aliases is None
 
     def test_model_type_override_persist(self):
         """Test model_type_override survives save/load cycle."""

@@ -69,6 +69,9 @@ grammar = [
     # Grammar-constrained decoding for structured output (requires torch ~2GB)
     "xgrammar>=0.1.32",
 ]
+# audio: mlx-audio>=0.4.0 is required for ASR/TTS engines.
+# Not listed here due to transitive dependency conflict with transformers.
+# Install separately: pip install mlx-audio>=0.4.0
 mcp = [
     "mcp>=1.0.0",
 ]

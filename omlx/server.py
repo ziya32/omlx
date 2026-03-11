@@ -111,6 +111,11 @@ from .api.embedding_utils import (
     truncate_embedding,
     normalize_input,
 )
+from .api.audio_models import (
+    SpeakersResponse,
+    SpeechRequest,
+    TranscriptionResponse,
+)
 from .api.rerank_models import (
     RerankRequest,
     RerankResponse,
@@ -152,8 +157,11 @@ from .api.tool_calling import (
 from .api.thinking import ThinkingParser, extract_thinking
 from .api.utils import clean_output_text, clean_special_tokens, extract_multimodal_content, extract_text_content
 from .engine import BaseEngine, BatchedEngine, VLMBatchedEngine
+from .engine.asr import ASREngine
 from .engine.embedding import EmbeddingEngine
+from .engine.llm_reranker import LLMRerankerEngine
 from .engine.reranker import RerankerEngine
+from .engine.tts import TTSEngine
 from .engine_pool import EnginePool
 from .exceptions import (
     EnginePoolError,
@@ -184,6 +192,8 @@ class EngineType(Enum):
     LLM = "llm"
     EMBEDDING = "embedding"
     RERANKER = "reranker"
+    ASR = "asr"
+    TTS = "tts"
 
 
 @dataclass
@@ -658,11 +668,23 @@ async def get_engine(
                 f"Use /v1/chat/completions for LLM models."
             )
     elif engine_type == EngineType.RERANKER:
-        if not isinstance(engine, RerankerEngine):
+        if not isinstance(engine, (RerankerEngine, LLMRerankerEngine)):
             raise HTTPException(
                 status_code=400,
                 detail=f"Model '{model_id}' is not a reranker model. "
-                f"Use a SequenceClassification model for reranking."
+                f"Use a SequenceClassification or LLM reranker model."
+            )
+    elif engine_type == EngineType.ASR:
+        if not isinstance(engine, ASREngine):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Model '{model_id}' is not an ASR model."
+            )
+    elif engine_type == EngineType.TTS:
+        if not isinstance(engine, TTSEngine):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Model '{model_id}' is not a TTS model."
             )
 
     return engine
@@ -704,11 +726,13 @@ async def get_embedding_engine(model: str) -> EmbeddingEngine:
     return await get_engine(model, EngineType.EMBEDDING)
 
 
-async def get_reranker_engine(model: str) -> RerankerEngine:
+async def get_reranker_engine(model: str) -> RerankerEngine | LLMRerankerEngine:
     """
     Get reranker engine for the specified model.
 
     This is a convenience wrapper around get_engine() for reranker models.
+    Returns either a RerankerEngine (classification-based) or LLMRerankerEngine
+    (generative, prefill_only logits mode).
 
     Args:
         model: Model ID to get engine for
@@ -720,6 +744,16 @@ async def get_reranker_engine(model: str) -> RerankerEngine:
         HTTPException: If model not found, is not a reranker model, or memory error
     """
     return await get_engine(model, EngineType.RERANKER)
+
+
+async def get_asr_engine(model: str) -> ASREngine:
+    """Get ASR engine for the specified model."""
+    return await get_engine(model, EngineType.ASR)
+
+
+async def get_tts_engine(model: str) -> TTSEngine:
+    """Get TTS engine for the specified model."""
+    return await get_engine(model, EngineType.TTS)
 
 
 def get_sampling_params(
@@ -1060,7 +1094,8 @@ def init_server(
     logger.info(f"CORS origins: {cors_origins}")
 
     # Initialize model settings manager
-    base_path = Path(global_settings.base_path) if global_settings else Path(model_dir)
+    _first_dir = model_dirs if isinstance(model_dirs, str) else model_dirs[0]
+    base_path = Path(global_settings.base_path) if global_settings else Path(_first_dir)
     _server_state.settings_manager = ModelSettingsManager(base_path)
 
     # Get pinned models from settings file only (managed via admin page)
@@ -1436,17 +1471,18 @@ async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
         settings_manager = _server_state.settings_manager
         for m in status["models"]:
             model_id = m["id"]
-            display_id = model_id
+            display_ids = [model_id]
             if settings_manager:
                 ms = settings_manager.get_settings(model_id)
-                if ms.model_alias:
-                    display_id = ms.model_alias
-            models.append(
-                ModelInfo(
-                    id=display_id,
-                    owned_by="omlx",
+                if ms.aliases:
+                    display_ids = ms.aliases
+            for display_id in display_ids:
+                models.append(
+                    ModelInfo(
+                        id=display_id,
+                        owned_by="omlx",
+                    )
                 )
-            )
 
     return ModelsResponse(data=models)
 
@@ -1677,6 +1713,145 @@ async def create_rerank(
         results=results,
         model=request.model,
         usage=RerankUsage(total_tokens=output.total_tokens),
+    )
+
+
+# =============================================================================
+# Audio Endpoints (ASR + TTS)
+# =============================================================================
+
+
+@app.post("/v1/audio/transcriptions")
+async def create_transcription(
+    http_request: FastAPIRequest,
+    _: bool = Depends(verify_api_key),
+) -> TranscriptionResponse:
+    """
+    Transcribe audio to text.
+
+    OpenAI-compatible endpoint for audio transcription (ASR).
+
+    Accepts multipart/form-data with:
+    - file: audio file (wav, mp3, m4a, etc.)
+    - model: model ID (e.g., "Qwen3-ASR-1.7B-bf16")
+    - language: ISO language code or "auto" (default)
+    """
+    import tempfile
+
+    form = await http_request.form()
+    audio_file = form.get("file")
+    model = form.get("model")
+    language = form.get("language", "auto")
+
+    if audio_file is None:
+        raise HTTPException(status_code=400, detail="Audio file is required")
+    if model is None:
+        raise HTTPException(status_code=400, detail="Model is required")
+
+    engine = await get_asr_engine(str(model))
+
+    # Write uploaded file to temp path for mlx_audio
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        content = await audio_file.read()
+        tmp.write(content)
+        tmp_path = tmp.name
+
+    try:
+        start_time = time.perf_counter()
+        output = await engine.transcribe(tmp_path, language=str(language))
+        elapsed = time.perf_counter() - start_time
+
+        logger.info(
+            f"Transcription: {elapsed:.3f}s, "
+            f"language={output.language}, "
+            f"duration={output.duration}s"
+        )
+
+        return TranscriptionResponse(
+            text=output.text,
+            language=output.language,
+            duration=output.duration,
+        )
+    finally:
+        import os
+        os.unlink(tmp_path)
+
+
+@app.post("/v1/audio/speech")
+async def create_speech(
+    request: SpeechRequest,
+    _: bool = Depends(verify_api_key),
+):
+    """
+    Generate speech from text.
+
+    OpenAI-compatible endpoint for text-to-speech (TTS).
+
+    For CustomVoice models:
+    - voice: preset speaker name (e.g., "ryan", "vivian")
+    - instructions: emotional/tonal control (e.g., "Speak warmly")
+
+    For VoiceDesign models:
+    - voice: ignored
+    - instructions: voice description (e.g., "A warm female narrator")
+
+    Returns binary WAV audio (24 kHz).
+    """
+    engine = await get_tts_engine(request.model)
+
+    start_time = time.perf_counter()
+
+    output = await engine.synthesize(
+        text=request.input,
+        speaker=request.voice if request.voice != "default" else None,
+        instruct=request.instructions,
+    )
+
+    elapsed = time.perf_counter() - start_time
+    logger.info(
+        f"Speech: {elapsed:.3f}s, "
+        f"duration={output.duration:.2f}s, "
+        f"sample_rate={output.sample_rate}"
+    )
+
+    return StreamingResponse(
+        iter([output.audio_bytes]),
+        media_type="audio/wav",
+        headers={
+            "Content-Disposition": "attachment; filename=speech.wav",
+        },
+    )
+
+
+@app.get("/v1/audio/speakers")
+async def list_speakers(
+    model: str | None = None,
+    _: bool = Depends(verify_api_key),
+) -> SpeakersResponse:
+    """
+    List available TTS speakers for a CustomVoice model.
+
+    Returns an empty list for VoiceDesign models (use instructions instead).
+    """
+    if model is None:
+        # Try to find any loaded TTS model
+        pool = get_engine_pool()
+        for mid, entry in pool._entries.items():
+            if entry.engine_type == "tts" and entry.engine is not None:
+                model = mid
+                break
+        if model is None:
+            raise HTTPException(
+                status_code=400,
+                detail="No TTS model specified and none currently loaded"
+            )
+
+    engine = await get_tts_engine(model)
+    speakers = engine.get_speakers()
+
+    return SpeakersResponse(
+        speakers=speakers,
+        languages=[],
     )
 
 

@@ -85,7 +85,7 @@
             showModelSettingsModal: false,
             selectedModel: null,
             modelSettings: {
-                model_alias: '',
+                aliases: '',
                 model_type_override: '',
                 max_context_window: null,
                 max_tokens: null,
@@ -901,7 +901,7 @@
                 }
                 const isOcr = OCR_CONFIG_MODEL_TYPES.has(model.config_model_type || '');
                 this.modelSettings = {
-                    model_alias: settings.model_alias || '',
+                    aliases: (settings.aliases || []).join(', '),
                     model_type_override: settings.model_type_override || '',
                     max_context_window: settings.max_context_window || null,
                     max_tokens: settings.max_tokens || null,
@@ -961,7 +961,7 @@
                                 }
                             }
                             return {
-                                model_alias: this.modelSettings.model_alias?.trim() || null,
+                                aliases: this.modelSettings.aliases?.trim() ? this.modelSettings.aliases.split(',').map(s => s.trim()).filter(Boolean) : null,
                                 model_type_override: this.modelSettings.model_type_override || null,
                                 max_context_window: this.modelSettings.max_context_window || null,
                                 max_tokens: this.modelSettings.max_tokens || null,

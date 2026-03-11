@@ -448,3 +448,52 @@ class TestRequestOutput:
         )
         assert output.tool_calls == tool_calls
         assert len(output.tool_calls) == 2
+
+    def test_last_logits(self):
+        """Test RequestOutput with last_logits for prefill_only mode."""
+        logits = [0.1, 0.2, 0.3, 0.4]
+        output = RequestOutput(
+            request_id="test-007",
+            last_logits=logits,
+            finished=True,
+            finish_reason="length",
+        )
+        assert output.last_logits == logits
+        assert len(output.last_logits) == 4
+
+    def test_last_logits_default_none(self):
+        """Test RequestOutput defaults last_logits to None."""
+        output = RequestOutput(request_id="test-008")
+        assert output.last_logits is None
+
+
+class TestPrefillOnly:
+    """Test cases for prefill_only mode in SamplingParams."""
+
+    def test_prefill_only_defaults(self):
+        """Test default prefill_only values."""
+        params = SamplingParams()
+        assert params.prefill_only is False
+        assert params.prefill_output == ""
+
+    def test_prefill_only_logits(self):
+        """Test prefill_only with logits output."""
+        params = SamplingParams(
+            max_tokens=1,
+            prefill_only=True,
+            prefill_output="logits",
+        )
+        assert params.prefill_only is True
+        assert params.prefill_output == "logits"
+        assert params.max_tokens == 1
+
+    def test_prefill_only_with_temperature_zero(self):
+        """Test prefill_only with greedy sampling (typical for reranking)."""
+        params = SamplingParams(
+            max_tokens=1,
+            temperature=0.0,
+            prefill_only=True,
+            prefill_output="logits",
+        )
+        assert params.temperature == 0.0
+        assert params.prefill_only is True

@@ -9,7 +9,7 @@ These models define the request and response schemas for:
 
 from typing import List, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class AudioTranscriptionRequest(BaseModel):
@@ -46,3 +46,13 @@ class AudioProcessRequest(BaseModel):
     """
 
     model: str
+
+
+class SpeakersResponse(BaseModel):
+    """Response listing available TTS speakers."""
+
+    speakers: list[str] = Field(default_factory=list)
+    """List of available speaker names."""
+
+    languages: list[str] = Field(default_factory=list)
+    """List of supported languages."""

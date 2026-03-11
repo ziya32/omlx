@@ -39,6 +39,19 @@ pytestmark = [
     ),
 ]
 
+# Cap Metal memory to 75% of physical RAM so runaway tests cannot OOM.
+# (Also set in top-level conftest.py, but repeated here for standalone runs.)
+try:
+    import mlx.core as mx
+    _total_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    mx.metal.set_memory_limit(int(_total_bytes * 0.75))
+except Exception:
+    pass
+
+# Maximum model size (bytes) we are willing to load in tests.
+# Prevents accidentally picking an 18 GB+ model when smaller ones exist.
+_MAX_TEST_MODEL_SIZE_GB = 6
+
 
 def get_test_model_dir() -> Optional[Path]:
     """Get the model directory for testing."""
@@ -48,6 +61,7 @@ def get_test_model_dir() -> Optional[Path]:
 
     # Try common locations
     common_paths = [
+        Path.home() / ".myemee" / "models",
         Path.home() / "Workspace" / "models",
         Path.home() / "models",
         Path("/opt/models"),
@@ -60,13 +74,26 @@ def get_test_model_dir() -> Optional[Path]:
     return None
 
 
+def _estimate_model_size_gb(model_path: Path) -> float:
+    """Estimate model weight size in GB by summing *.safetensors files."""
+    total = sum(f.stat().st_size for f in model_path.glob("*.safetensors"))
+    if total == 0:
+        # Fallback: sum *.bin (PyTorch) or *.gguf files
+        total = sum(f.stat().st_size for f in model_path.glob("*.bin"))
+        total += sum(f.stat().st_size for f in model_path.glob("*.gguf"))
+    return total / (1024**3)
+
+
 def find_test_model(model_dir: Path) -> Optional[Path]:
     """Find a test model in the model directory.
 
     Priority:
     1. OMLX_TEST_MODEL env var (absolute path or model name)
     2. Preferred small models for faster testing
-    3. Any model with config.json
+    3. Any model with config.json that is under _MAX_TEST_MODEL_SIZE_GB
+
+    Models larger than _MAX_TEST_MODEL_SIZE_GB are skipped in auto-discovery
+    to prevent OOM crashes. Set OMLX_TEST_MODEL to override.
     """
     # Check for specific model via environment variable
     if test_model := os.environ.get("OMLX_TEST_MODEL"):
@@ -97,11 +124,13 @@ def find_test_model(model_dir: Path) -> Optional[Path]:
         "*SmolLM*",  # Very small model
         "*Qwen*0.5B*",
         "*Qwen*1.5B*",
+        "*Reranker*0.6B*",  # Qwen3-Reranker-0.6B (~1.2 GB, valid causal LM)
         "*TinyLlama*",
         "*Llama*1B*",
         "*Llama*3B*4bit*",
         "*Phi*mini*",
         "*Gemma*2B*",
+        "*Nanbeige*3B*",  # Nanbeige4.1-3B-bf16
     ]
 
     for pattern in preferred_patterns:
@@ -112,10 +141,18 @@ def find_test_model(model_dir: Path) -> Optional[Path]:
                 if (match / "config.json").exists():
                     return match
 
-    # Fall back to any model with config.json
-    for subdir in model_dir.iterdir():
+    # Fall back to any model with config.json, but skip models that are too large
+    candidates = []
+    for subdir in sorted(model_dir.iterdir()):
         if subdir.is_dir() and (subdir / "config.json").exists():
-            return subdir
+            size_gb = _estimate_model_size_gb(subdir)
+            if size_gb <= _MAX_TEST_MODEL_SIZE_GB:
+                candidates.append((size_gb, subdir))
+
+    if candidates:
+        # Pick the smallest model to minimise memory pressure
+        candidates.sort(key=lambda x: x[0])
+        return candidates[0][1]
 
     return None
 
@@ -138,42 +175,48 @@ def test_model_path(model_dir: Path) -> Path:
     return path
 
 
+@pytest.fixture(scope="module")
+def loaded_model(test_model_path: Path):
+    """Module-scoped loaded MLXLanguageModel — shared across all tests.
+
+    Loading a model is expensive (~2-5 s + GB of Metal memory).  Re-using a
+    single instance avoids accumulating duplicate copies that caused OOM
+    crashes when every test method loaded its own.
+    """
+    from omlx.models.llm import MLXLanguageModel
+
+    model = MLXLanguageModel(str(test_model_path))
+    model.load()
+    yield model
+    del model
+    gc.collect()
+    try:
+        import mlx.core as _mx
+        _mx.metal.clear_cache()
+    except Exception:
+        pass
+
+
 class TestMLXLanguageModel:
     """Tests for MLXLanguageModel with real models."""
 
-    def test_model_loading(self, test_model_path: Path):
+    def test_model_loading(self, loaded_model):
         """Test that model loads correctly."""
-        from omlx.models.llm import MLXLanguageModel
+        assert loaded_model._loaded is True
+        assert loaded_model.model is not None
+        assert loaded_model.tokenizer is not None
 
-        model = MLXLanguageModel(str(test_model_path))
-        model.load()
-
-        assert model._loaded is True
-        assert model.model is not None
-        assert model.tokenizer is not None
-
-        # Check model info
-        info = model.get_model_info()
+        info = loaded_model.get_model_info()
         assert info["loaded"] is True
-        # vocab_size may not be present for all model types
         if "vocab_size" in info:
             assert info["vocab_size"] > 0
 
-        # Cleanup
-        del model
-        gc.collect()
-
-    def test_basic_generation(self, test_model_path: Path):
+    def test_basic_generation(self, loaded_model):
         """Test basic text generation."""
-        from omlx.models.llm import MLXLanguageModel
-
-        model = MLXLanguageModel(str(test_model_path))
-        model.load()
-
-        output = model.generate(
+        output = loaded_model.generate(
             prompt="The capital of France is",
             max_tokens=10,
-            temperature=0.0,  # Greedy for deterministic output
+            temperature=0.0,
         )
 
         assert output.text is not None
@@ -181,19 +224,10 @@ class TestMLXLanguageModel:
         assert len(output.tokens) > 0
         assert output.finish_reason in ("stop", "length")
 
-        # Cleanup
-        del model
-        gc.collect()
-
-    def test_streaming_generation(self, test_model_path: Path):
+    def test_streaming_generation(self, loaded_model):
         """Test streaming text generation."""
-        from omlx.models.llm import MLXLanguageModel
-
-        model = MLXLanguageModel(str(test_model_path))
-        model.load()
-
         chunks: List[str] = []
-        for output in model.stream_generate(
+        for output in loaded_model.stream_generate(
             prompt="Hello, my name is",
             max_tokens=20,
             temperature=0.7,
@@ -207,22 +241,13 @@ class TestMLXLanguageModel:
         full_text = "".join(chunks)
         assert len(full_text) > 0
 
-        # Cleanup
-        del model
-        gc.collect()
-
-    def test_chat_completion(self, test_model_path: Path):
+    def test_chat_completion(self, loaded_model):
         """Test chat completion with message format."""
-        from omlx.models.llm import MLXLanguageModel
-
-        model = MLXLanguageModel(str(test_model_path))
-        model.load()
-
         messages = [
             {"role": "user", "content": "What is 2 + 2?"}
         ]
 
-        output = model.chat(
+        output = loaded_model.chat(
             messages=messages,
             max_tokens=50,
             temperature=0.0,
@@ -230,30 +255,16 @@ class TestMLXLanguageModel:
 
         assert output.text is not None
         assert len(output.text) > 0
-        # Model should mention "4" somewhere in response
-        # (This is a weak check, but tests the flow)
 
-        # Cleanup
-        del model
-        gc.collect()
-
-    def test_utf8_generation_cjk(self, test_model_path: Path):
+    def test_utf8_generation_cjk(self, loaded_model):
         """Test UTF-8 streaming for CJK characters."""
-        from omlx.models.llm import MLXLanguageModel
-
-        model = MLXLanguageModel(str(test_model_path))
-        model.load()
-
-        # Use a prompt that should elicit CJK output
-        # (Results depend on model, but tests UTF-8 handling)
         chunks: List[str] = []
-        for output in model.stream_generate(
+        for output in loaded_model.stream_generate(
             prompt="Translate to Japanese: Hello",
             max_tokens=30,
             temperature=0.7,
         ):
             chunks.append(output.text)
-            # Each chunk should be valid UTF-8
             try:
                 output.text.encode('utf-8')
             except UnicodeEncodeError:
@@ -261,10 +272,6 @@ class TestMLXLanguageModel:
 
             if output.finished:
                 break
-
-        # Cleanup
-        del model
-        gc.collect()
 
 
 class TestSchedulerWithRealModel:
@@ -392,55 +399,35 @@ class TestSchedulerWithRealModel:
 
 
 class TestMemoryHandling:
-    """Tests for memory handling with real models."""
+    """Tests for memory handling with real models (reuses loaded_model fixture)."""
 
-    def test_model_memory_footprint(self, test_model_path: Path):
-        """Test that model loading doesn't cause memory issues."""
+    def test_model_memory_footprint(self, loaded_model):
+        """Test that model stays usable after generation."""
         import mlx.core as mx
 
-        from omlx.models.llm import MLXLanguageModel
-
-        # Get initial memory state
-        mx.clear_cache()
-        gc.collect()
-
-        model = MLXLanguageModel(str(test_model_path))
-        model.load()
-
         # Generate some tokens to allocate KV cache
-        for _ in model.stream_generate(
+        for _ in loaded_model.stream_generate(
             prompt="Test prompt",
             max_tokens=50,
         ):
             pass
 
-        # Force memory evaluation
         mx.eval()
 
         # Model should be usable after generation
-        output = model.generate(
+        output = loaded_model.generate(
             prompt="Another test",
             max_tokens=10,
         )
         assert output.text is not None
-
-        # Cleanup
-        del model
-        gc.collect()
         mx.clear_cache()
 
-    def test_repeated_generation_no_leak(self, test_model_path: Path):
+    def test_repeated_generation_no_leak(self, loaded_model):
         """Test that repeated generations don't leak memory."""
         import mlx.core as mx
 
-        from omlx.models.llm import MLXLanguageModel
-
-        model = MLXLanguageModel(str(test_model_path))
-        model.load()
-
-        # Run multiple generations
         for i in range(5):
-            output = model.generate(
+            output = loaded_model.generate(
                 prompt=f"Generation test {i}:",
                 max_tokens=20,
                 temperature=0.7,
@@ -450,26 +437,19 @@ class TestMemoryHandling:
             # Clear intermediate cache
             mx.clear_cache()
 
-        # Final generation should still work
-        final = model.generate(
+        final = loaded_model.generate(
             prompt="Final test:",
             max_tokens=10,
         )
         assert final.text is not None
 
-        # Cleanup
-        del model
-        gc.collect()
-
 
 class TestTokenizerIntegration:
-    """Tests for tokenizer integration with real models."""
+    """Tests for tokenizer integration with real models (reuses loaded_model)."""
 
-    def test_tokenizer_roundtrip(self, test_model_path: Path):
+    def test_tokenizer_roundtrip(self, loaded_model):
         """Test tokenizer encode/decode roundtrip."""
-        from mlx_lm import load
-
-        _, tokenizer = load(str(test_model_path))
+        tokenizer = loaded_model.tokenizer
 
         test_texts = [
             "Hello, world!",
@@ -486,11 +466,9 @@ class TestTokenizerIntegration:
             # (may have added special tokens)
             assert text.strip() in decoded or text in decoded
 
-    def test_tokenizer_special_tokens(self, test_model_path: Path):
+    def test_tokenizer_special_tokens(self, loaded_model):
         """Test handling of special tokens."""
-        from mlx_lm import load
-
-        _, tokenizer = load(str(test_model_path))
+        tokenizer = loaded_model.tokenizer
 
         # Check EOS token exists
         assert hasattr(tokenizer, 'eos_token_id') or hasattr(tokenizer, 'eos_token')
@@ -499,11 +477,9 @@ class TestTokenizerIntegration:
         vocab_size = len(tokenizer) if hasattr(tokenizer, '__len__') else tokenizer.vocab_size
         assert vocab_size > 0
 
-    def test_chat_template_application(self, test_model_path: Path):
+    def test_chat_template_application(self, loaded_model):
         """Test chat template application if available."""
-        from mlx_lm import load
-
-        _, tokenizer = load(str(test_model_path))
+        tokenizer = loaded_model.tokenizer
 
         messages = [
             {"role": "user", "content": "Hello!"},

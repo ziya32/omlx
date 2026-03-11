@@ -77,6 +77,10 @@ class SamplingParams:
     # Typed as Any to avoid a hard dependency on xgrammar at import time.
     compiled_grammar: Any = None
 
+    # Prefill-only mode (for LLM-based reranking/embedding)
+    prefill_only: bool = False  # Complete after first decode step, skip full generation
+    prefill_output: str = ""    # "logits" to capture last-token log-probabilities
+
     def __post_init__(self):
         if self.stop is None:
             self.stop = []
@@ -238,6 +242,8 @@ class RequestOutput:
     cached_tokens: int = 0
     # Error message (set when engine encounters an unrecoverable error)
     error: Optional[str] = None
+    # Prefill-only outputs
+    last_logits: Optional[List[float]] = None  # Last-token log-probabilities (vocab_size)
 
     @property
     def usage(self) -> Dict[str, int]:

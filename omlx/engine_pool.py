@@ -26,7 +26,9 @@ if TYPE_CHECKING:
 import mlx.core as mx
 
 from .engine import BaseEngine, BatchedEngine
+from .engine.asr import ASREngine
 from .engine.embedding import EmbeddingEngine
+from .engine.llm_reranker import LLMRerankerEngine
 from .engine.reranker import RerankerEngine
 from .engine.stt import STTEngine
 from .engine.sts import STSEngine
@@ -52,11 +54,11 @@ class EngineEntry:
 
     model_id: str  # Directory name (e.g., "llama-3b")
     model_path: str  # Full path to model directory
-    model_type: Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]  # Model type
-    engine_type: Literal["batched", "simple", "embedding", "reranker", "vlm", "audio_stt", "audio_tts", "audio_sts"]  # Engine type to use
+    model_type: Literal["llm", "vlm", "embedding", "reranker", "llm_reranker", "audio_stt", "audio_tts", "audio_sts"]  # Model type
+    engine_type: Literal["batched", "simple", "embedding", "reranker", "llm_reranker", "vlm", "audio_stt", "audio_tts", "audio_sts"]  # Engine type to use
     estimated_size: int  # Pre-calculated from safetensors (bytes)
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
-    engine: BaseEngine | EmbeddingEngine | RerankerEngine | STTEngine | STSEngine | TTSEngine | None = None  # Loaded engine instance
+    engine: BaseEngine | EmbeddingEngine | RerankerEngine | LLMRerankerEngine | STTEngine | STSEngine | TTSEngine | None = None  # Loaded engine instance
     last_access: float = 0.0  # Timestamp for LRU (0 if never loaded)
     is_loading: bool = False  # Prevent concurrent loads
     is_pinned: bool = False  # Never evict if True
@@ -189,6 +191,7 @@ class EnginePool:
         "vlm": "vlm",
         "embedding": "embedding",
         "reranker": "reranker",
+        "llm_reranker": "llm_reranker",
         "audio_stt": "audio_stt",
         "audio_tts": "audio_tts",
         "audio_sts": "audio_sts",
@@ -270,7 +273,7 @@ class EnginePool:
         if settings_manager is not None:
             all_settings = settings_manager.get_all_settings()
             for mid, ms in all_settings.items():
-                if ms.model_alias and ms.model_alias == model_id_or_alias:
+                if ms.aliases and model_id_or_alias in ms.aliases:
                     return mid
 
         # Strip provider prefix (e.g. "omlx/qwen3.5-35b" -> "qwen3.5-35b")
@@ -527,13 +530,15 @@ class EnginePool:
 
             # Create engine based on engine type
             if effective_type == "embedding":
-                # EmbeddingEngine for embedding models
                 engine = EmbeddingEngine(model_name=entry.model_path)
             elif effective_type == "reranker":
-                # RerankerEngine for reranker models
                 engine = RerankerEngine(model_name=entry.model_path)
+            elif effective_type == "llm_reranker":
+                engine = LLMRerankerEngine(
+                    model_name=entry.model_path,
+                    scheduler_config=self._scheduler_config,
+                )
             elif effective_type == "vlm":
-                # VLMBatchedEngine for vision-language models
                 engine = VLMBatchedEngine(
                     model_name=entry.model_path,
                     scheduler_config=self._scheduler_config,

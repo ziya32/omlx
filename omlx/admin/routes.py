@@ -75,7 +75,7 @@ class DeleteSubKeyRequest(BaseModel):
 class ModelSettingsRequest(BaseModel):
     """Request model for updating per-model settings."""
 
-    model_alias: Optional[str] = None
+    aliases: Optional[list[str]] = None
     model_type_override: Optional[str] = None
     max_context_window: Optional[int] = None
     max_tokens: Optional[int] = None
@@ -1292,7 +1292,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         # Add settings if available
         if settings:
             model_data["settings"] = {
-                "model_alias": settings.model_alias,
+                "aliases": settings.aliases,
                 "model_type_override": settings.model_type_override,
                 "max_context_window": settings.max_context_window,
                 "max_tokens": settings.max_tokens,
@@ -1427,27 +1427,32 @@ async def update_model_settings(
     # (clear to default) from "not sent" (don't touch).
     sent = request.model_fields_set
     prev_engine_type = entry.engine_type  # Track for requires_reload check
-    if "model_alias" in sent:
-        alias_value = request.model_alias.strip() if request.model_alias else None
-        if alias_value == "":
-            alias_value = None
-        if alias_value is not None:
+    if "aliases" in sent:
+        # Normalize: strip whitespace, drop empty strings, deduplicate preserving order
+        raw = request.aliases
+        if raw is not None:
+            alias_list = list(dict.fromkeys(a.strip() for a in raw if a and a.strip()))
+            alias_values = alias_list if alias_list else None
+        else:
+            alias_values = None
+        if alias_values is not None:
             all_settings = settings_manager.get_all_settings()
-            for mid, ms in all_settings.items():
-                if mid != model_id and ms.model_alias == alias_value:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Alias '{alias_value}' is already used by model '{mid}'",
-                    )
-            for mid in engine_pool._entries:
-                if mid != model_id and mid == alias_value:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Alias '{alias_value}' conflicts with model directory name '{mid}'",
-                    )
-        current_settings.model_alias = alias_value
+            for alias_value in alias_values:
+                for mid, ms in all_settings.items():
+                    if mid != model_id and ms.aliases and alias_value in ms.aliases:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Alias '{alias_value}' is already used by model '{mid}'",
+                        )
+                for mid in engine_pool._entries:
+                    if mid != model_id and mid == alias_value:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Alias '{alias_value}' conflicts with model directory name '{mid}'",
+                        )
+        current_settings.aliases = alias_values
     if "model_type_override" in sent:
-        valid_types = {"llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"}
+        valid_types = {"llm", "vlm", "embedding", "reranker", "llm_reranker", "audio_stt", "audio_tts", "audio_sts"}
         # Treat empty string as None (auto-detect)
         override_value = request.model_type_override or None
         if override_value is not None and override_value not in valid_types:
@@ -1462,6 +1467,7 @@ async def update_model_settings(
             "vlm": "vlm",
             "embedding": "embedding",
             "reranker": "reranker",
+            "llm_reranker": "llm_reranker",
             "audio_stt": "audio_stt",
             "audio_tts": "audio_tts",
             "audio_sts": "audio_sts",

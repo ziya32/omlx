@@ -22,8 +22,8 @@ from typing import Literal
 
 logger = logging.getLogger(__name__)
 
-ModelType = Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
-EngineType = Literal["batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
+ModelType = Literal["llm", "vlm", "embedding", "reranker", "llm_reranker", "audio_stt", "audio_tts", "audio_sts"]
+EngineType = Literal["batched", "vlm", "embedding", "reranker", "llm_reranker", "audio_stt", "audio_tts", "audio_sts"]
 
 # Known VLM (Vision-Language Model) types from mlx-vlm
 VLM_MODEL_TYPES = {
@@ -286,6 +286,7 @@ def _is_unsupported_model(model_path: Path) -> bool:
     return normalized in UNSUPPORTED_MODEL_TYPES or model_type in UNSUPPORTED_MODEL_TYPES
 
 
+
 def _is_causal_lm_reranker(model_path: Path) -> bool:
     """
     Heuristic check for CausalLM models fine-tuned as rerankers.
@@ -385,6 +386,14 @@ def detect_model_type(model_path: Path) -> ModelType:
             f"but architecture {architectures} is not an embedding architecture "
             "— treating as LLM"
         )
+
+    # Check model_type for TTS
+    if normalized_type in TTS_MODEL_TYPES or model_type in TTS_MODEL_TYPES:
+        return "tts"
+
+    # Check model_type for ASR
+    if normalized_type in ASR_MODEL_TYPES or model_type in ASR_MODEL_TYPES:
+        return "asr"
 
     # Check for VLM: architectures field
     for arch in architectures:
@@ -508,6 +517,8 @@ def _register_model(
             engine_type = "reranker"
         elif model_type == "vlm":
             engine_type = "vlm"
+        elif model_type == "llm_reranker":
+            engine_type = "llm_reranker"
         elif model_type == "audio_stt":
             engine_type = "audio_stt"
         elif model_type == "audio_tts":
