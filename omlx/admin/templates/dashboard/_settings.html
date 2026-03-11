@@ -770,9 +770,9 @@
                                                 <i data-lucide="box" class="w-4 h-4 text-neutral-500"></i>
                                             </div>
                                             <p class="text-sm font-medium text-neutral-900 truncate" x-text="model.id"></p>
-                                            <span x-show="model.settings?.model_alias" x-cloak
+                                            <span x-show="model.settings?.aliases?.length" x-cloak
                                                   class="px-1.5 py-0.5 text-[10px] font-medium rounded bg-neutral-100 text-neutral-500 border border-neutral-200 truncate max-w-[120px]"
-                                                  x-text="model.settings?.model_alias"></span>
+                                                  x-text="model.settings?.aliases?.join(', ')"></span>
                                             <button x-data="{ copied: false }"
                                                     @click.stop="copyToClipboard(model.id); copied = true; setTimeout(() => copied = false, 2000)"
                                                     class="p-1 rounded-md transition-all flex-shrink-0"

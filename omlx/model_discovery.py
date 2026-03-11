@@ -20,8 +20,8 @@ from typing import Literal
 
 logger = logging.getLogger(__name__)
 
-ModelType = Literal["llm", "vlm", "embedding", "reranker"]
-EngineType = Literal["batched", "vlm", "embedding", "reranker"]
+ModelType = Literal["llm", "vlm", "embedding", "reranker", "llm_reranker", "asr", "tts"]
+EngineType = Literal["batched", "vlm", "embedding", "reranker", "llm_reranker", "asr", "tts"]
 
 # Known VLM (Vision-Language Model) types from mlx-vlm
 VLM_MODEL_TYPES = {
@@ -127,6 +127,22 @@ UNSUPPORTED_RERANKER_ARCHITECTURES = {
 # All known reranker architectures (for model type detection)
 RERANKER_ARCHITECTURES = SUPPORTED_RERANKER_ARCHITECTURES | UNSUPPORTED_RERANKER_ARCHITECTURES
 
+# Known ASR (speech-to-text) model types
+ASR_MODEL_TYPES = {
+    "whisper",
+    "qwen3_asr",
+}
+
+# Known TTS (text-to-speech) model types
+TTS_MODEL_TYPES = {
+    "qwen3_tts",  # Qwen3TTSForConditionalGeneration (12Hz codec)
+}
+
+# Known TTS architectures
+TTS_ARCHITECTURES = {
+    "Qwen3TTSForConditionalGeneration",
+}
+
 
 @dataclass
 class DiscoveredModel:
@@ -193,6 +209,11 @@ def detect_model_type(model_path: Path) -> ModelType:
             if _is_causal_lm_reranker(model_path):
                 return "reranker"
 
+    # Check architectures for TTS (before embedding — TTS is more specific)
+    for arch in architectures:
+        if arch in TTS_ARCHITECTURES:
+            return "tts"
+
     # Check architectures field for embedding (before model_type to avoid
     # false positives from ambiguous model types like qwen3, gemma3-text)
     for arch in architectures:
@@ -218,6 +239,14 @@ def detect_model_type(model_path: Path) -> ModelType:
             f"but architecture {architectures} is not an embedding architecture "
             "— treating as LLM"
         )
+
+    # Check model_type for TTS
+    if normalized_type in TTS_MODEL_TYPES or model_type in TTS_MODEL_TYPES:
+        return "tts"
+
+    # Check model_type for ASR
+    if normalized_type in ASR_MODEL_TYPES or model_type in ASR_MODEL_TYPES:
+        return "asr"
 
     # Check for VLM: architectures field
     for arch in architectures:
@@ -304,6 +333,12 @@ def _register_model(
             engine_type = "reranker"
         elif model_type == "vlm":
             engine_type = "vlm"
+        elif model_type == "llm_reranker":
+            engine_type = "llm_reranker"
+        elif model_type == "asr":
+            engine_type = "asr"
+        elif model_type == "tts":
+            engine_type = "tts"
         else:
             engine_type = "batched"
         estimated_size = estimate_model_size(model_dir)

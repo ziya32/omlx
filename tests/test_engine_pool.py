@@ -772,7 +772,7 @@ class TestResolveModelId:
         settings_manager = MagicMock()
         from omlx.model_settings import ModelSettings
         settings_manager.get_all_settings.return_value = {
-            "model-a": ModelSettings(model_alias="gpt-4"),
+            "model-a": ModelSettings(aliases=["gpt-4"]),
             "model-b": ModelSettings(),
         }
 

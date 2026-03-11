@@ -68,6 +68,10 @@ class SamplingParams:
     logprobs: bool = False  # Whether to return logprobs
     top_logprobs: Optional[int] = None  # Number of top logprobs (1-20)
 
+    # Prefill-only mode (for LLM-based reranking/embedding)
+    prefill_only: bool = False  # Complete after first decode step, skip full generation
+    prefill_output: str = ""    # "logits" to capture last-token log-probabilities
+
     def __post_init__(self):
         if self.stop is None:
             self.stop = []
@@ -223,6 +227,8 @@ class RequestOutput:
     cached_tokens: int = 0
     # Error message (set when engine encounters an unrecoverable error)
     error: Optional[str] = None
+    # Prefill-only outputs
+    last_logits: Optional[List[float]] = None  # Last-token log-probabilities (vocab_size)
 
     @property
     def usage(self) -> Dict[str, int]:
