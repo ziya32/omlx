@@ -128,6 +128,31 @@ def _extract_multimodal_content_list(content: list) -> list:
 # System and tool messages are excluded: system messages have distinct semantics
 # (e.g., JSON schema instructions), and tool messages carry tool_call_id.
 _MERGEABLE_ROLES = {"user", "assistant"}
+_PRESERVE_BOUNDARY_KEY = "_preserve_role_boundary"
+
+
+def _consolidate_system_messages(messages: list[dict]) -> list[dict]:
+    """Move all system messages to the front, merged into one.
+
+    Models with strict chat templates (e.g., Qwen3.5) require the system
+    message to appear first.  Clients may send system or developer messages
+    mid-conversation, so we consolidate them defensively.
+    """
+    system_parts: list[str] = []
+    non_system: list[dict] = []
+    for msg in messages:
+        if msg.get("role") == "system":
+            content = msg.get("content", "")
+            if content:
+                system_parts.append(content)
+        else:
+            non_system.append(msg)
+
+    if not system_parts:
+        return messages
+
+    merged_system = {"role": "system", "content": "\n\n".join(system_parts)}
+    return [merged_system] + non_system
 
 
 def _merge_consecutive_roles(messages: list[dict]) -> list[dict]:
@@ -150,7 +175,12 @@ def _merge_consecutive_roles(messages: list[dict]) -> list[dict]:
 
     for msg in messages[1:]:
         prev = merged[-1]
-        if msg["role"] == prev["role"] and msg["role"] in _MERGEABLE_ROLES:
+        if (
+            msg["role"] == prev["role"]
+            and msg["role"] in _MERGEABLE_ROLES
+            and not prev.get(_PRESERVE_BOUNDARY_KEY)
+            and not msg.get(_PRESERVE_BOUNDARY_KEY)
+        ):
             prev_content = prev.get("content", "")
             new_content = msg.get("content", "")
             if prev_content and new_content:
@@ -216,7 +246,8 @@ def extract_text_content(
             else:
                 processed_messages.append({
                     "role": "user",  # mlx-lm expects user/assistant roles
-                    "content": f"[Tool Result ({tool_call_id})]: {tool_content}"
+                    "content": f"[Tool Result ({tool_call_id})]: {tool_content}",
+                    _PRESERVE_BOUNDARY_KEY: True,
                 })
             continue
 
@@ -273,6 +304,7 @@ def extract_text_content(
                 if tool_calls_text:
                     text = (text + "\n" if text else "") + "\n".join(tool_calls_text)
                 msg_dict["content"] = text
+            msg_dict[_PRESERVE_BOUNDARY_KEY] = True
 
             processed_messages.append(msg_dict)
             continue
@@ -293,7 +325,9 @@ def extract_text_content(
             # Unknown format, try to convert
             processed_messages.append({"role": role, "content": str(content)})
 
-    return _merge_consecutive_roles(processed_messages)
+    return _merge_consecutive_roles(
+        _consolidate_system_messages(processed_messages)
+    )
 
 
 def extract_multimodal_content(
@@ -342,7 +376,8 @@ def extract_multimodal_content(
             else:
                 processed_messages.append({
                     "role": "user",
-                    "content": f"[Tool Result ({tool_call_id})]: {tool_content}"
+                    "content": f"[Tool Result ({tool_call_id})]: {tool_content}",
+                    _PRESERVE_BOUNDARY_KEY: True,
                 })
             continue
 
@@ -394,6 +429,7 @@ def extract_multimodal_content(
                 if tool_calls_text:
                     text = (text + "\n" if text else "") + "\n".join(tool_calls_text)
                 msg_dict["content"] = text
+            msg_dict[_PRESERVE_BOUNDARY_KEY] = True
 
             processed_messages.append(msg_dict)
             continue
@@ -420,7 +456,7 @@ def extract_multimodal_content(
         else:
             processed_messages.append({"role": role, "content": str(content)})
 
-    return processed_messages
+    return _consolidate_system_messages(processed_messages)
 
 
 # =============================================================================
@@ -606,6 +642,7 @@ def extract_harmony_messages(
                             }
                         })
                 msg_dict["tool_calls"] = tool_calls_list
+                msg_dict[_PRESERVE_BOUNDARY_KEY] = True
 
             processed_messages.append(msg_dict)
             continue
@@ -629,4 +666,6 @@ def extract_harmony_messages(
         else:
             processed_messages.append({"role": role, "content": str(content)})
 
-    return _merge_consecutive_roles(processed_messages)
+    return _merge_consecutive_roles(
+        _consolidate_system_messages(processed_messages)
+    )

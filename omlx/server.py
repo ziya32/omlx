@@ -132,13 +132,16 @@ from .api.responses_models import (
 )
 from .api.responses_utils import (
     ResponseStore,
+    ResponseStateCorruptError,
+    ResponseStateNotFoundError,
     build_function_call_output_item,
     build_message_output_item,
+    build_response_store_record,
     build_response_usage,
     convert_responses_input_to_messages,
     convert_responses_tools,
-    convert_stored_response_to_messages,
     format_sse_event,
+    normalize_response_output_to_messages,
 )
 from .api.tool_calling import (
     ToolCallStreamFilter,
@@ -541,6 +544,22 @@ async def get_engine(
     try:
         engine = await pool.get_engine(model_id)
     except ModelNotFoundError as e:
+        # Fallback to default model if enabled (LLM only)
+        if (
+            engine_type == EngineType.LLM
+            and _server_state.global_settings
+            and _server_state.global_settings.model.model_fallback
+            and _server_state.default_model
+        ):
+            logger.info(
+                f"Model '{model_id}' not found, falling back to "
+                f"default model '{_server_state.default_model}'"
+            )
+            try:
+                return await pool.get_engine(_server_state.default_model)
+            except Exception:
+                pass  # Fall through to original 404
+
         # Show aliases instead of directory names for user-friendly display
         available = e.available_models
         sm = _server_state.settings_manager
@@ -888,6 +907,13 @@ def init_server(
     # Store API key
     _server_state.api_key = api_key
     _server_state.global_settings = global_settings
+    response_state_dir = None
+    if global_settings:
+        response_state_dir = (
+            global_settings.cache.get_ssd_cache_dir(global_settings.base_path)
+            / "response-state"
+        )
+    _server_state.responses_store = ResponseStore(state_dir=response_state_dir)
 
     # Refresh i18n with loaded language setting
     from .admin.routes import _refresh_i18n_globals
@@ -1170,6 +1196,78 @@ async def health():
         "default_model": _server_state.default_model,
         "engine_pool": pool_status,
         "mcp": mcp_info,
+    }
+
+
+@app.get("/api/status")
+async def server_status(_: bool = Depends(verify_api_key)):
+    """Lightweight status endpoint for external tool polling (statuslines, scripts)."""
+    from .model_discovery import format_size
+    from .server_metrics import get_server_metrics
+
+    metrics = get_server_metrics()
+    snapshot = metrics.get_snapshot()
+
+    pool = _server_state.engine_pool
+
+    models_discovered = 0
+    models_loaded = 0
+    models_loading = 0
+    loaded_models = []
+    model_memory_used = 0
+    model_memory_max = None
+
+    if pool is not None:
+        models_discovered = pool.model_count
+        models_loaded = pool.loaded_model_count
+        loaded_models = pool.get_loaded_model_ids()
+        model_memory_used = pool.current_model_memory
+        model_memory_max = pool.max_model_memory
+        for entry in pool._entries.values():
+            if entry.is_loading:
+                models_loading += 1
+
+    # Aggregate active/waiting requests across all loaded engines
+    active_requests = 0
+    waiting_requests = 0
+    if pool is not None:
+        for entry in pool._entries.values():
+            engine = entry.engine
+            if engine is None:
+                continue
+            async_core = getattr(engine, "_engine", None)
+            if async_core is None:
+                continue
+            core = getattr(async_core, "engine", None)
+            if core is None:
+                continue
+            active_requests += len(getattr(core, "_output_collectors", {}))
+            sched = getattr(core, "scheduler", None)
+            if sched is not None:
+                waiting_requests += len(getattr(sched, "waiting", []))
+
+    return {
+        "status": "ok",
+        "version": __version__,
+        "uptime_seconds": snapshot["uptime_seconds"],
+        "models_discovered": models_discovered,
+        "models_loaded": models_loaded,
+        "models_loading": models_loading,
+        "default_model": _server_state.default_model,
+        "loaded_models": loaded_models,
+        "total_requests": snapshot["total_requests"],
+        "active_requests": active_requests,
+        "waiting_requests": waiting_requests,
+        "total_prompt_tokens": snapshot["total_prompt_tokens"],
+        "total_completion_tokens": snapshot["total_completion_tokens"],
+        "total_cached_tokens": snapshot["total_cached_tokens"],
+        "cache_efficiency": snapshot["cache_efficiency"],
+        "avg_prefill_tps": snapshot["avg_prefill_tps"],
+        "avg_generation_tps": snapshot["avg_generation_tps"],
+        "model_memory_used": model_memory_used,
+        "model_memory_max": model_memory_max,
+        "model_memory_used_formatted": format_size(model_memory_used) if model_memory_used else "0B",
+        "model_memory_max_formatted": format_size(model_memory_max) if model_memory_max else "unlimited",
     }
 
 
@@ -2806,6 +2904,49 @@ async def count_anthropic_tokens(
 # =============================================================================
 
 
+def _should_store_response(store_flag: Optional[bool]) -> bool:
+    """OpenAI Responses defaults to storing responses unless explicitly disabled."""
+    return store_flag is not False
+
+
+def _resolve_previous_response_messages(previous_response_id: str) -> list[dict]:
+    """Resolve a previous_response_id chain into chat messages."""
+    try:
+        return _server_state.responses_store.resolve_chain_messages(previous_response_id)
+    except ResponseStateNotFoundError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "Response state not found for previous_response_id. "
+                "It may have been deleted, evicted, or lost after restart."
+            ),
+        ) from exc
+    except ResponseStateCorruptError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Stored response state is incomplete or corrupted for "
+                "previous_response_id."
+            ),
+        ) from exc
+
+
+def _store_response_state(
+    public_response: dict,
+    input_messages: list[dict],
+) -> None:
+    """Persist the response object and the normalized conversation state."""
+    output_messages = normalize_response_output_to_messages(
+        public_response.get("output", [])
+    )
+    record = build_response_store_record(
+        public_response,
+        input_messages=input_messages,
+        output_messages=output_messages,
+    )
+    _server_state.responses_store.put(public_response["id"], record)
+
+
 @app.post("/v1/responses")
 async def create_response(
     request: ResponsesRequest,
@@ -2823,12 +2964,14 @@ async def create_response(
 
     resolved_model = resolve_model_id(request.model) or request.model
 
+    current_input_messages = convert_responses_input_to_messages(request.input)
+
     # Build previous context from previous_response_id
     previous_messages = None
     if request.previous_response_id:
-        prev = _server_state.responses_store.get(request.previous_response_id)
-        if prev:
-            previous_messages = convert_stored_response_to_messages(prev)
+        previous_messages = _resolve_previous_response_messages(
+            request.previous_response_id
+        )
 
     # Convert Responses API input → internal messages
     messages = convert_responses_input_to_messages(
@@ -2934,6 +3077,8 @@ async def create_response(
                     engine,
                     messages,
                     request,
+                    input_messages=current_input_messages,
+                    store_response=_should_store_response(request.store),
                     model_load_duration=model_load_duration,
                     **chat_kwargs,
                 ),
@@ -3024,9 +3169,10 @@ async def create_response(
     )
 
     # Store response
-    if request.store:
-        _server_state.responses_store.put(
-            response_obj.id, response_obj.model_dump(exclude_none=True)
+    if _should_store_response(request.store):
+        _store_response_state(
+            response_obj.model_dump(exclude_none=True),
+            input_messages=current_input_messages,
         )
 
     return response_obj
@@ -3036,6 +3182,8 @@ async def stream_responses_api(
     engine: BaseEngine,
     messages: list,
     request: ResponsesRequest,
+    input_messages: Optional[list[dict]] = None,
+    store_response: bool = True,
     model_load_duration: float = 0.0,
     **kwargs,
 ) -> AsyncIterator[str]:
@@ -3383,8 +3531,8 @@ async def stream_responses_api(
     })
 
     # Store for future previous_response_id usage
-    if request.store:
-        _server_state.responses_store.put(response_id, final_response)
+    if store_response:
+        _store_response_state(final_response, input_messages=input_messages or [])
 
 
 @app.get("/v1/responses/{response_id}")

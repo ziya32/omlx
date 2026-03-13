@@ -193,7 +193,7 @@
 
             // Benchmark state
             benchModelId: '',
-            benchPromptLengths: { 1024: true, 4096: true, 8192: false, 16384: false, 32768: false, 65536: false },
+            benchPromptLengths: { 1024: true, 4096: true, 8192: false, 16384: false, 32768: false, 65536: false, 131072: false, 200000: false },
             benchBatchSizes: { 2: true, 4: true, 8: false },
             benchRunning: false,
             benchBenchId: null,
@@ -468,6 +468,7 @@
                             log_level: this.globalSettings.server.log_level,
                             model_dirs: this.globalSettings.model.model_dirs.filter(d => d.trim()),
                             max_model_memory: this.globalSettings.model.max_model_memory,
+                            model_fallback: this.globalSettings.model.model_fallback,
                             max_process_memory: this.globalSettings.memory.max_process_memory,
                             max_num_seqs: this.globalSettings.scheduler.max_num_seqs,
                             completion_batch_size: this.globalSettings.scheduler.completion_batch_size,
