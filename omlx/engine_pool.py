@@ -262,7 +262,7 @@ class EnginePool:
                 return stripped
             if all_settings is not None:
                 for mid, ms in all_settings.items():
-                    if ms.model_alias and ms.model_alias == stripped:
+                    if ms.aliases and stripped in ms.aliases:
                         return mid
 
         return model_id_or_alias

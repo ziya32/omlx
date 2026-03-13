@@ -92,7 +92,7 @@ class TestDetectModelType:
             "architectures": ["Qwen3ForCausalLM"],
         }
         (reranker_dir / "config.json").write_text(json.dumps(config))
-        assert detect_model_type(reranker_dir) == "reranker"
+        assert detect_model_type(reranker_dir) == "llm_reranker"
 
     def test_causal_lm_without_reranker_name_is_llm(self, tmp_path):
         """Test that Qwen3ForCausalLM without 'reranker' in name is LLM."""
