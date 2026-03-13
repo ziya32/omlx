@@ -94,7 +94,7 @@ class TestDetectModelType:
             "architectures": ["Qwen3ForCausalLM"],
         }
         (reranker_dir / "config.json").write_text(json.dumps(config))
-        assert detect_model_type(reranker_dir) == "reranker"
+        assert detect_model_type(reranker_dir) == "llm_reranker"
 
     def test_detect_causal_lm_embedding(self, tmp_path):
         """Test detection of CausalLM-based embedding (e.g., Qwen3-Embedding)."""

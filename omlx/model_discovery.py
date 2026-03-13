@@ -348,10 +348,12 @@ def detect_model_type(model_path: Path) -> ModelType:
     # Check for CausalLM-based rerankers (e.g., Qwen3-Reranker).
     # These use a standard CausalLM architecture but are fine-tuned for reranking
     # via yes/no logit scoring. Detected by architecture + model directory name hint.
+    # Returns "llm_reranker" (not "reranker") so they route to LLMRerankerEngine,
+    # which wraps BatchedEngine for continuous batching and prefix caching.
     for arch in architectures:
         if arch in CAUSAL_LM_RERANKER_ARCHITECTURES:
             if _is_causal_lm_reranker(model_path):
-                return "reranker"
+                return "llm_reranker"
 
     # Check for CausalLM-based embeddings (e.g., Qwen3-Embedding).
     # These use a standard CausalLM architecture but are fine-tuned for embeddings
