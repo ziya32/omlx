@@ -124,6 +124,110 @@ class ASREngine(BaseNonStreamingEngine):
         language: str,
         prompt: str | None,
     ) -> TranscriptionOutput:
+        loop = asyncio.get_running_loop()
+        executor = get_mlx_executor()
+
+        # Step 1: Load audio and split into chunks on executor.
+        # For audio <= 20 min this returns a single chunk and falls
+        # through to the fast single-call path.
+        def _load_and_split():
+            import numpy as np
+            from mlx_audio.stt.utils import load_audio
+            from mlx_audio.stt.models.qwen3_asr.qwen3_asr import (
+                split_audio_into_chunks,
+            )
+
+            logger.debug(f"[ASR] Loading audio: {audio_path}")
+            audio = load_audio(audio_path)
+            audio_np = (
+                np.array(audio) if isinstance(audio, mx.array) else audio
+            )
+            sr = getattr(model, "sample_rate", 16000)
+            return split_audio_into_chunks(audio_np, sr=sr)
+
+        try:
+            chunks = await loop.run_in_executor(executor, _load_and_split)
+        except (ImportError, AttributeError):
+            # Model doesn't support split_audio_into_chunks (not Qwen3-ASR)
+            # — fall back to single-call path
+            chunks = None
+
+        if chunks is None or len(chunks) == 1:
+            # Short audio or unsupported model — single executor call
+            return await self._transcribe_single(
+                model, audio_path, language, prompt
+            )
+
+        # Step 2: Long audio — process each chunk separately, yielding
+        # the executor between chunks so LLM token generation can
+        # interleave during transcription of very long audio (20+ min).
+        logger.info(
+            f"[ASR] Long audio split into {len(chunks)} chunks, "
+            "yielding executor between chunks"
+        )
+        all_texts: list[str] = []
+        all_segments: list[dict] = []
+        detected_lang: str | None = None
+
+        for chunk_audio, offset_sec in chunks:
+
+            def _transcribe_chunk(
+                audio_chunk=chunk_audio, offset=offset_sec
+            ):
+                from mlx_audio.stt.generate import generate_transcription
+
+                kw: dict[str, Any] = {}
+                if language and language != "auto":
+                    kw["language"] = language
+                if prompt:
+                    kw["initial_prompt"] = prompt
+
+                return generate_transcription(
+                    model=model, audio=audio_chunk, **kw
+                ), offset
+
+            result, offset = await loop.run_in_executor(
+                executor, _transcribe_chunk
+            )
+
+            all_texts.append(result.text or "")
+
+            raw_lang = result.language
+            if isinstance(raw_lang, list):
+                detected_lang = raw_lang[0] if raw_lang else detected_lang
+            elif raw_lang and raw_lang != "None":
+                detected_lang = raw_lang
+
+            if result.segments:
+                for seg in result.segments:
+                    if isinstance(seg, dict):
+                        adjusted = dict(seg)
+                        adjusted["start"] = seg.get("start", 0.0) + offset
+                        adjusted["end"] = seg.get("end", 0.0) + offset
+                        all_segments.append(adjusted)
+
+        full_text = " ".join(all_texts)
+        duration = all_segments[-1].get("end") if all_segments else None
+
+        output = TranscriptionOutput(
+            text=full_text,
+            language=detected_lang,
+            duration=duration,
+            segments=all_segments if all_segments else None,
+        )
+        if output.duration:
+            self._total_audio_seconds += output.duration
+        return output
+
+    async def _transcribe_single(
+        self,
+        model: Any,
+        audio_path: str,
+        language: str,
+        prompt: str | None,
+    ) -> TranscriptionOutput:
+        """Transcribe audio in a single executor call (short audio or fallback)."""
+
         def _transcribe_sync() -> TranscriptionOutput:
             from mlx_audio.stt.generate import generate_transcription
 
@@ -136,19 +240,15 @@ class ASREngine(BaseNonStreamingEngine):
                 kw["initial_prompt"] = prompt
 
             result = generate_transcription(
-                model=model,
-                audio=audio_path,
-                **kw,
+                model=model, audio=audio_path, **kw
             )
 
             text = result.text or ""
-            # result.language may be a list (e.g. ['en']) in newer mlx_audio versions
             raw_lang = result.language
             if isinstance(raw_lang, list):
                 detected_lang = raw_lang[0] if raw_lang else None
             else:
                 detected_lang = raw_lang
-            # Normalize string "None" to actual None
             if detected_lang == "None":
                 detected_lang = None
             duration = None
@@ -157,7 +257,6 @@ class ASREngine(BaseNonStreamingEngine):
                 last_seg = result.segments[-1]
                 if isinstance(last_seg, dict):
                     duration = last_seg.get("end")
-                # Preserve segment data for verbose_json responses
                 segments = list(result.segments)
 
             return TranscriptionOutput(
