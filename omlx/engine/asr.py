@@ -128,7 +128,7 @@ class ASREngine(BaseNonStreamingEngine):
         executor = get_mlx_executor()
 
         # Step 1: Load audio and split into chunks on executor.
-        # For audio <= 20 min this returns a single chunk and falls
+        # For audio <= 60s this returns a single chunk and falls
         # through to the fast single-call path.
         def _load_and_split():
             import numpy as np
@@ -143,7 +143,11 @@ class ASREngine(BaseNonStreamingEngine):
                 np.array(audio) if isinstance(audio, mx.array) else audio
             )
             sr = getattr(model, "sample_rate", 16000)
-            return split_audio_into_chunks(audio_np, sr=sr)
+            # Use 60s chunks so each executor hold is ~2-5s, allowing
+            # other engines (LLM, embedding) to interleave.
+            return split_audio_into_chunks(
+                audio_np, sr=sr, chunk_duration=60.0
+            )
 
         try:
             chunks = await loop.run_in_executor(executor, _load_and_split)
