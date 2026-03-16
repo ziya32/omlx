@@ -40,6 +40,15 @@ class SpeechOutput:
     duration: float = 0.0  # seconds
 
 
+
+def _audio_to_pcm(audio_array) -> bytes:
+    """Convert audio samples to raw 16-bit PCM bytes (for streaming segments)."""
+    samples = np.array(audio_array, dtype=np.float32).flatten()
+    samples = np.clip(samples, -1.0, 1.0)
+    return (samples * 32767).astype(np.int16).tobytes()
+
+
+
 class TTSEngine(BaseNonStreamingEngine):
     """
     Engine for speech synthesis (Text-to-Speech).
@@ -353,23 +362,24 @@ class TTSEngine(BaseNonStreamingEngine):
                 executor, lambda: model.generate(**gen_kwargs)
             )
 
-            def _segment_to_output(seg):
+            def _next_seg(g):
+                return next(g, None)
+
+            def _segment_to_pcm(seg):
                 audio = np.array(seg.audio)
                 sr = getattr(seg, "sample_rate", _DEFAULT_SAMPLE_RATE)
                 dur = len(audio) / sr
                 return SpeechOutput(
-                    audio_bytes=_audio_to_wav_bytes(audio, int(sr)),
+                    audio_bytes=_audio_to_pcm(audio),
                     sample_rate=int(sr),
                     duration=dur,
                 )
 
             while True:
-                seg = await loop.run_in_executor(
-                    executor, lambda: next(gen, None)
-                )
+                seg = await loop.run_in_executor(executor, _next_seg, gen)
                 if seg is None:
                     break
-                chunk = await loop.run_in_executor(executor, _segment_to_output, seg)
+                chunk = await loop.run_in_executor(executor, _segment_to_pcm, seg)
                 total_duration += chunk.duration
                 yield chunk
         finally:

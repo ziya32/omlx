@@ -414,3 +414,115 @@ Tests need to be updated to cover the new parameters and verify backward compati
 | `test_tts_mp3_format` | Request MP3 format, verify response has MP3 magic bytes (`0xFF 0xFB` or ID3 header) |
 | `test_transcribe_verbose_segments` | Transcribe with verbose=true, verify segments have start/end timestamps |
 | `test_omlx_default_voice_settings` | Verify omlx model_settings.json includes default_voice from LocalModelConfig |
+
+---
+
+## Code Review Notes (2026-03-15)
+
+Reviewed all plan phases against current implementation. Most of Phases 1-4, 5c-5d, 6-8, and 11a-11c are already implemented. Findings below.
+
+### Stale Plan
+
+The plan reads as entirely future work, but the following are already implemented in code:
+
+| Phase | Status | Evidence |
+|-------|--------|----------|
+| 1 (TTL fix) | Done | `_active_operations` counter + `_engine_has_active_work()` in `engine_pool.py:407-425` |
+| 2 (Chunked yielding) | Done | `synthesize()` in `tts.py:211-244` uses chunked `next(gen)` pattern |
+| 3 (Streaming TTS) | Done | `stream_synthesize()` in `tts.py:253-315`, `stream` query param in `server.py:1674` |
+| 4 (Memory headroom) | Done | `engine_pool.py:320-323` sets `kv_headroom=0` for asr/tts/embedding/reranker |
+| 5c (Verbose transcription) | Done | `VerboseTranscriptionResponse`, segments in `TranscriptionOutput`, verbose_json in `server.py:1643-1659` |
+| 5d (Prompt parameter) | Done | `prompt` param in `asr.py:85`, passed as `initial_prompt` at line 136 |
+| 6 (Model settings) | Partially done | `default_voice`/`default_instruct`/`default_language` in `ModelSettings` and applied in `server.py:1697-1707`; admin API can read but not write (see below) |
+| 7 (Stats) | Done | Counters in both engines' `get_stats()` |
+| 8 (get_languages) | Partially done | `get_languages()` exists in `asr.py:176-193` but no endpoint exposes it |
+| 11a-11c (Nanobot) | Done | `verbose` param, `response_format` passthrough, voice cloning all in nanobot handlers |
+
+**Action:** Update the plan with completion status per phase so it accurately reflects current state.
+
+### Bugs
+
+**1. `SpeechRequest.response_format` accepted but silently ignored**
+- `audio_models.py:79` accepts any string (`response_format: str = "wav"`)
+- `server.py:create_speech()` never reads `request.response_format` — always returns WAV
+- A client sending `response_format=mp3` gets WAV back with no error
+- [Ola] Fixed: added validation that returns 400 for non-wav formats
+
+**2. `SpeechRequest.speed` accepted but silently ignored**
+- `audio_models.py:82-83`: `speed: float = 1.0` with comment "reserved for future use, currently ignored"
+- A client sending `speed=2.0` gets normal-speed audio with no feedback
+- [Ola] Fixed: added validation that returns 400 for non-1.0 speed values
+
+**3. `SpeakersResponse.languages` always empty**
+- `server.py:1785` hardcodes `languages=[]` in the speakers endpoint
+- `ASREngine.get_languages()` exists and works but is never called
+- This means Phase 8's data is available but not exposed anywhere
+- [Ola] Fixed: speakers endpoint now populates languages from a loaded ASR engine if available
+
+### Gaps
+
+**4. Admin API can't set audio defaults**
+- `ModelSettingsRequest` (`admin/routes.py:74-94`) is missing `default_voice`, `default_instruct`, `default_language`, `default_response_format` fields
+- `update_model_settings()` (`admin/routes.py:1323-1490`) has no logic to apply these fields
+- Settings are read in the model list response (`routes.py:1250-1253`) but can't be written through the admin API
+- The only way to set audio defaults is by editing `model_settings.json` directly
+- [Ola] Fixed: added four fields to `ModelSettingsRequest` and corresponding `if "field" in sent:` blocks in update handler
+
+**5. Admin UI has no audio controls**
+- `_modal_model_settings.html` and `dashboard.js` have zero references to audio settings (default voice, default language, etc.)
+- Phase 10 is entirely unimplemented
+- Not blocking — audio defaults can be set via `model_settings.json` or the REST API
+- [Ola] Acknowledged, deferred — low priority, REST API now works for setting defaults
+
+**6. Audio exceptions defined but never raised**
+- `exceptions.py:378-399` defines `AudioError`, `InvalidAudioFormatError`, `VoiceCloningError`, `UnsupportedOutputFormatError`
+- Neither `tts.py` nor `asr.py` imports or raises any of them
+- `server.py` doesn't catch `AudioError`
+- Raw mlx-audio exceptions propagate as 500 Internal Server Error
+- [Ola] Acknowledged, deferred — wrapping mlx-audio exceptions adds complexity; the 500 errors include the original message which is descriptive enough for now. Will revisit when format conversion (Phase 5a) adds more failure modes.
+
+**7. No `GET /v1/audio/languages` endpoint**
+- Phase 8 says to add this endpoint
+- `ASREngine.get_languages()` is implemented but has no server route
+- [Ola] Fixed via speakers endpoint: languages are now populated from a loaded ASR engine. Separate endpoint not needed since the data is available in the existing response.
+
+**8. Phase 5a/5b not implemented**
+- No `_convert_audio()` function, no ffmpeg subprocess for format conversion
+- Speed parameter not implemented
+- [Ola] Unsupported values now return 400 instead of being silently ignored (see fixes #1 and #2). Format conversion deferred until there's a concrete need.
+
+### Optimization Opportunities
+
+**9. `stream_synthesize()` generates WAV per segment then strips header**
+- Each streamed segment goes through `_audio_to_wav()` (adds 44-byte WAV header) in `tts.py:296`
+- Server immediately strips it at `server.py:1719` (`chunk.audio_bytes[44:]`)
+- [Ola] Fixed: added `_audio_to_pcm()` that returns raw PCM bytes. `stream_synthesize()` now uses it directly, server yields bytes as-is.
+
+**10. `synthesize()` concatenates even for single segment**
+- `_finalize()` (`tts.py:233-242`) always calls `mx.concatenate([s.audio for s in segs])` even when there's only one segment
+- [Ola] Fixed: `audio = segs[0].audio if len(segs) == 1 else mx.concatenate([s.audio for s in segs])`
+
+**11. `stream_synthesize()` uses closures inconsistently with `synthesize()`**
+- `synthesize()` uses a named function `_next_seg(g)` that takes the generator as parameter (correct approach, avoids late-binding issues)
+- `stream_synthesize()` uses `lambda: next(gen, None)` which captures `gen` from enclosing scope and creates a new function object each iteration
+- Both work correctly since `gen` doesn't change, but they should be consistent
+- [Ola] Fixed: `stream_synthesize()` now uses the `_next_seg` pattern
+
+**12. ASR blocks executor for entire transcription**
+- `_do_transcribe()` runs as a single executor submission
+- For long audio (5+ minutes), this blocks all LLM token generation
+- `generate_transcription()` is not a generator so chunked yielding isn't directly possible
+- [Ola] Acknowledged, known limitation. ASR transcription is typically fast (a few seconds even for long audio due to Whisper's chunked architecture internally). Adding audio splitting would introduce segment boundary artifacts. Documenting as a known limitation is the right approach.
+
+### Nanobot Integration Notes
+
+**13. `VoiceConfig.SPEAKERS` hardcoded**
+- `schema.py` hardcodes `SPEAKERS = ["Vivian", "Serena", "Ryan", "Aiden"]`
+- If speakers change upstream in the TTS model, nanobot's validation list becomes stale
+- The speakers endpoint (`/v1/audio/speakers`) returns the actual list from the model
+- [Ola] Valid observation but low risk — these are Qwen3-TTS preset speakers which are baked into the model weights and won't change. If a new TTS model with different speakers is added, both the omlx model config and nanobot config would need updating anyway. Not worth the complexity of dynamic fetching.
+
+**14. `_tts_and_emit()` doesn't use streaming**
+- `handlers.py:612-628` generates complete audio before emitting the WebSocket event
+- Phase 11d acknowledges this as a future improvement
+- [Ola] Acknowledged, intentionally deferred. Streaming audio over WebSocket requires chunked events and client-side audio buffering/playback — significant frontend work for marginal benefit given typical TTS latency is 1-3 seconds.

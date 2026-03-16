@@ -1891,6 +1891,18 @@ async def create_speech(
             if instruct is None and ms.default_instruct:
                 instruct = ms.default_instruct
 
+    if request.response_format != "wav":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported format: {request.response_format}. Only 'wav' is currently supported.",
+        )
+
+    if request.speed != 1.0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Speed {request.speed} is not supported. Only speed=1.0 is currently available.",
+        )
+
     if stream:
         async def _stream_pcm():
             async for chunk in engine.stream_synthesize(
@@ -1900,8 +1912,7 @@ async def create_speech(
                 ref_audio=request.ref_audio,
                 ref_text=request.ref_text,
             ):
-                # Strip WAV header (44 bytes) and yield raw PCM
-                yield chunk.audio_bytes[44:]
+                yield chunk.audio_bytes
 
         return StreamingResponse(
             _stream_pcm(),
@@ -1965,9 +1976,19 @@ async def list_speakers(
     engine = await get_tts_engine(model)
     speakers = engine.get_speakers()
 
+    # Try to populate languages from a loaded ASR engine
+    languages: list[str] = []
+    pool = get_engine_pool()
+    for mid, entry in pool._entries.items():
+        if entry.engine_type == "asr" and entry.engine is not None:
+            from .engine.asr import ASREngine
+            if isinstance(entry.engine, ASREngine):
+                languages = entry.engine.get_languages()
+            break
+
     return SpeakersResponse(
         speakers=speakers,
-        languages=[],
+        languages=languages,
     )
 
 

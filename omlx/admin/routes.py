@@ -102,6 +102,10 @@ class ModelSettingsRequest(BaseModel):
     specprefill_keep_pct: Optional[float] = None
     specprefill_threshold: Optional[int] = None
     reasoning_parser: Optional[str] = None
+    default_voice: Optional[str] = None
+    default_instruct: Optional[str] = None
+    default_language: Optional[str] = None
+    default_response_format: Optional[str] = None
     is_pinned: Optional[bool] = None
     is_default: Optional[bool] = None
 
@@ -1547,6 +1551,14 @@ async def update_model_settings(
 
     if "reasoning_parser" in sent:
         current_settings.reasoning_parser = request.reasoning_parser or None
+    if "default_voice" in sent:
+        current_settings.default_voice = request.default_voice or None
+    if "default_instruct" in sent:
+        current_settings.default_instruct = request.default_instruct or None
+    if "default_language" in sent:
+        current_settings.default_language = request.default_language or None
+    if "default_response_format" in sent:
+        current_settings.default_response_format = request.default_response_format or None
     if request.is_pinned is not None:
         current_settings.is_pinned = request.is_pinned
         # Also update the engine pool entry

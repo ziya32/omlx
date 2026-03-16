@@ -578,15 +578,12 @@ class TestTTSEngineSynthesize:
 
         mock_model = MagicMock()
         mock_model.sample_rate = 24000
-        mock_segment = MagicMock()
-        mock_segment.audio = MagicMock()
-        mock_model.generate.return_value = iter([mock_segment])
-        engine._model = mock_model
-
-        # Mock mx.concatenate to return an array with shape
         mock_audio = MagicMock()
         mock_audio.shape = (24000,)
-        mock_mx.concatenate.return_value = mock_audio
+        mock_segment = MagicMock()
+        mock_segment.audio = mock_audio
+        mock_model.generate.return_value = iter([mock_segment])
+        engine._model = mock_model
 
         mock_audio_to_wav.return_value = b"RIFF....WAV"
 
@@ -609,13 +606,13 @@ class TestTTSEngineSynthesize:
 
         mock_model = MagicMock()
         mock_model.sample_rate = 24000
+        mock_audio = MagicMock()
+        mock_audio.shape = (48000,)
         mock_segment = MagicMock()
+        mock_segment.audio = mock_audio
         mock_model.generate.return_value = iter([mock_segment])
         engine._model = mock_model
 
-        mock_audio = MagicMock()
-        mock_audio.shape = (48000,)
-        mock_mx.concatenate.return_value = mock_audio
         mock_audio_to_wav.return_value = b"WAV"
 
         result = await engine.synthesize("Hi", speaker="ryan", instruct="Speak warmly")
@@ -635,13 +632,13 @@ class TestTTSEngineSynthesize:
 
         mock_model = MagicMock()
         mock_model.sample_rate = 24000
+        mock_audio = MagicMock()
+        mock_audio.shape = (12000,)
         mock_segment = MagicMock()
+        mock_segment.audio = mock_audio
         mock_model.generate.return_value = iter([mock_segment])
         engine._model = mock_model
 
-        mock_audio = MagicMock()
-        mock_audio.shape = (12000,)
-        mock_mx.concatenate.return_value = mock_audio
         mock_audio_to_wav.return_value = b"WAV"
 
         result = await engine.synthesize(
@@ -665,13 +662,13 @@ class TestTTSEngineSynthesize:
 
         mock_model = MagicMock()
         mock_model.sample_rate = 24000
+        mock_audio = MagicMock()
+        mock_audio.shape = (24000,)
         mock_segment = MagicMock()
+        mock_segment.audio = mock_audio
         mock_model.generate.return_value = iter([mock_segment])
         engine._model = mock_model
 
-        mock_audio = MagicMock()
-        mock_audio.shape = (24000,)
-        mock_mx.concatenate.return_value = mock_audio
         mock_audio_to_wav.return_value = b"WAV"
 
         await engine.synthesize("Test")
@@ -721,13 +718,13 @@ class TestTTSEngineSynthesize:
 
         mock_model = MagicMock()
         mock_model.sample_rate = 48000  # custom rate
+        mock_audio = MagicMock()
+        mock_audio.shape = (48000,)
         mock_segment = MagicMock()
+        mock_segment.audio = mock_audio
         mock_model.generate.return_value = iter([mock_segment])
         engine._model = mock_model
 
-        mock_audio = MagicMock()
-        mock_audio.shape = (48000,)
-        mock_mx.concatenate.return_value = mock_audio
         mock_audio_to_wav.return_value = b"WAV"
 
         result = await engine.synthesize("Hi")
@@ -747,13 +744,13 @@ class TestTTSEngineSynthesize:
 
         mock_model = MagicMock()
         mock_model.sample_rate = 24000
+        mock_audio = MagicMock()
+        mock_audio.shape = (24000,)
         mock_segment = MagicMock()
+        mock_segment.audio = mock_audio
         mock_model.generate.return_value = iter([mock_segment])
         engine._model = mock_model
 
-        mock_audio = MagicMock()
-        mock_audio.shape = (24000,)
-        mock_mx.concatenate.return_value = mock_audio
         mock_audio_to_wav.return_value = b"WAV"
 
         await engine.synthesize("Hi", speaker="ryan")
