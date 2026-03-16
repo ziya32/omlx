@@ -33,11 +33,47 @@ def _has_cli_overrides(args) -> bool:
         return True
     if hasattr(args, "max_process_memory") and args.max_process_memory is not None:
         return True
-    if hasattr(args, "host") and args.host is not None:
+    # host: default="0.0.0.0"
+    if hasattr(args, "host") and args.host != "0.0.0.0":
         return True
     if hasattr(args, "log_level") and args.log_level is not None:
         return True
     return False
+
+
+def _push_api_key_to_nanobot(api_key: str) -> None:
+    """Write the omlx API key into nanobot's config file (if present)."""
+    import json
+    import logging
+    from pathlib import Path
+
+    logger = logging.getLogger(__name__)
+    config_path = Path.home() / ".myemee" / "config.json"
+
+    if not config_path.exists():
+        logger.warning(
+            "Nanobot config not found at %s — "
+            "if nanobot runs on another machine, set omlx.apiKey there manually",
+            config_path,
+        )
+        print(
+            f"Note: nanobot config not found at {config_path}. "
+            "If nanobot runs on another machine, set omlx.apiKey there manually."
+        )
+        return
+
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+        omlx_section = data.setdefault("omlx", {})
+        omlx_section["apiKey"] = api_key
+        config_path.write_text(
+            json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        print(f"Updated nanobot config at {config_path}")
+    except Exception as exc:
+        logger.warning("Failed to update nanobot config at %s: %s", config_path, exc)
+        print(f"Warning: could not update nanobot config: {exc}")
 
 
 def serve_command(args):
@@ -135,6 +171,19 @@ def serve_command(args):
         for error in errors:
             print(f"Configuration error: {error}")
         sys.exit(1)
+
+    # Auto-generate API key when bound to non-loopback and none configured
+    if (
+        settings.auth.api_key is None
+        and settings.server.host not in ("127.0.0.1", "::1", "localhost")
+    ):
+        import secrets
+        key = secrets.token_urlsafe(32)
+        settings.auth.api_key = key
+        settings.save()
+        print(f"Generated API key: {key}")
+        print("Saved to omlx settings.json")
+        _push_api_key_to_nanobot(key)
 
     # Import server and config
     from .server import app, init_server
@@ -423,7 +472,7 @@ Example directory structure:
     )
 
     # Server options
-    serve_parser.add_argument("--host", type=str, default=None, help="Host to bind (default: 127.0.0.1)")
+    serve_parser.add_argument("--host", type=str, default=None, help="Host to bind (default: 0.0.0.0)")
     serve_parser.add_argument("--port", type=int, default=None, help="Port to bind (default: 8000)")
     serve_parser.add_argument(
         "--log-level",

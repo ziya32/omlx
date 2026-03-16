@@ -12,6 +12,15 @@ from typing import List, Optional
 from pydantic import BaseModel, Field
 
 
+class TranscriptionSegment(BaseModel):
+    """A segment of transcribed audio with timestamps."""
+
+    id: int
+    start: float
+    end: float
+    text: str
+
+
 class AudioTranscriptionRequest(BaseModel):
     """OpenAI-compatible audio transcription request."""
 
@@ -29,11 +38,23 @@ class AudioTranscriptionResponse(BaseModel):
     segments: Optional[List[dict]] = None
 
 
+class VerboseTranscriptionResponse(BaseModel):
+    """Verbose response from audio transcription with segment timestamps."""
+
+    task: str = "transcribe"
+    language: str | None = None
+    duration: float | None = None
+    text: str
+    segments: list[TranscriptionSegment] = Field(default_factory=list)
+
+
 class AudioSpeechRequest(BaseModel):
     model: str
     input: str
     voice: Optional[str] = None
     instructions: Optional[str] = None
+    ref_audio: Optional[str] = None
+    ref_text: Optional[str] = None
     speed: Optional[float] = 1.0
     response_format: Optional[str] = "wav"
 

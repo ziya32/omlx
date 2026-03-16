@@ -68,6 +68,12 @@ class ModelSettings:
     specprefill_keep_pct: Optional[float] = None  # Keep rate (0.1-0.5, default 0.2)
     specprefill_threshold: Optional[int] = None  # Min tokens to trigger (default 8192)
 
+    # Audio-specific settings (TTS/ASR)
+    default_voice: Optional[str] = None  # Default TTS speaker/voice name
+    default_instruct: Optional[str] = None  # Default TTS instruct text
+    default_language: Optional[str] = None  # Default ASR language ("auto", "en", etc.)
+    default_response_format: Optional[str] = None  # Default audio output format ("wav", "mp3", etc.)
+
     # Model management flags
     is_pinned: bool = False
     is_default: bool = False  # Only one model can be default

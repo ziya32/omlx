@@ -115,6 +115,8 @@ from .api.audio_models import (
     SpeakersResponse,
     SpeechRequest,
     TranscriptionResponse,
+    TranscriptionSegment,
+    VerboseTranscriptionResponse,
 )
 from .api.rerank_models import (
     RerankRequest,
@@ -353,9 +355,37 @@ async def lifespan(app: FastAPI):
     if mcp_config:
         await init_mcp(mcp_config)
 
+    # Publish mDNS beacon when bound to non-loopback
+    beacon = None
+    if _server_state.global_settings is not None:
+        settings = _server_state.global_settings
+        if (
+            settings.discovery.enabled
+            and settings.server.host not in ("127.0.0.1", "::1", "localhost")
+        ):
+            if settings.auth.api_key is None:
+                logger.warning(
+                    "omlx bound to all interfaces without api_key — "
+                    "any device on the network can access it"
+                )
+            from omlx.discovery import OMLXBeacon
+
+            beacon = OMLXBeacon(
+                port=settings.server.port,
+                display_name=settings.discovery.service_name,
+            )
+            try:
+                await beacon.start()
+                logger.info("mDNS beacon published on port %d", settings.server.port)
+            except Exception as exc:
+                logger.warning("mDNS beacon failed: %s", exc)
+                beacon = None
+
     yield
 
-    # Shutdown: Save all-time stats, stop TTL task, process memory enforcer, etc.
+    # Shutdown: Stop beacon, save stats, stop TTL task, etc.
+    if beacon:
+        await beacon.stop()
     get_server_metrics().save_alltime()
     if ttl_task is not None:
         ttl_task.cancel()
@@ -643,7 +673,7 @@ async def get_engine(
             display = []
             for mid in available:
                 ms = sm.get_settings(mid)
-                display.append(ms.model_alias if ms.model_alias else mid)
+                display.append(ms.display_name if ms.display_name else mid)
             available = display
         detail = (
             f"Model '{model_id}' not found. "
@@ -1082,7 +1112,11 @@ def init_server(
 
         init_auth(global_settings.auth.secret_key)
 
-    # Configure CORS middleware from settings
+    # Configure CORS middleware from settings.
+    # Reset the middleware stack so init_server() is safe to call multiple
+    # times (e.g. in tests).  Starlette builds the stack lazily on first
+    # request; once built, add_middleware() raises.
+    app.middleware_stack = None
     cors_origins = global_settings.server.cors_origins if global_settings else ["*"]
     app.add_middleware(
         CORSMiddleware,
@@ -1725,7 +1759,7 @@ async def create_rerank(
 async def create_transcription(
     http_request: FastAPIRequest,
     _: bool = Depends(verify_api_key),
-) -> TranscriptionResponse:
+):
     """
     Transcribe audio to text.
 
@@ -1735,20 +1769,36 @@ async def create_transcription(
     - file: audio file (wav, mp3, m4a, etc.)
     - model: model ID (e.g., "Qwen3-ASR-1.7B-bf16")
     - language: ISO language code or "auto" (default)
+    - prompt: optional text to guide transcription (Whisper models)
+    - response_format: "json" (default), "verbose_json", or "text"
     """
     import tempfile
 
     form = await http_request.form()
     audio_file = form.get("file")
     model = form.get("model")
-    language = form.get("language", "auto")
+    language = form.get("language")
+    prompt = form.get("prompt")
+    response_format = str(form.get("response_format", "json"))
 
     if audio_file is None:
         raise HTTPException(status_code=400, detail="Audio file is required")
     if model is None:
         raise HTTPException(status_code=400, detail="Model is required")
 
-    engine = await get_asr_engine(str(model))
+    model_str = str(model)
+
+    # Apply model settings defaults
+    if language is None:
+        sm = _server_state.settings_manager
+        if sm:
+            ms = sm.get_settings(model_str)
+            language = ms.default_language or "auto"
+        else:
+            language = "auto"
+    language = str(language)
+
+    engine = await get_asr_engine(model_str)
 
     # Write uploaded file to temp path for mlx_audio
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
@@ -1758,7 +1808,11 @@ async def create_transcription(
 
     try:
         start_time = time.perf_counter()
-        output = await engine.transcribe(tmp_path, language=str(language))
+        output = await engine.transcribe(
+            tmp_path,
+            language=language,
+            prompt=str(prompt) if prompt else None,
+        )
         elapsed = time.perf_counter() - start_time
 
         logger.info(
@@ -1766,6 +1820,28 @@ async def create_transcription(
             f"language={output.language}, "
             f"duration={output.duration}s"
         )
+
+        if response_format == "text":
+            from fastapi.responses import PlainTextResponse
+            return PlainTextResponse(output.text)
+
+        if response_format == "verbose_json":
+            segments = []
+            if output.segments:
+                for i, seg in enumerate(output.segments):
+                    if isinstance(seg, dict):
+                        segments.append(TranscriptionSegment(
+                            id=seg.get("id", i),
+                            start=seg.get("start", 0.0),
+                            end=seg.get("end", 0.0),
+                            text=seg.get("text", ""),
+                        ))
+            return VerboseTranscriptionResponse(
+                text=output.text,
+                language=output.language,
+                duration=output.duration,
+                segments=segments,
+            )
 
         return TranscriptionResponse(
             text=output.text,
@@ -1780,6 +1856,7 @@ async def create_transcription(
 @app.post("/v1/audio/speech")
 async def create_speech(
     request: SpeechRequest,
+    stream: bool = False,
     _: bool = Depends(verify_api_key),
 ):
     """
@@ -1795,16 +1872,55 @@ async def create_speech(
     - voice: ignored
     - instructions: voice description (e.g., "A warm female narrator")
 
-    Returns binary WAV audio (24 kHz).
+    Query params:
+    - stream: if true, stream raw PCM chunks as they're generated
+
+    Returns binary WAV audio (24 kHz) or streaming PCM.
     """
     engine = await get_tts_engine(request.model)
+
+    # Apply model settings defaults
+    speaker = request.voice if request.voice != "default" else None
+    instruct = request.instructions
+    if speaker is None or instruct is None:
+        sm = _server_state.settings_manager
+        if sm:
+            ms = sm.get_settings(request.model)
+            if speaker is None and ms.default_voice:
+                speaker = ms.default_voice
+            if instruct is None and ms.default_instruct:
+                instruct = ms.default_instruct
+
+    if stream:
+        async def _stream_pcm():
+            async for chunk in engine.stream_synthesize(
+                text=request.input,
+                speaker=speaker,
+                instruct=instruct,
+                ref_audio=request.ref_audio,
+                ref_text=request.ref_text,
+            ):
+                # Strip WAV header (44 bytes) and yield raw PCM
+                yield chunk.audio_bytes[44:]
+
+        return StreamingResponse(
+            _stream_pcm(),
+            media_type="audio/pcm",
+            headers={
+                "X-Sample-Rate": "24000",
+                "X-Channels": "1",
+                "X-Bits-Per-Sample": "16",
+            },
+        )
 
     start_time = time.perf_counter()
 
     output = await engine.synthesize(
         text=request.input,
-        speaker=request.voice if request.voice != "default" else None,
-        instruct=request.instructions,
+        speaker=speaker,
+        instruct=instruct,
+        ref_audio=request.ref_audio,
+        ref_text=request.ref_text,
     )
 
     elapsed = time.perf_counter() - start_time

@@ -35,6 +35,10 @@ class MockASREngine(ASREngine):
         self._model_name = model_name
         self._model = True  # Mark as "loaded"
         self._processor = True
+        self._active_operations = 0
+        self._total_operations = 0
+        self._total_audio_seconds = 0.0
+        self._total_processing_seconds = 0.0
 
     async def start(self):
         pass
@@ -42,11 +46,12 @@ class MockASREngine(ASREngine):
     async def stop(self):
         pass
 
-    async def transcribe(self, audio_path, language="auto"):
+    async def transcribe(self, audio_path, language="auto", prompt=None):
         return TranscriptionOutput(
             text="This is a test transcription.",
             language="en",
             duration=3.5,
+            segments=[{"id": 0, "start": 0.0, "end": 3.5, "text": "This is a test transcription."}],
         )
 
     def get_stats(self):
@@ -60,6 +65,10 @@ class MockTTSEngine(TTSEngine):
         self._model_name = model_name
         self._model = True  # Mark as "loaded"
         self._variant = "custom_voice"
+        self._active_operations = 0
+        self._total_operations = 0
+        self._total_audio_seconds = 0.0
+        self._total_processing_seconds = 0.0
 
     async def start(self):
         pass
@@ -67,7 +76,7 @@ class MockTTSEngine(TTSEngine):
     async def stop(self):
         pass
 
-    async def synthesize(self, text, speaker=None, instruct=None):
+    async def synthesize(self, text, speaker=None, instruct=None, ref_audio=None, ref_text=None):
         # Generate minimal valid WAV header + 1 second of silence
         sample_rate = 24000
         num_samples = sample_rate
@@ -758,11 +767,32 @@ class TestModelDiscoveryIntegration:
         assert entry.model_type == "tts"
         assert entry.engine_type == "tts"
 
-    def test_llm_reranker_via_model_type_override(self, tmp_path):
-        """Test LLM reranker configured via model_type_override."""
+    def test_llm_reranker_auto_detected_from_name(self, tmp_path):
+        """Test CausalLM reranker is auto-detected from model directory name."""
         model_dir = tmp_path / "Qwen3-Reranker-0.6B"
         model_dir.mkdir()
-        # Qwen3-Reranker uses standard CausalLM architecture
+        (model_dir / "config.json").write_text(json.dumps({
+            "model_type": "qwen3",
+            "architectures": ["Qwen3ForCausalLM"],
+        }))
+        (model_dir / "model.safetensors").write_bytes(b"\x00" * 1024)
+
+        from omlx.model_discovery import detect_model_type
+        from omlx.engine_pool import EnginePool
+
+        assert detect_model_type(model_dir) == "llm_reranker"
+
+        pool = EnginePool(max_model_memory=None)
+        pool.discover_models(str(tmp_path))
+        entry = pool.get_entry("Qwen3-Reranker-0.6B")
+        assert entry.model_type == "llm_reranker"
+        assert entry.engine_type == "llm_reranker"
+
+    def test_llm_reranker_via_model_type_override(self, tmp_path):
+        """Test LLM reranker configured via model_type_override for a model
+        that isn't auto-detected (no 'reranker' in name)."""
+        model_dir = tmp_path / "Qwen3-Custom-0.6B"
+        model_dir.mkdir()
         (model_dir / "config.json").write_text(json.dumps({
             "model_type": "qwen3",
             "architectures": ["Qwen3ForCausalLM"],
@@ -773,12 +803,12 @@ class TestModelDiscoveryIntegration:
         from omlx.engine_pool import EnginePool
         from omlx.model_settings import ModelSettingsManager
 
-        # Without override, it's detected as LLM
+        # Without override, it's detected as LLM (no "reranker" in name)
         assert detect_model_type(model_dir) == "llm"
 
         pool = EnginePool(max_model_memory=None)
         pool.discover_models(str(tmp_path))
-        entry = pool.get_entry("Qwen3-Reranker-0.6B")
+        entry = pool.get_entry("Qwen3-Custom-0.6B")
         assert entry.model_type == "llm"
         assert entry.engine_type == "batched"
 
@@ -786,12 +816,12 @@ class TestModelDiscoveryIntegration:
         settings_dir = tmp_path / "settings"
         settings_dir.mkdir()
         sm = ModelSettingsManager(str(settings_dir))
-        settings = sm.get_settings("Qwen3-Reranker-0.6B")
+        settings = sm.get_settings("Qwen3-Custom-0.6B")
         settings.model_type_override = "llm_reranker"
-        sm.set_settings("Qwen3-Reranker-0.6B", settings)
+        sm.set_settings("Qwen3-Custom-0.6B", settings)
 
         pool.apply_settings_overrides(sm)
-        entry = pool.get_entry("Qwen3-Reranker-0.6B")
+        entry = pool.get_entry("Qwen3-Custom-0.6B")
         assert entry.model_type == "llm_reranker"
         assert entry.engine_type == "llm_reranker"
 

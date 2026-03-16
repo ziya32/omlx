@@ -18,7 +18,7 @@ import gc
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from .model_settings import ModelSettingsManager
@@ -347,12 +347,13 @@ class EnginePool:
 
             # Pre-load eviction: reserve 25% extra for KV cache headroom
             # so other models get evicted earlier, leaving room for context.
+            # Audio/embedding/reranker models don't use KV caches — no headroom.
             # Always try to evict with headroom first. If all evictable models
             # are gone and the model still fits without headroom, allow it.
             # Skip entirely when model memory limit is disabled (None).
             # Audio engines (STT/TTS) don't use KV cache, so headroom is 0.
             if self._max_model_memory is not None:
-                if entry.engine_type in ("audio_stt", "audio_tts", "audio_sts"):
+                if entry.engine_type in ("audio_stt", "audio_tts", "audio_sts", "embedding", "reranker", "llm_reranker"):
                     kv_headroom = 0
                 else:
                     kv_headroom = int(entry.estimated_size * 0.25)
@@ -438,22 +439,49 @@ class EnginePool:
                 )
             await self._unload_engine(victim)
 
+    @staticmethod
+    def _engine_has_active_work(engine: Any) -> bool:
+        """Check if an engine has in-flight requests or operations.
+
+        Works for all engine types:
+        - BatchedEngine / VLMBatchedEngine: checks _output_collectors
+        - ASREngine / TTSEngine: checks active_operations counter
+        """
+        # BatchedEngine / VLMBatchedEngine: check output collectors
+        engine_core = getattr(engine, "_engine", None)
+        if engine_core is not None:
+            inner = getattr(engine_core, "engine", None)
+            if inner is not None:
+                if len(getattr(inner, "_output_collectors", {})) > 0:
+                    return True
+        # Audio engines: check active_operations counter
+        active_ops = getattr(engine, "active_operations", 0)
+        if isinstance(active_ops, int) and active_ops > 0:
+            return True
+        return False
+
     def _find_lru_victim(self) -> str | None:
         """
         Find the least recently used non-pinned loaded model.
 
+        Prefers idle models over models with active requests.
+
         Returns:
             Model ID of the LRU victim, or None if all models are pinned
         """
-        candidates = [
-            (e.last_access, mid)
-            for mid, e in self._entries.items()
-            if e.engine is not None and not e.is_pinned
-        ]
+        candidates = []
+        for mid, e in self._entries.items():
+            if e.engine is None or e.is_pinned:
+                continue
+            has_active = self._engine_has_active_work(e.engine)
+            candidates.append((has_active, e.last_access, mid))
         if not candidates:
             return None
-        candidates.sort()  # Sort by last_access (oldest first)
-        return candidates[0][1]
+        candidates.sort()  # (False, old_time) sorts before (True, old_time)
+        best_active, _, best_mid = candidates[0]
+        if best_active:
+            return None  # All models busy — reject rather than kill active requests
+        return best_mid
 
     async def _unload_engine(self, model_id: str) -> None:
         """
@@ -771,10 +799,8 @@ class EnginePool:
                 if idle_time < settings.ttl_seconds:
                     continue
 
-                # Check if model has active requests
-                has_active = entry.engine.has_active_requests()
-
-                if has_active:
+                # Check if model has active requests (works for all engine types)
+                if self._engine_has_active_work(entry.engine):
                     entry.last_access = now
                     continue
 

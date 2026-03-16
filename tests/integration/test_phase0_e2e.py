@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Optional
 
 import pytest
+import pytest_asyncio
 
 pytestmark = [
     pytest.mark.slow,
@@ -116,34 +117,31 @@ class TestLLMRerankerE2E:
         import asyncio
         from omlx.engine.llm_reranker import LLMRerankerEngine
 
+        loop = asyncio.new_event_loop()
         engine = LLMRerankerEngine(model_name=str(reranker_model))
-        asyncio.get_event_loop().run_until_complete(engine.start())
-        yield engine
-        asyncio.get_event_loop().run_until_complete(engine.stop())
+        loop.run_until_complete(engine.start())
+        yield engine, loop
+        loop.run_until_complete(engine.stop())
+        loop.close()
         gc.collect()
         mx.clear_cache()
 
     def test_rerank_basic(self, engine):
         """Test basic reranking produces valid scores."""
-        import asyncio
-
-        output = asyncio.get_event_loop().run_until_complete(
-            engine.rerank(
-                query="What is machine learning?",
-                documents=[
-                    "Machine learning is a subset of artificial intelligence that enables systems to learn from data.",
-                    "The weather forecast for tomorrow predicts rain in the afternoon.",
-                    "Deep learning uses neural networks with many layers to learn complex patterns.",
-                ],
-            )
-        )
+        eng, loop = engine
+        output = loop.run_until_complete(eng.rerank(
+            query="What is machine learning?",
+            documents=[
+                "Machine learning is a subset of artificial intelligence that enables systems to learn from data.",
+                "The weather forecast for tomorrow predicts rain in the afternoon.",
+                "Deep learning uses neural networks with many layers to learn complex patterns.",
+            ],
+        ))
 
         assert len(output.scores) == 3
         assert len(output.indices) == 3
-        # All scores should be between 0 and 1
         for score in output.scores:
             assert 0.0 <= score <= 1.0
-        # ML-related docs should score higher than weather
         assert output.scores[0] > output.scores[1], (
             f"ML doc ({output.scores[0]:.3f}) should score higher than "
             f"weather doc ({output.scores[1]:.3f})"
@@ -155,48 +153,39 @@ class TestLLMRerankerE2E:
 
     def test_rerank_top_n(self, engine):
         """Test top_n filtering returns correct number of results."""
-        import asyncio
-
-        output = asyncio.get_event_loop().run_until_complete(
-            engine.rerank(
-                query="Python programming",
-                documents=[
-                    "Python is a high-level programming language.",
-                    "Java is another popular language.",
-                    "Cooking recipes for dinner.",
-                    "Python supports multiple paradigms.",
-                ],
-                top_n=2,
-            )
-        )
+        eng, loop = engine
+        output = loop.run_until_complete(eng.rerank(
+            query="Python programming",
+            documents=[
+                "Python is a high-level programming language.",
+                "Java is another popular language.",
+                "Cooking recipes for dinner.",
+                "Python supports multiple paradigms.",
+            ],
+            top_n=2,
+        ))
 
         assert len(output.scores) == 4  # all documents scored
         assert len(output.indices) == 2  # only top 2 returned
 
     def test_rerank_single_document(self, engine):
         """Test reranking with a single document."""
-        import asyncio
-
-        output = asyncio.get_event_loop().run_until_complete(
-            engine.rerank(
-                query="What is AI?",
-                documents=["Artificial intelligence is the simulation of human intelligence."],
-            )
-        )
+        eng, loop = engine
+        output = loop.run_until_complete(eng.rerank(
+            query="What is AI?",
+            documents=["Artificial intelligence is the simulation of human intelligence."],
+        ))
 
         assert len(output.scores) == 1
         assert output.scores[0] > 0.5  # Should be relevant
 
     def test_rerank_token_count(self, engine):
         """Test that token count is tracked."""
-        import asyncio
-
-        output = asyncio.get_event_loop().run_until_complete(
-            engine.rerank(
-                query="test",
-                documents=["doc one", "doc two"],
-            )
-        )
+        eng, loop = engine
+        output = loop.run_until_complete(eng.rerank(
+            query="test",
+            documents=["doc one", "doc two"],
+        ))
 
         assert output.total_tokens > 0
 
@@ -225,18 +214,20 @@ class TestPrefillOnlyE2E:
         import asyncio
         from omlx.engine.batched import BatchedEngine
 
+        loop = asyncio.new_event_loop()
         engine = BatchedEngine(model_name=str(llm_model))
-        asyncio.get_event_loop().run_until_complete(engine.start())
-        yield engine
-        asyncio.get_event_loop().run_until_complete(engine.stop())
+        loop.run_until_complete(engine.start())
+        yield engine, loop
+        loop.run_until_complete(engine.stop())
+        loop.close()
         gc.collect()
         mx.clear_cache()
 
     def test_prefill_only_captures_logits(self, batched_engine):
         """Test that prefill_only=True captures last_logits in output."""
-        import asyncio
         from omlx.request import SamplingParams
 
+        engine, loop = batched_engine
         params = SamplingParams(
             max_tokens=1,
             temperature=0.0,
@@ -244,23 +235,20 @@ class TestPrefillOnlyE2E:
             prefill_output="logits",
         )
 
-        output = asyncio.get_event_loop().run_until_complete(
-            batched_engine._engine.generate(
-                prompt="The capital of France is",
-                sampling_params=params,
-            )
-        )
+        output = loop.run_until_complete(engine._engine.generate(
+            prompt="The capital of France is",
+            sampling_params=params,
+        ))
 
         assert output.finished is True
         assert output.last_logits is not None
-        # Logits should be vocab-sized
-        assert len(output.last_logits) > 1000  # any real tokenizer has >1000 tokens
+        assert len(output.last_logits) > 1000
 
     def test_prefill_only_logits_are_valid(self, batched_engine):
         """Test that captured logits produce valid probabilities."""
-        import asyncio
         from omlx.request import SamplingParams
 
+        engine, loop = batched_engine
         params = SamplingParams(
             max_tokens=1,
             temperature=0.0,
@@ -268,31 +256,27 @@ class TestPrefillOnlyE2E:
             prefill_output="logits",
         )
 
-        output = asyncio.get_event_loop().run_until_complete(
-            batched_engine._engine.generate(
-                prompt="Hello",
-                sampling_params=params,
-            )
-        )
+        output = loop.run_until_complete(engine._engine.generate(
+            prompt="Hello",
+            sampling_params=params,
+        ))
 
         logits = mx.array(output.last_logits)
         probs = mx.softmax(logits)
         mx.eval(probs)
 
-        # Probabilities should sum to ~1.0
         total = float(mx.sum(probs).item())
         assert abs(total - 1.0) < 1e-3, f"Probabilities sum to {total}, expected ~1.0"
 
-        # Max probability should be reasonable
         max_prob = float(mx.max(probs).item())
         assert max_prob > 0.0
         assert max_prob <= 1.0
 
     def test_prefill_only_minimal_generation(self, batched_engine):
         """Test prefill_only produces exactly 1 completion token."""
-        import asyncio
         from omlx.request import SamplingParams
 
+        engine, loop = batched_engine
         params = SamplingParams(
             max_tokens=1,
             temperature=0.0,
@@ -300,34 +284,30 @@ class TestPrefillOnlyE2E:
             prefill_output="logits",
         )
 
-        output = asyncio.get_event_loop().run_until_complete(
-            batched_engine._engine.generate(
-                prompt="Test prompt for prefill only",
-                sampling_params=params,
-            )
-        )
+        output = loop.run_until_complete(engine._engine.generate(
+            prompt="Test prompt for prefill only",
+            sampling_params=params,
+        ))
 
         assert output.completion_tokens == 1
         assert output.prompt_tokens > 0
 
     def test_prefill_only_without_logits_capture(self, batched_engine):
         """Test prefill_only=True without prefill_output doesn't capture logits."""
-        import asyncio
         from omlx.request import SamplingParams
 
+        engine, loop = batched_engine
         params = SamplingParams(
             max_tokens=1,
             temperature=0.0,
             prefill_only=True,
-            prefill_output="",  # No logits capture
+            prefill_output="",
         )
 
-        output = asyncio.get_event_loop().run_until_complete(
-            batched_engine._engine.generate(
-                prompt="Test",
-                sampling_params=params,
-            )
-        )
+        output = loop.run_until_complete(engine._engine.generate(
+            prompt="Test",
+            sampling_params=params,
+        ))
 
         assert output.last_logits is None
 
@@ -359,13 +339,13 @@ class TestASRE2E:
 
         engine = ASREngine(model_name=str(asr_model))
         try:
-            asyncio.get_event_loop().run_until_complete(engine.start())
+            asyncio.run(engine.start())
         except ImportError:
             pytest.skip("mlx-audio not installed")
         except Exception as e:
             pytest.skip(f"Failed to load ASR model: {e}")
         yield engine
-        asyncio.get_event_loop().run_until_complete(engine.stop())
+        asyncio.run(engine.stop())
         gc.collect()
         mx.clear_cache()
 
@@ -401,7 +381,7 @@ class TestASRE2E:
             f.write(struct.pack("<I", data_size))
             f.write(b"\x00" * data_size)
 
-        output = asyncio.get_event_loop().run_until_complete(
+        output = asyncio.run(
             asr_engine.transcribe(str(wav_path))
         )
 
@@ -437,13 +417,13 @@ class TestTTSE2E:
 
         engine = TTSEngine(model_name=str(tts_model))
         try:
-            asyncio.get_event_loop().run_until_complete(engine.start())
+            asyncio.run(engine.start())
         except ImportError:
             pytest.skip("mlx-audio not installed")
         except Exception as e:
             pytest.skip(f"Failed to load TTS model: {e}")
         yield engine
-        asyncio.get_event_loop().run_until_complete(engine.stop())
+        asyncio.run(engine.stop())
         gc.collect()
         mx.clear_cache()
 
@@ -456,7 +436,7 @@ class TestTTSE2E:
         """Test speech synthesis produces valid WAV audio."""
         import asyncio
 
-        output = asyncio.get_event_loop().run_until_complete(
+        output = asyncio.run(
             tts_engine.synthesize(text="Hello world.")
         )
 
@@ -497,11 +477,11 @@ class TestTTSASRRoundTrip:
 
         engine = TTSEngine(model_name=str(model))
         try:
-            asyncio.get_event_loop().run_until_complete(engine.start())
+            asyncio.run(engine.start())
         except Exception as e:
             pytest.skip(f"Failed to load TTS model: {e}")
         yield engine
-        asyncio.get_event_loop().run_until_complete(engine.stop())
+        asyncio.run(engine.stop())
         gc.collect()
         mx.clear_cache()
 
@@ -520,11 +500,11 @@ class TestTTSASRRoundTrip:
 
         engine = ASREngine(model_name=str(model))
         try:
-            asyncio.get_event_loop().run_until_complete(engine.start())
+            asyncio.run(engine.start())
         except Exception as e:
             pytest.skip(f"Failed to load ASR model: {e}")
         yield engine
-        asyncio.get_event_loop().run_until_complete(engine.stop())
+        asyncio.run(engine.stop())
         gc.collect()
         mx.clear_cache()
 
@@ -535,7 +515,7 @@ class TestTTSASRRoundTrip:
         source_text = "The quick brown fox jumps over the lazy dog."
 
         # Step 1: TTS — text to audio
-        tts_output = asyncio.get_event_loop().run_until_complete(
+        tts_output = asyncio.run(
             tts_engine.synthesize(text=source_text)
         )
         assert tts_output.audio_bytes is not None
@@ -546,7 +526,7 @@ class TestTTSASRRoundTrip:
         wav_path.write_bytes(tts_output.audio_bytes)
 
         # Step 2: ASR — audio back to text
-        asr_output = asyncio.get_event_loop().run_until_complete(
+        asr_output = asyncio.run(
             asr_engine.transcribe(str(wav_path))
         )
 

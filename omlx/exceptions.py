@@ -400,6 +400,35 @@ class ModelLoadingError(EnginePoolError):
 
 
 # =============================================================================
+# Audio Errors
+# =============================================================================
+
+
+class AudioError(OMLXError):
+    """Base exception for audio-related errors."""
+
+    pass
+
+
+class InvalidAudioFormatError(AudioError):
+    """Unsupported or corrupt audio file."""
+
+    pass
+
+
+class VoiceCloningError(AudioError):
+    """Voice cloning failed (missing ref_audio, invalid format, etc.)."""
+
+    pass
+
+
+class UnsupportedOutputFormatError(AudioError):
+    """Requested output format is not supported."""
+
+    pass
+
+
+# =============================================================================
 # MCP Errors
 # =============================================================================
 

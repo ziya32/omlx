@@ -172,7 +172,7 @@ class TestServerConfig:
         assert args == ["serve", "--base-path", base, "--port", "8000"]
 
     def test_build_serve_args_with_model_dir(self):
-        """Test build_serve_args does not include model_dir (server reads settings.json)."""
+        """Test build_serve_args does NOT include model_dir (read from settings.json)."""
         config = ServerConfig(
             base_path="/test/base",
             port=9000,
@@ -181,6 +181,8 @@ class TestServerConfig:
         args = config.build_serve_args()
 
         base = str(Path("/test/base").expanduser())
+        # model_dir is intentionally not passed via CLI args — the server
+        # reads model_dirs from settings.json to support multi-directory configs.
         assert args == [
             "serve",
             "--base-path", base,

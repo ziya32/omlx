@@ -110,7 +110,7 @@ def get_ssd_capacity(path: str | Path) -> int:
 class ServerSettings:
     """Server configuration settings."""
 
-    host: str = "127.0.0.1"
+    host: str = "0.0.0.0"
     port: int = 8000
     log_level: str = "info"
     cors_origins: list[str] = field(default_factory=lambda: ["*"])
@@ -123,7 +123,7 @@ class ServerSettings:
     def from_dict(cls, data: dict[str, Any]) -> ServerSettings:
         """Create from dictionary."""
         return cls(
-            host=data.get("host", "127.0.0.1"),
+            host=data.get("host", "0.0.0.0"),
             port=data.get("port", 8000),
             log_level=data.get("log_level", "info"),
             cors_origins=data.get("cors_origins", ["*"]),
@@ -578,6 +578,29 @@ class ClaudeCodeSettings:
 
 
 @dataclass
+class DiscoverySettings:
+    """mDNS/Bonjour service discovery settings."""
+
+    enabled: bool = True  # Auto-publish when host != 127.0.0.1
+    service_name: str = ""  # Override mDNS instance name (default: hostname)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "enabled": self.enabled,
+            "service_name": self.service_name,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> DiscoverySettings:
+        """Create from dictionary."""
+        return cls(
+            enabled=data.get("enabled", True),
+            service_name=data.get("service_name", ""),
+        )
+
+
+@dataclass
 class IntegrationSettings:
     """Other integrations settings (Codex, OpenCode, OpenClaw)."""
 
@@ -631,6 +654,7 @@ class GlobalSettings:
     sampling: SamplingSettings = field(default_factory=SamplingSettings)
     logging: LoggingSettings = field(default_factory=LoggingSettings)
     claude_code: ClaudeCodeSettings = field(default_factory=ClaudeCodeSettings)
+    discovery: DiscoverySettings = field(default_factory=DiscoverySettings)
     integrations: IntegrationSettings = field(default_factory=IntegrationSettings)
     ui: UISettings = field(default_factory=UISettings)
 
@@ -718,6 +742,8 @@ class GlobalSettings:
                 self.logging = LoggingSettings.from_dict(data["logging"])
             if "claude_code" in data:
                 self.claude_code = ClaudeCodeSettings.from_dict(data["claude_code"])
+            if "discovery" in data:
+                self.discovery = DiscoverySettings.from_dict(data["discovery"])
             if "integrations" in data:
                 self.integrations = IntegrationSettings.from_dict(
                     data["integrations"]
@@ -791,6 +817,10 @@ class GlobalSettings:
         # MCP settings
         if mcp_config := os.getenv("OMLX_MCP_CONFIG"):
             self.mcp.config_path = mcp_config
+
+        # Discovery settings
+        if discovery_enabled := os.getenv("OMLX_DISCOVERY_ENABLED"):
+            self.discovery.enabled = discovery_enabled.lower() in ("true", "1", "yes")
 
         # HuggingFace settings
         if hf_endpoint := os.getenv("OMLX_HF_ENDPOINT"):
@@ -896,6 +926,7 @@ class GlobalSettings:
             "sampling": self.sampling.to_dict(),
             "logging": self.logging.to_dict(),
             "claude_code": self.claude_code.to_dict(),
+            "discovery": self.discovery.to_dict(),
             "integrations": self.integrations.to_dict(),
             "ui": self.ui.to_dict(),
         }
@@ -1105,6 +1136,7 @@ class GlobalSettings:
             "sampling": self.sampling.to_dict(),
             "logging": self.logging.to_dict(),
             "claude_code": self.claude_code.to_dict(),
+            "discovery": self.discovery.to_dict(),
             "integrations": self.integrations.to_dict(),
             "ui": self.ui.to_dict(),
         }
