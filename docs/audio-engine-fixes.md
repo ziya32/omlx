@@ -550,7 +550,10 @@ The plan reads as entirely future work, but the following are already implemente
 - `schema.py` hardcodes `SPEAKERS = ["Vivian", "Serena", "Ryan", "Aiden"]`
 - If speakers change upstream in the TTS model, nanobot's validation list becomes stale
 - The speakers endpoint (`/v1/audio/speakers`) returns the actual list from the model
-- [Ola] Valid observation but low risk — these are Qwen3-TTS preset speakers which are baked into the model weights and won't change. If a new TTS model with different speakers is added, both the omlx model config and nanobot config would need updating anyway. Not worth the complexity of dynamic fetching.
+- [Ola] Fixed: nanobot now fetches speakers from omlx at startup via
+  `KnowledgeService.fetch_speakers()` → `GET /v1/audio/speakers`. The response
+  updates `VoiceConfig.SPEAKERS` dynamically, keeping it in sync with whatever
+  TTS model is loaded. Falls back to the hardcoded default if omlx is unavailable.
 
 **14. `_tts_and_emit()` doesn't use streaming**
 - `handlers.py:612-628` generates complete audio before emitting the WebSocket event
