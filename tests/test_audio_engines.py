@@ -2,9 +2,24 @@
 """Tests for omlx.engine.asr and omlx.engine.tts modules."""
 
 import struct
+import wave
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+
+@pytest.fixture
+def wav_path(tmp_path):
+    """Create a minimal valid WAV file (0.1s of silence, 16kHz mono 16-bit)."""
+    path = tmp_path / "test_audio.wav"
+    sample_rate = 16000
+    n_samples = 1600  # 0.1 seconds
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(b"\x00\x00" * n_samples)
+    return str(path)
 
 
 def _make_stt_module(**overrides):
@@ -159,13 +174,13 @@ class TestASREngineLifecycle:
 class TestASREngineTranscribe:
     """Test ASREngine.transcribe with mocked generate_transcription."""
 
-    async def test_transcribe_not_started_raises(self):
+    async def test_transcribe_not_started_raises(self, wav_path):
         from omlx.engine.asr import ASREngine
         engine = ASREngine(model_name="whisper-tiny")
         with pytest.raises(RuntimeError, match="Engine not started"):
-            await engine.transcribe("/tmp/audio.wav")
+            await engine.transcribe(wav_path)
 
-    async def test_transcribe_auto_language(self):
+    async def test_transcribe_auto_language(self, wav_path):
         from omlx.engine.asr import ASREngine, TranscriptionOutput
 
         mock_gen = MagicMock(return_value=_make_stt_output(
@@ -175,10 +190,10 @@ class TestASREngineTranscribe:
         ))
 
         engine = ASREngine(model_name="whisper-tiny")
-        engine._model = MagicMock(name="model")
+        engine._model = MagicMock(name="model", sample_rate=16000)
 
         with _patch_stt_generate(mock_gen):
-            result = await engine.transcribe("/tmp/audio.wav", language="auto")
+            result = await engine.transcribe(wav_path, language="auto")
 
         assert isinstance(result, TranscriptionOutput)
         assert result.text == "Hello world"
@@ -187,10 +202,10 @@ class TestASREngineTranscribe:
         # language="auto" should not pass language kwarg
         mock_gen.assert_called_once_with(
             model=engine._model,
-            audio="/tmp/audio.wav",
+            audio=wav_path,
         )
 
-    async def test_transcribe_explicit_language(self):
+    async def test_transcribe_explicit_language(self, wav_path):
         from omlx.engine.asr import ASREngine
 
         mock_gen = MagicMock(return_value=_make_stt_output(
@@ -199,63 +214,63 @@ class TestASREngineTranscribe:
         ))
 
         engine = ASREngine(model_name="whisper-tiny")
-        engine._model = MagicMock()
+        engine._model = MagicMock(sample_rate=16000)
 
         with _patch_stt_generate(mock_gen):
-            result = await engine.transcribe("/tmp/audio.wav", language="fr")
+            result = await engine.transcribe(wav_path, language="fr")
 
         assert result.text == "Bonjour"
         assert result.language == "fr"
         assert result.duration is None
         mock_gen.assert_called_once_with(
             model=engine._model,
-            audio="/tmp/audio.wav",
+            audio=wav_path,
             language="fr",
         )
 
-    async def test_transcribe_no_segments(self):
+    async def test_transcribe_no_segments(self, wav_path):
         from omlx.engine.asr import ASREngine
 
         mock_gen = MagicMock(return_value=_make_stt_output(text="test"))
 
         engine = ASREngine(model_name="whisper-tiny")
-        engine._model = MagicMock()
+        engine._model = MagicMock(sample_rate=16000)
 
         with _patch_stt_generate(mock_gen):
-            result = await engine.transcribe("/tmp/audio.wav")
+            result = await engine.transcribe(wav_path)
 
         assert result.text == "test"
         assert result.language is None
         assert result.duration is None
 
-    async def test_transcribe_empty_segments(self):
+    async def test_transcribe_empty_segments(self, wav_path):
         from omlx.engine.asr import ASREngine
 
         mock_gen = MagicMock(return_value=_make_stt_output(text="test", segments=[]))
 
         engine = ASREngine(model_name="whisper-tiny")
-        engine._model = MagicMock()
+        engine._model = MagicMock(sample_rate=16000)
 
         with _patch_stt_generate(mock_gen):
-            result = await engine.transcribe("/tmp/audio.wav")
+            result = await engine.transcribe(wav_path)
 
         assert result.duration is None
 
-    async def test_transcribe_empty_result(self):
+    async def test_transcribe_empty_result(self, wav_path):
         """Handles result with no text gracefully."""
         from omlx.engine.asr import ASREngine
 
         mock_gen = MagicMock(return_value=_make_stt_output(text=None))
 
         engine = ASREngine(model_name="whisper-tiny")
-        engine._model = MagicMock()
+        engine._model = MagicMock(sample_rate=16000)
 
         with _patch_stt_generate(mock_gen):
-            result = await engine.transcribe("/tmp/audio.wav")
+            result = await engine.transcribe(wav_path)
 
         assert result.text == ""
 
-    async def test_transcribe_multi_segment_duration(self):
+    async def test_transcribe_multi_segment_duration(self, wav_path):
         """Duration comes from the last segment's end time."""
         from omlx.engine.asr import ASREngine
 
@@ -270,14 +285,14 @@ class TestASREngineTranscribe:
         ))
 
         engine = ASREngine(model_name="whisper-tiny")
-        engine._model = MagicMock()
+        engine._model = MagicMock(sample_rate=16000)
 
         with _patch_stt_generate(mock_gen):
-            result = await engine.transcribe("/tmp/audio.wav")
+            result = await engine.transcribe(wav_path)
 
         assert result.duration == 5.2
 
-    async def test_transcribe_language_as_list(self):
+    async def test_transcribe_language_as_list(self, wav_path):
         """Handles language returned as list (newer mlx_audio versions)."""
         from omlx.engine.asr import ASREngine
 
@@ -287,14 +302,14 @@ class TestASREngineTranscribe:
         ))
 
         engine = ASREngine(model_name="whisper-tiny")
-        engine._model = MagicMock()
+        engine._model = MagicMock(sample_rate=16000)
 
         with _patch_stt_generate(mock_gen):
-            result = await engine.transcribe("/tmp/audio.wav")
+            result = await engine.transcribe(wav_path)
 
         assert result.language == "en"
 
-    async def test_transcribe_language_none_string(self):
+    async def test_transcribe_language_none_string(self, wav_path):
         """Handles language='None' string from silent audio."""
         from omlx.engine.asr import ASREngine
 
@@ -304,10 +319,10 @@ class TestASREngineTranscribe:
         ))
 
         engine = ASREngine(model_name="whisper-tiny")
-        engine._model = MagicMock()
+        engine._model = MagicMock(sample_rate=16000)
 
         with _patch_stt_generate(mock_gen):
-            result = await engine.transcribe("/tmp/audio.wav")
+            result = await engine.transcribe(wav_path)
 
         assert result.language is None
 

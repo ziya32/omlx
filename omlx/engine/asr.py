@@ -161,8 +161,9 @@ class ASREngine(BaseNonStreamingEngine):
 
         try:
             chunks = await loop.run_in_executor(executor, _load_and_split)
-        except (ImportError, AttributeError):
+        except (ImportError, AttributeError, TypeError):
             # Model doesn't support split_audio_into_chunks (not Qwen3-ASR)
+            # or has incompatible types (e.g. non-numeric sample_rate)
             # — fall back to single-call path
             chunks = None
 

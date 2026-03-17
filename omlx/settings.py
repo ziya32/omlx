@@ -658,6 +658,10 @@ class GlobalSettings:
     integrations: IntegrationSettings = field(default_factory=IntegrationSettings)
     ui: UISettings = field(default_factory=UISettings)
 
+    # Engine pool drain/wait timeouts (CLI-only, not persisted to settings.json)
+    drain_timeout: float | None = None      # None = use EnginePool default (120s)
+    max_wait_timeout: float | None = None   # None = use EnginePool default (300s)
+
     @classmethod
     def load(
         cls,
@@ -906,6 +910,12 @@ class GlobalSettings:
         # ModelScope settings
         if hasattr(args, "ms_endpoint") and args.ms_endpoint is not None:
             self.modelscope.endpoint = args.ms_endpoint
+
+        # Engine pool drain/wait timeouts
+        if hasattr(args, "drain_timeout") and args.drain_timeout is not None:
+            self.drain_timeout = args.drain_timeout
+        if hasattr(args, "max_wait_timeout") and args.max_wait_timeout is not None:
+            self.max_wait_timeout = args.max_wait_timeout
 
     def save(self) -> None:
         """Save current settings to the settings file."""

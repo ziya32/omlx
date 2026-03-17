@@ -25,7 +25,7 @@ def mock_engine_pool():
     """Create a mock EnginePool with required methods."""
     pool = MagicMock()
     pool._lock = asyncio.Lock()
-    pool._find_lru_victim = MagicMock(return_value="model-a")
+    pool._find_drain_or_evict_candidate = MagicMock(return_value="model-a")
     pool._unload_engine = AsyncMock()
     pool._entries = {}
     return pool
@@ -74,7 +74,7 @@ class TestCheckAndEnforce:
             "model-a": entry_a,
             "model-b": entry_b,
         }
-        enforcer._engine_pool._find_lru_victim.return_value = "model-a"
+        enforcer._engine_pool._find_drain_or_evict_candidate.return_value = "model-a"
 
         async def fake_unload(model_id):
             enforcer._engine_pool._entries[model_id].engine = None
@@ -93,7 +93,7 @@ class TestCheckAndEnforce:
     @pytest.mark.asyncio
     async def test_stops_when_all_pinned(self, enforcer):
         """Stops eviction when all models are pinned (no victim)."""
-        enforcer._engine_pool._find_lru_victim.return_value = None
+        enforcer._engine_pool._find_drain_or_evict_candidate.return_value = None
         # Add a pinned loaded model so the log says "pinned"
         entry = _make_entry("pinned-model", engine=MagicMock(), is_pinned=True)
         enforcer._engine_pool._entries = {"pinned-model": entry}
@@ -123,7 +123,7 @@ class TestCheckAndEnforce:
             "model-b": entry_b,
             "model-c": entry_c,
         }
-        enforcer._engine_pool._find_lru_victim.side_effect = [
+        enforcer._engine_pool._find_drain_or_evict_candidate.side_effect = [
             "model-a",
             "model-b",
         ]
@@ -146,7 +146,7 @@ class TestCheckAndEnforce:
     @pytest.mark.asyncio
     async def test_aborts_loading_model_when_no_lru_victim(self, enforcer):
         """Aborts a loading model when no LRU victim is available."""
-        enforcer._engine_pool._find_lru_victim.return_value = None
+        enforcer._engine_pool._find_drain_or_evict_candidate.return_value = None
         loading_entry = _make_entry(
             "loading-model", engine=None, is_loading=True
         )
@@ -187,7 +187,7 @@ class TestCheckAndEnforce:
         enforcer._engine_pool._unload_engine.side_effect = fake_unload
 
         # First call returns victim, second call returns None
-        enforcer._engine_pool._find_lru_victim.side_effect = [
+        enforcer._engine_pool._find_drain_or_evict_candidate.side_effect = [
             "model-a",
             None,
         ]
@@ -208,7 +208,7 @@ class TestCheckAndEnforce:
     @pytest.mark.asyncio
     async def test_no_models_loaded_or_loading(self, enforcer):
         """Logs correctly when no models are loaded or loading."""
-        enforcer._engine_pool._find_lru_victim.return_value = None
+        enforcer._engine_pool._find_drain_or_evict_candidate.return_value = None
         enforcer._engine_pool._entries = {}
 
         with patch("omlx.process_memory_enforcer.mx") as mock_mx:
@@ -361,7 +361,7 @@ class TestSingleModelMemoryPressure:
         engine.abort_all_requests = AsyncMock(return_value=3)
         entry = _make_entry("big-model", engine=engine)
         enforcer._engine_pool._entries = {"big-model": entry}
-        enforcer._engine_pool._find_lru_victim.return_value = "big-model"
+        enforcer._engine_pool._find_drain_or_evict_candidate.return_value = "big-model"
 
         with patch("omlx.process_memory_enforcer.mx") as mock_mx:
             mock_mx.get_active_memory.side_effect = [
@@ -381,7 +381,7 @@ class TestSingleModelMemoryPressure:
         engine.abort_all_requests = AsyncMock(return_value=0)
         entry = _make_entry("big-model", engine=engine)
         enforcer._engine_pool._entries = {"big-model": entry}
-        enforcer._engine_pool._find_lru_victim.return_value = "big-model"
+        enforcer._engine_pool._find_drain_or_evict_candidate.return_value = "big-model"
 
         with patch("omlx.process_memory_enforcer.mx") as mock_mx:
             mock_mx.get_active_memory.side_effect = [
@@ -412,7 +412,7 @@ class TestSingleModelMemoryPressure:
             "active-model": entry_active,
             "idle-model": entry_idle,
         }
-        enforcer._engine_pool._find_lru_victim.return_value = "idle-model"
+        enforcer._engine_pool._find_drain_or_evict_candidate.return_value = "idle-model"
 
         async def fake_unload(model_id):
             enforcer._engine_pool._entries[model_id].engine = None
@@ -451,7 +451,7 @@ class TestSingleModelMemoryPressure:
             "model-b": entry_b,
         }
         # First iteration: model-b is LRU. After eviction: model-a is sole.
-        enforcer._engine_pool._find_lru_victim.side_effect = [
+        enforcer._engine_pool._find_drain_or_evict_candidate.side_effect = [
             "model-b",
             "model-a",
         ]

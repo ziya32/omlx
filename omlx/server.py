@@ -686,10 +686,11 @@ async def get_engine(
         raise HTTPException(status_code=404, detail=detail)
     except ModelTooLargeError as e:
         raise HTTPException(status_code=507, detail=str(e))
+    except ModelLoadingError as e:
+        # ModelLoadingError now represents wait timeouts and load cooldown
+        raise HTTPException(status_code=504, detail=str(e))
     except InsufficientMemoryError as e:
         raise HTTPException(status_code=507, detail=str(e))
-    except ModelLoadingError as e:
-        raise HTTPException(status_code=409, detail=str(e))
     except EnginePoolError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1170,10 +1171,15 @@ def init_server(
             logger.warning(f"Model directory created (empty): {md}")
 
     # Create engine pool
-    _server_state.engine_pool = EnginePool(
+    ep_kwargs: dict = dict(
         max_model_memory=max_model_memory,
         scheduler_config=scheduler_config,
     )
+    if global_settings and getattr(global_settings, "drain_timeout", None) is not None:
+        ep_kwargs["drain_timeout"] = global_settings.drain_timeout
+    if global_settings and getattr(global_settings, "max_wait_timeout", None) is not None:
+        ep_kwargs["max_wait_timeout"] = global_settings.max_wait_timeout
+    _server_state.engine_pool = EnginePool(**ep_kwargs)
 
     # Discover models (use pinned models from settings file)
     _server_state.engine_pool._settings_manager = _server_state.settings_manager

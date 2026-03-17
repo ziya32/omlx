@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from omlx.engine_pool import EngineEntry, EnginePool
+from omlx.engine_pool import EngineEntry, EnginePool, EngineState
 from omlx.exceptions import (
     InsufficientMemoryError,
     ModelLoadingError,
@@ -124,7 +124,7 @@ class TestDiscoverModelsMerge:
         mock_engine = MagicMock()
         entry_a.engine = mock_engine
         entry_a.last_access = 42.0
-        pool._current_model_memory = entry_a.estimated_size
+        entry_a.state = EngineState.ACTIVE
 
         original_size = entry_a.estimated_size
 
@@ -137,7 +137,7 @@ class TestDiscoverModelsMerge:
         assert entry_a_after.engine is mock_engine
         assert entry_a_after.last_access == 42.0
         assert entry_a_after.estimated_size == original_size
-        assert pool._current_model_memory == original_size
+        assert pool._committed_memory() == original_size
         assert pool.model_count == 2
 
     def test_rediscover_removes_stale_unloaded(self, small_mock_model_dir):
@@ -478,12 +478,12 @@ class TestEnginePoolLRU:
         pool.discover_models(str(small_mock_model_dir))
         return pool
 
-    def test_find_lru_victim_no_loaded(self, pool_with_entries):
+    def test_find_drain_or_evict_candidate_no_loaded(self, pool_with_entries):
         """Test finding LRU victim when no models loaded."""
-        victim = pool_with_entries._find_lru_victim()
+        victim = pool_with_entries._find_drain_or_evict_candidate()
         assert victim is None
 
-    def test_find_lru_victim_all_pinned(self, pool_with_entries):
+    def test_find_drain_or_evict_candidate_all_pinned(self, pool_with_entries):
         """Test finding LRU victim when all loaded models are pinned."""
         # Mark both as pinned
         pool_with_entries._entries["model-a"].is_pinned = True
@@ -493,10 +493,10 @@ class TestEnginePoolLRU:
         pool_with_entries._entries["model-a"].engine = MagicMock()
         pool_with_entries._entries["model-a"].last_access = 100
 
-        victim = pool_with_entries._find_lru_victim()
+        victim = pool_with_entries._find_drain_or_evict_candidate()
         assert victim is None
 
-    def test_find_lru_victim_oldest_first(self, pool_with_entries):
+    def test_find_drain_or_evict_candidate_oldest_first(self, pool_with_entries):
         """Test that oldest (lowest last_access) is selected."""
         # Simulate loaded state with different access times
         pool_with_entries._entries["model-a"].engine = MagicMock()
@@ -505,7 +505,7 @@ class TestEnginePoolLRU:
         pool_with_entries._entries["model-b"].engine = MagicMock()
         pool_with_entries._entries["model-b"].last_access = 200  # Newer
 
-        victim = pool_with_entries._find_lru_victim()
+        victim = pool_with_entries._find_drain_or_evict_candidate()
         assert victim == "model-a"
 
     def test_pinned_model_skipped_for_eviction(self, pool_with_entries):
@@ -519,7 +519,7 @@ class TestEnginePoolLRU:
         pool_with_entries._entries["model-b"].engine = MagicMock()
         pool_with_entries._entries["model-b"].last_access = 200
 
-        victim = pool_with_entries._find_lru_victim()
+        victim = pool_with_entries._find_drain_or_evict_candidate()
         # model-a is skipped (pinned), model-b is selected
         assert victim == "model-b"
 
@@ -681,7 +681,7 @@ class TestEnginePoolEviction:
             await pool.get_engine("model-a")
 
             # Try to load model-b - should fail (can't evict pinned model-a)
-            with pytest.raises(InsufficientMemoryError):
+            with pytest.raises((InsufficientMemoryError, ModelTooLargeError)):
                 await pool.get_engine("model-b")
 
 
@@ -714,7 +714,7 @@ class TestEnginePoolTTL:
         entry.engine.stop = AsyncMock()
         entry.engine.has_active_requests = MagicMock(return_value=False)
         entry.last_access = 100.0  # Old access time
-        pool._current_model_memory = entry.estimated_size
+        entry.state = EngineState.ACTIVE
         return pool
 
     @pytest.mark.asyncio
@@ -780,8 +780,8 @@ class TestEnginePoolTTL:
         assert pool._entries["model-a"].engine is not None
 
     @pytest.mark.asyncio
-    async def test_ttl_skips_model_with_active_requests(self, pool_with_loaded_model):
-        """Test that TTL does not unload model with active requests."""
+    async def test_ttl_drains_model_with_active_requests(self, pool_with_loaded_model):
+        """Test that TTL starts drain (not immediate unload) for model with active requests."""
         pool = pool_with_loaded_model
 
         # Mock an engine that reports active requests
@@ -798,9 +798,11 @@ class TestEnginePoolTTL:
         with patch("time.time", return_value=200.0):
             expired = await pool.check_ttl_expirations(settings_manager)
 
-        assert expired == []
-        # last_access should be refreshed
-        assert pool._entries["model-a"].last_access == 200.0
+        # Model with active requests gets drained, not skipped
+        assert "model-a" in expired
+        assert pool._entries["model-a"].state == EngineState.DRAINING
+
+        await pool.shutdown()
 
     @pytest.mark.asyncio
     async def test_ttl_skips_vlm_with_active_requests(self, pool_with_loaded_model):

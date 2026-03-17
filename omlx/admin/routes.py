@@ -316,16 +316,16 @@ async def _apply_model_dirs_runtime(model_dirs: list[str]) -> tuple[bool, str]:
         pinned_models = _server_state.settings_manager.get_pinned_model_ids()
 
     # Unload all loaded models
-    loaded_models = pool.get_loaded_model_ids()
-    for model_id in loaded_models:
-        try:
-            await pool._unload_engine(model_id)
-        except Exception as e:
-            logger.warning(f"Error unloading {model_id}: {e}")
+    async with pool._tracked_lock("admin_rediscover"):
+        loaded_models = pool.get_loaded_model_ids()
+        for model_id in loaded_models:
+            try:
+                await pool._unload_engine(model_id)
+            except Exception as e:
+                logger.warning(f"Error unloading {model_id}: {e}")
 
-    # Clear entries
-    pool._entries.clear()
-    pool._current_model_memory = 0
+        # Clear entries
+        pool._entries.clear()
 
     # Update downloader model directories
     global _hf_downloader, _ms_downloader
@@ -424,13 +424,14 @@ async def _apply_max_model_memory_runtime(
 
     # If current usage exceeds new limit, unload LRU models
     unloaded = []
-    while pool._current_model_memory > max_memory_bytes:
-        victim = pool._find_lru_victim()
-        if not victim:
-            # All models are pinned, can't free more memory
-            break
-        await pool._unload_engine(victim)
-        unloaded.append(victim)
+    async with pool._tracked_lock("admin_max_memory"):
+        while pool._committed_memory() > max_memory_bytes:
+            victim = pool._find_drain_or_evict_candidate()
+            if not victim:
+                # All models are pinned, can't free more memory
+                break
+            await pool._unload_engine(victim)
+            unloaded.append(victim)
 
     msg = f"Max model memory changed: {old_display} -> {format_size(max_memory_bytes)}"
     if unloaded:
@@ -581,12 +582,13 @@ async def _apply_cache_settings_runtime(
         )
 
     # Unload all loaded models so they use new config when reloaded
-    loaded_models = pool.get_loaded_model_ids()
-    for model_id in loaded_models:
-        try:
-            await pool._unload_engine(model_id)
-        except Exception as e:
-            logger.warning(f"Error unloading {model_id}: {e}")
+    async with pool._tracked_lock("admin_cache_settings"):
+        loaded_models = pool.get_loaded_model_ids()
+        for model_id in loaded_models:
+            try:
+                await pool._unload_engine(model_id)
+            except Exception as e:
+                logger.warning(f"Error unloading {model_id}: {e}")
 
     return True, f"Cache settings updated. Unloaded {len(loaded_models)} models."
 
@@ -1352,7 +1354,8 @@ async def unload_model(
     if entry.engine is None:
         raise HTTPException(status_code=400, detail=f"Model not loaded: {model_id}")
 
-    await engine_pool._unload_engine(model_id)
+    async with engine_pool._tracked_lock("admin_unload"):
+        await engine_pool._unload_engine(model_id)
     logger.info(f"Manually unloaded model: {model_id}")
     return {"status": "ok", "model_id": model_id, "message": f"Unloaded {model_id}"}
 
@@ -3077,7 +3080,8 @@ async def delete_hf_model(
         loaded_ids = engine_pool.get_loaded_model_ids()
         if model_name in loaded_ids:
             try:
-                await engine_pool._unload_engine(model_name)
+                async with engine_pool._tracked_lock("admin_delete"):
+                    await engine_pool._unload_engine(model_name)
                 logger.info(f"Unloaded model '{model_name}' before deletion")
             except Exception as e:
                 logger.warning(f"Failed to unload model '{model_name}': {e}")

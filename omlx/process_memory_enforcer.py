@@ -218,9 +218,9 @@ class ProcessMemoryEnforcer:
         # Acquire EnginePool lock and unload LRU models until under limit.
         # Note: prefill loops self-check via _memory_limit_bytes (same thread,
         # no GIL issue), so they will abort independently of this enforcer.
-        async with self._engine_pool._lock:
+        async with self._engine_pool._tracked_lock("process_memory_enforcer"):
             while mx.get_active_memory() > self._max_bytes:
-                victim = self._engine_pool._find_lru_victim()
+                victim = self._engine_pool._find_drain_or_evict_candidate()
                 if victim is not None:
                     # Count loaded non-pinned models
                     loaded_non_pinned = [

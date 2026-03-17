@@ -392,11 +392,24 @@ class InsufficientMemoryError(EnginePoolError):
 
 
 class ModelLoadingError(EnginePoolError):
-    """Raised when a model is already being loaded."""
+    """Raised when a model load fails, times out, or is in cooldown."""
 
-    def __init__(self, model_id: str):
-        self.model_id = model_id
-        super().__init__(f"Model '{model_id}' is already being loaded")
+    def __init__(self, model_id_or_message: str | None = None, *, model_id: str | None = None):
+        if model_id is not None and model_id_or_message is not None:
+            # Explicit model_id + custom message
+            self.model_id = model_id
+            super().__init__(model_id_or_message)
+        elif model_id is not None:
+            # Keyword-only: model_id=...
+            self.model_id = model_id
+            super().__init__(f"Model '{model_id}' is already being loaded")
+        elif model_id_or_message is not None:
+            # Legacy: single positional arg is the model_id
+            self.model_id = model_id_or_message
+            super().__init__(f"Model '{model_id_or_message}' is already being loaded")
+        else:
+            self.model_id = ""
+            super().__init__("Model loading error")
 
 
 # =============================================================================

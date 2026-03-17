@@ -15,9 +15,24 @@ asyncio event loop thread.
 
 import asyncio
 import threading
+import wave
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+
+@pytest.fixture
+def wav_path(tmp_path):
+    """Create a minimal valid WAV file (0.1s of silence, 16kHz mono 16-bit)."""
+    path = tmp_path / "test_audio.wav"
+    sample_rate = 16000
+    n_samples = 1600  # 0.1 seconds
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(b"\x00\x00" * n_samples)
+    return str(path)
 
 
 def _get_executor_thread_name() -> str:
@@ -161,7 +176,7 @@ class TestASRThreadSafety:
             f"This would cause Metal command buffer races!"
         )
 
-    async def test_transcribe_runs_on_executor_thread(self):
+    async def test_transcribe_runs_on_executor_thread(self, wav_path):
         """ASR transcription must run on the executor thread."""
         from omlx.engine.asr import ASREngine
 
@@ -180,14 +195,14 @@ class TestASRThreadSafety:
         mock_gen_module.generate_transcription = _mock_generate_transcription
 
         engine = ASREngine(model_name="whisper-tiny")
-        engine._model = MagicMock()
+        engine._model = MagicMock(sample_rate=16000)
 
         with patch.dict("sys.modules", {
             "mlx_audio": MagicMock(),
             "mlx_audio.stt": MagicMock(),
             "mlx_audio.stt.generate": mock_gen_module,
         }):
-            result = await engine.transcribe("/tmp/audio.wav")
+            result = await engine.transcribe(wav_path)
 
         executor_thread = _get_executor_thread_name()
         assert transcribe_thread_name == executor_thread, (

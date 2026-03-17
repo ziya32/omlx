@@ -493,6 +493,20 @@ Example directory structure:
         help="Max sequences for mlx-lm BatchGenerator completion phase (token generation). (default: 32)",
     )
 
+    # Model switching / drain options
+    serve_parser.add_argument(
+        "--drain-timeout",
+        type=float,
+        default=None,
+        help="Seconds before force-aborting a draining model (default: 120)",
+    )
+    serve_parser.add_argument(
+        "--max-wait-timeout",
+        type=float,
+        default=None,
+        help="Seconds before get_engine() gives up waiting for a model (default: 300)",
+    )
+
     # paged SSD cache options
     serve_parser.add_argument(
         "--paged-ssd-cache-dir",
