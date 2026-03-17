@@ -488,7 +488,9 @@ The plan reads as entirely future work, but the following are already implemente
 **7. No `GET /v1/audio/languages` endpoint**
 - Phase 8 says to add this endpoint
 - `ASREngine.get_languages()` is implemented but has no server route
-- [Ola] Fixed via speakers endpoint: languages are now populated from a loaded ASR engine. Separate endpoint not needed since the data is available in the existing response.
+- [Ola] Fixed: added `GET /v1/audio/languages` endpoint that loads the ASR model on
+  demand and returns supported language codes. Speakers endpoint reverted to TTS-only
+  (no longer conflates TTS speakers with ASR languages).
 
 **8. Phase 5a/5b not implemented**
 - No `_convert_audio()` function, no ffmpeg subprocess for format conversion

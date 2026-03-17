@@ -54,6 +54,9 @@ class MockASREngine(ASREngine):
             segments=[{"id": 0, "start": 0.0, "end": 3.5, "text": "This is a test transcription."}],
         )
 
+    def get_languages(self):
+        return ["en", "zh", "ja", "ko", "fr", "de", "es"]
+
     def get_stats(self):
         return {"model_name": self._model_name, "loaded": True}
 
@@ -472,6 +475,33 @@ class TestSpeakersEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert "speakers" in data
+
+
+class TestLanguagesEndpoint:
+    """Tests for GET /v1/audio/languages."""
+
+    def test_languages_list(self, client):
+        """Test languages endpoint returns supported languages."""
+        response = client.get(
+            "/v1/audio/languages",
+            params={"model": "test-asr-model"},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert "languages" in data
+        assert "en" in data["languages"]
+        assert "zh" in data["languages"]
+        assert data["model"] == "test-asr-model"
+
+    def test_languages_auto_detect_model(self, client):
+        """Test languages auto-detects ASR model when no model specified."""
+        response = client.get("/v1/audio/languages")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert "languages" in data
+        assert len(data["languages"]) > 0
 
 
 # ──────────────────────────────────────────────────────────────────────

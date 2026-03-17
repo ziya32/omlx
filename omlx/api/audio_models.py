@@ -77,3 +77,13 @@ class SpeakersResponse(BaseModel):
 
     languages: list[str] = Field(default_factory=list)
     """List of supported languages."""
+
+
+class LanguagesResponse(BaseModel):
+    """Response listing supported ASR languages."""
+
+    languages: list[str] = Field(default_factory=list)
+    """List of supported ISO language codes."""
+
+    model: str | None = None
+    """The ASR model these languages are from."""

@@ -115,6 +115,7 @@ from .api.audio_models import (
     SpeakersResponse,
     SpeechRequest,
     TranscriptionResponse,
+    LanguagesResponse,
     TranscriptionSegment,
     VerboseTranscriptionResponse,
 )
@@ -1989,19 +1990,39 @@ async def list_speakers(
     engine = await get_tts_engine(model)
     speakers = engine.get_speakers()
 
-    # Try to populate languages from a loaded ASR engine
-    languages: list[str] = []
-    pool = get_engine_pool()
-    for mid, entry in pool._entries.items():
-        if entry.engine_type == "asr" and entry.engine is not None:
-            from .engine.asr import ASREngine
-            if isinstance(entry.engine, ASREngine):
-                languages = entry.engine.get_languages()
-            break
-
     return SpeakersResponse(
         speakers=speakers,
+    )
+
+
+@app.get("/v1/audio/languages")
+async def list_languages(
+    model: str | None = None,
+    _: bool = Depends(verify_api_key),
+) -> LanguagesResponse:
+    """
+    List supported languages for an ASR model.
+
+    If no model is specified, uses the first available ASR model.
+    """
+    if model is None:
+        pool = get_engine_pool()
+        for mid, entry in pool._entries.items():
+            if entry.engine_type == "asr":
+                model = mid
+                break
+        if model is None:
+            raise HTTPException(
+                status_code=400,
+                detail="No ASR model specified and none available"
+            )
+
+    engine = await get_asr_engine(model)
+    languages = engine.get_languages()
+
+    return LanguagesResponse(
         languages=languages,
+        model=model,
     )
 
 
