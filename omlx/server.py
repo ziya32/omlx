@@ -1922,6 +1922,17 @@ async def create_speech(
         )
 
     if stream:
+        if speed != 1.0:
+            raise HTTPException(
+                status_code=400,
+                detail="Speed adjustment is not supported in streaming mode",
+            )
+        if fmt not in ("wav", "pcm"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Streaming only supports wav/pcm format, got {fmt}",
+            )
+
         async def _stream_pcm():
             async for chunk in engine.stream_synthesize(
                 text=request.input,

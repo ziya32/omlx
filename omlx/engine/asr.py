@@ -225,7 +225,9 @@ class ASREngine(BaseNonStreamingEngine):
                         adjusted["end"] = seg.get("end", 0.0) + offset
                         all_segments.append(adjusted)
 
-        full_text = " ".join(all_texts)
+        # CJK languages don't use spaces between words
+        sep = "" if detected_lang in ("zh", "ja", "ko", "yue") else " "
+        full_text = sep.join(t for t in all_texts if t)
         duration = all_segments[-1].get("end") if all_segments else None
 
         output = TranscriptionOutput(

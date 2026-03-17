@@ -75,9 +75,6 @@ class SpeakersResponse(BaseModel):
     speakers: list[str] = Field(default_factory=list)
     """List of available speaker names."""
 
-    languages: list[str] = Field(default_factory=list)
-    """List of supported languages."""
-
 
 class LanguagesResponse(BaseModel):
     """Response listing supported ASR languages."""

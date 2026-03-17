@@ -294,11 +294,11 @@ Sprint 6:  Phase 11 (nanobot updates)                     -- depends on Phase 5
 
 | Phase | Test | File |
 |-------|------|------|
-| 1 | TTL does not evict TTS engine during active synthesis | `tests/integration/test_phase0_endpoints.py` |
-| 2 | LLM inter-token latency stays below threshold during concurrent TTS | `tests/integration/test_phase0_e2e.py` |
-| 3 | Streaming TTS endpoint returns chunked data incrementally | `tests/integration/test_phase0_endpoints.py` |
-| 5c | `response_format=verbose_json` returns segments in transcription | `tests/integration/test_phase0_endpoints.py` |
-| 5a | `response_format=mp3` returns valid MP3 audio | `tests/integration/test_phase0_endpoints.py` |
+| 1 | TTL does not evict TTS engine during active synthesis | `tests/integration/test_audio_reranker_endpoints.py` |
+| 2 | LLM inter-token latency stays below threshold during concurrent TTS | `tests/integration/test_audio_reranker_e2e.py` |
+| 3 | Streaming TTS endpoint returns chunked data incrementally | `tests/integration/test_audio_reranker_endpoints.py` |
+| 5c | `response_format=verbose_json` returns segments in transcription | `tests/integration/test_audio_reranker_endpoints.py` |
+| 5a | `response_format=mp3` returns valid MP3 audio | `tests/integration/test_audio_reranker_endpoints.py` |
 
 ### Executor Contention Tests
 
@@ -559,3 +559,52 @@ The plan reads as entirely future work, but the following are already implemente
 - `handlers.py:612-628` generates complete audio before emitting the WebSocket event
 - Phase 11d acknowledges this as a future improvement
 - [Ola] Acknowledged, intentionally deferred. Streaming audio over WebSocket requires chunked events and client-side audio buffering/playback — significant frontend work for marginal benefit given typical TTS latency is 1-3 seconds.
+
+---
+
+## Code Review — Follow-up (2026-03-15)
+
+Verified all "[Ola] Fixed" items against the code. Most are correctly implemented.
+Found 2 bugs and 2 cleanup items.
+
+### Bugs
+
+**15. `variant` NameError in TTS error handlers**
+- `tts.py:312` (`_create_gen`) and `tts.py:402` (`_create_stream_gen`) reference `variant` but this variable is not defined in the enclosing `synthesize()` or `stream_synthesize()` scope
+- If `model.generate()` raises an exception for a base model, the error handler would hit `NameError: name 'variant' is not defined` instead of raising the intended `VoiceCloningError`
+- Both closures capture `self._variant` on line 308 (via f-string) for logging, but the error handler on line 312/402 uses bare `variant`
+- **Fix:** Change `variant` to `self._variant` on lines 312 and 402
+
+**16. Streaming path ignores `speed` and `response_format`**
+- `server.py:1725-1737` validates both `response_format` and `speed` before the streaming branch
+- `server.py:1739-1758` (streaming path) ignores both — always returns raw PCM at normal speed regardless of what the client requested
+- A client sending `speed=2.0&stream=true` gets validation pass but normal-speed audio
+- A client sending `response_format=mp3&stream=true` gets PCM back with `audio/pcm` content type
+- **Fix options:**
+  - (a) Reject non-default speed/format in streaming mode with a 400 error ("speed/format conversion not supported in streaming mode")
+  - (b) Apply ffmpeg post-processing per-chunk in the streaming path (adds latency per chunk, may not be worth it)
+  - Recommend option (a) — it's honest about the limitation and trivial to implement:
+    ```python
+    if stream:
+        if speed != 1.0:
+            raise HTTPException(400, "Speed adjustment not supported in streaming mode")
+        if fmt not in ("wav", "pcm"):
+            raise HTTPException(400, f"Streaming only supports wav/pcm format, got {fmt}")
+    ```
+
+### Cleanup
+
+**17. `SpeakersResponse.languages` field is vestigial**
+- `audio_models.py:92-93` still has `languages: list[str]` on `SpeakersResponse`
+- Now that `LanguagesResponse` exists as a separate model, this field is always empty
+- `server.py:1831-1833` returns `SpeakersResponse(speakers=speakers)` — `languages` defaults to `[]`
+- **Fix:** Remove the `languages` field from `SpeakersResponse`
+
+**18. ASR chunk text joining inserts spaces at CJK boundaries**
+- `asr.py:228`: `full_text = " ".join(all_texts)` unconditionally adds spaces between chunk texts
+- For Chinese/Japanese/Korean transcription, this inserts incorrect whitespace between chunk boundaries (e.g. `"你好" + " " + "世界"` → `"你好 世界"`)
+- **Fix:** Use detected language to decide separator:
+  ```python
+  sep = "" if detected_lang in ("zh", "ja", "ko", "yue") else " "
+  full_text = sep.join(t for t in all_texts if t)
+  ```

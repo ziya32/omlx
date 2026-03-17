@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-Integration tests for Phase 0 endpoints (audio + LLM reranker).
+Integration tests for audio and reranker endpoints.
 
 Tests FastAPI endpoints using TestClient with mocked engines to verify
 request/response formats without loading actual models.
@@ -252,7 +252,7 @@ class MockEnginePool:
 
 @pytest.fixture
 def client():
-    """Create a test client with mock engines for Phase 0 endpoints."""
+    """Create a test client with mock engines for audio and reranker endpoints."""
     from omlx.server import app, _server_state
 
     pool = MockEnginePool()

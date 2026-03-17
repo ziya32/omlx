@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """
-End-to-end tests for Phase 0 features with real models.
+End-to-end tests for audio and reranker engines with real models.
 
 Tests:
 - LLM-based reranker via /v1/rerank with a real Qwen3-Reranker model
@@ -8,7 +8,7 @@ Tests:
 - Audio endpoints with real ASR/TTS models (if available)
 
 These tests are marked with @pytest.mark.slow and are skipped by default.
-Run with: pytest -m slow tests/integration/test_phase0_e2e.py -v
+Run with: pytest -m slow tests/integration/test_audio_reranker_e2e.py -v
 
 Requirements:
 - Apple Silicon (M1/M2/M3/M4)

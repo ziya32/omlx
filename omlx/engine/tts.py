@@ -351,7 +351,7 @@ class TTSEngine(BaseNonStreamingEngine):
                 try:
                     return model.generate(**gen_kwargs)
                 except Exception as e:
-                    if variant == "base" and ref_audio:
+                    if self._variant == "base" and ref_audio:
                         raise VoiceCloningError(
                             f"Voice cloning failed: {e}"
                         ) from e
@@ -457,7 +457,7 @@ class TTSEngine(BaseNonStreamingEngine):
                 try:
                     return model.generate(**gen_kwargs)
                 except Exception as e:
-                    if variant == "base" and ref_audio:
+                    if self._variant == "base" and ref_audio:
                         raise VoiceCloningError(
                             f"Voice cloning failed: {e}"
                         ) from e
