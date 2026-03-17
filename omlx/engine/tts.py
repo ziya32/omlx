@@ -42,6 +42,86 @@ class SpeechOutput:
 
 
 
+_SUPPORTED_FORMATS = {"wav", "mp3", "opus", "flac", "pcm"}
+
+_FORMAT_MEDIA_TYPES = {
+    "wav": "audio/wav",
+    "mp3": "audio/mpeg",
+    "opus": "audio/opus",
+    "flac": "audio/flac",
+    "pcm": "audio/pcm",
+}
+
+_FORMAT_EXTENSIONS = {
+    "wav": "wav",
+    "mp3": "mp3",
+    "opus": "opus",
+    "flac": "flac",
+    "pcm": "pcm",
+}
+
+
+def _convert_wav(wav_bytes: bytes, output_format: str, speed: float = 1.0) -> bytes:
+    """Convert WAV bytes to another audio format using ffmpeg.
+
+    Args:
+        wav_bytes: Input WAV audio bytes.
+        output_format: Target format ("mp3", "opus", "flac").
+        speed: Playback speed multiplier (0.25-4.0). 1.0 = no change.
+
+    Returns:
+        Converted audio bytes.
+
+    Raises:
+        AudioError: If ffmpeg is not available or conversion fails.
+    """
+    import shutil
+    import subprocess
+
+    ffmpeg_path = shutil.which("ffmpeg")
+    if not ffmpeg_path:
+        raise AudioError(
+            "ffmpeg is required for audio format conversion but was not found. "
+            "Install with: brew install ffmpeg"
+        )
+
+    cmd = [ffmpeg_path, "-i", "pipe:0", "-f", output_format]
+
+    # Apply speed change via atempo filter
+    if speed != 1.0:
+        # atempo only supports 0.5-100.0; chain filters for extreme values
+        filters = []
+        remaining = speed
+        while remaining > 2.0:
+            filters.append("atempo=2.0")
+            remaining /= 2.0
+        while remaining < 0.5:
+            filters.append("atempo=0.5")
+            remaining *= 2.0
+        filters.append(f"atempo={remaining}")
+        cmd.extend(["-af", ",".join(filters)])
+
+    cmd.extend(["-y", "pipe:1"])
+
+    try:
+        result = subprocess.run(
+            cmd,
+            input=wav_bytes,
+            capture_output=True,
+            timeout=300,
+        )
+    except FileNotFoundError:
+        raise AudioError("ffmpeg not found")
+    except subprocess.TimeoutExpired:
+        raise AudioError("Audio conversion timed out (>5 min)")
+
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="replace")[-500:]
+        raise AudioError(f"ffmpeg conversion failed: {stderr}")
+
+    return result.stdout
+
+
 def _audio_to_pcm(audio_array) -> bytes:
     """Convert audio samples to raw 16-bit PCM bytes (for streaming segments)."""
     samples = np.array(audio_array, dtype=np.float32).flatten()

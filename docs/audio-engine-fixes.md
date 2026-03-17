@@ -495,7 +495,11 @@ The plan reads as entirely future work, but the following are already implemente
 **8. Phase 5a/5b not implemented**
 - No `_convert_audio()` function, no ffmpeg subprocess for format conversion
 - Speed parameter not implemented
-- [Ola] Unsupported values now return 400 instead of being silently ignored (see fixes #1 and #2). Format conversion deferred until there's a concrete need.
+- [Ola] Fixed: full format conversion and speed control implemented.
+  - `response_format` supports wav, mp3, opus, flac, pcm via ffmpeg subprocess
+  - `speed` supports 0.25-4.0 via ffmpeg atempo filter (chained for extreme values)
+  - Unsupported formats and out-of-range speed return 400
+  - ffmpeg availability checked at conversion time with descriptive error
 
 ### Optimization Opportunities
 

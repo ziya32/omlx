@@ -1900,16 +1900,25 @@ async def create_speech(
             if instruct is None and ms.default_instruct:
                 instruct = ms.default_instruct
 
-    if request.response_format != "wav":
+    from .engine.tts import (
+        _SUPPORTED_FORMATS,
+        _FORMAT_MEDIA_TYPES,
+        _FORMAT_EXTENSIONS,
+        _convert_wav,
+    )
+
+    fmt = request.response_format
+    if fmt not in _SUPPORTED_FORMATS:
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported format: {request.response_format}. Only 'wav' is currently supported.",
+            detail=f"Unsupported format: {fmt}. Supported: {', '.join(sorted(_SUPPORTED_FORMATS))}",
         )
 
-    if request.speed != 1.0:
+    speed = request.speed
+    if not (0.25 <= speed <= 4.0):
         raise HTTPException(
             status_code=400,
-            detail=f"Speed {request.speed} is not supported. Only speed=1.0 is currently available.",
+            detail=f"Speed must be between 0.25 and 4.0, got {speed}",
         )
 
     if stream:
@@ -1949,17 +1958,31 @@ async def create_speech(
         raise HTTPException(status_code=422, detail=str(e))
 
     elapsed = time.perf_counter() - start_time
+
+    # Convert format and/or apply speed if needed
+    audio_bytes = output.audio_bytes
+    if fmt != "wav" or speed != 1.0:
+        if fmt == "pcm":
+            # Strip WAV header for raw PCM
+            audio_bytes = audio_bytes[44:]
+        else:
+            audio_bytes = _convert_wav(audio_bytes, fmt, speed=speed)
+
+    media_type = _FORMAT_MEDIA_TYPES[fmt]
+    ext = _FORMAT_EXTENSIONS[fmt]
+
     logger.info(
         f"Speech: {elapsed:.3f}s, "
         f"duration={output.duration:.2f}s, "
-        f"sample_rate={output.sample_rate}"
+        f"sample_rate={output.sample_rate}, "
+        f"format={fmt}"
     )
 
     return StreamingResponse(
-        iter([output.audio_bytes]),
-        media_type="audio/wav",
+        iter([audio_bytes]),
+        media_type=media_type,
         headers={
-            "Content-Disposition": "attachment; filename=speech.wav",
+            "Content-Disposition": f"attachment; filename=speech.{ext}",
         },
     )
 

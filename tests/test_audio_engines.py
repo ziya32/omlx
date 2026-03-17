@@ -868,3 +868,84 @@ class TestSpeechOutput:
         assert out.audio_bytes == b"data"
         assert out.sample_rate == 48000
         assert out.duration == 3.0
+
+
+def _make_wav_bytes(sample_rate=24000, duration_s=0.1) -> bytes:
+    """Generate minimal valid WAV bytes for testing."""
+    import io as _io
+    num_samples = int(sample_rate * duration_s)
+    data_size = num_samples * 2
+    buf = _io.BytesIO()
+    buf.write(b"RIFF")
+    buf.write(struct.pack("<I", 36 + data_size))
+    buf.write(b"WAVE")
+    buf.write(b"fmt ")
+    buf.write(struct.pack("<I", 16))
+    buf.write(struct.pack("<H", 1))
+    buf.write(struct.pack("<H", 1))
+    buf.write(struct.pack("<I", sample_rate))
+    buf.write(struct.pack("<I", sample_rate * 2))
+    buf.write(struct.pack("<H", 2))
+    buf.write(struct.pack("<H", 16))
+    buf.write(b"data")
+    buf.write(struct.pack("<I", data_size))
+    buf.write(b"\x00" * data_size)
+    return buf.getvalue()
+
+
+class TestConvertWav:
+    """Tests for _convert_wav format conversion."""
+
+    def test_wav_to_mp3(self):
+        from omlx.engine.tts import _convert_wav
+        wav = _make_wav_bytes()
+        mp3 = _convert_wav(wav, "mp3")
+        # MP3 starts with 0xFF 0xFB or ID3 tag
+        assert mp3[:3] == b"ID3" or mp3[0] == 0xFF
+        assert len(mp3) > 0
+
+    def test_wav_to_flac(self):
+        from omlx.engine.tts import _convert_wav
+        wav = _make_wav_bytes()
+        flac = _convert_wav(wav, "flac")
+        assert flac[:4] == b"fLaC"
+
+    def test_wav_to_opus(self):
+        from omlx.engine.tts import _convert_wav
+        wav = _make_wav_bytes()
+        opus = _convert_wav(wav, "opus")
+        assert len(opus) > 0
+
+    def test_wav_to_wav_with_speed(self):
+        from omlx.engine.tts import _convert_wav
+        wav = _make_wav_bytes(duration_s=0.5)
+        fast = _convert_wav(wav, "wav", speed=2.0)
+        # Sped-up audio should be shorter (fewer bytes)
+        assert fast[:4] == b"RIFF"
+        assert len(fast) < len(wav)
+
+    def test_wav_to_mp3_with_speed(self):
+        from omlx.engine.tts import _convert_wav
+        wav = _make_wav_bytes(duration_s=0.5)
+        mp3 = _convert_wav(wav, "mp3", speed=0.5)
+        assert mp3[:3] == b"ID3" or mp3[0] == 0xFF
+
+    def test_invalid_input_raises(self):
+        from omlx.engine.tts import _convert_wav
+        from omlx.exceptions import AudioError
+        with pytest.raises(AudioError, match="ffmpeg conversion failed"):
+            _convert_wav(b"not audio data", "mp3")
+
+
+class TestSupportedFormats:
+    """Tests for format constants."""
+
+    def test_all_formats_have_media_types(self):
+        from omlx.engine.tts import _SUPPORTED_FORMATS, _FORMAT_MEDIA_TYPES
+        for fmt in _SUPPORTED_FORMATS:
+            assert fmt in _FORMAT_MEDIA_TYPES, f"Missing media type for {fmt}"
+
+    def test_all_formats_have_extensions(self):
+        from omlx.engine.tts import _SUPPORTED_FORMATS, _FORMAT_EXTENSIONS
+        for fmt in _SUPPORTED_FORMATS:
+            assert fmt in _FORMAT_EXTENSIONS, f"Missing extension for {fmt}"

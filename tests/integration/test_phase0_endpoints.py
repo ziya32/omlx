@@ -445,6 +445,111 @@ class TestSpeechEndpoint:
 
         assert response.status_code == 422  # Pydantic validation error
 
+    def test_speech_mp3_format(self, client):
+        """Test TTS with mp3 response_format."""
+        response = client.post(
+            "/v1/audio/speech",
+            json={
+                "model": "test-tts-model",
+                "input": "Hello!",
+                "response_format": "mp3",
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "audio/mpeg"
+        # MP3 starts with 0xFF 0xFB/0xF3/0xF2 or ID3 tag
+        assert response.content[:3] == b"ID3" or response.content[0] == 0xFF
+
+    def test_speech_flac_format(self, client):
+        """Test TTS with flac response_format."""
+        response = client.post(
+            "/v1/audio/speech",
+            json={
+                "model": "test-tts-model",
+                "input": "Hello!",
+                "response_format": "flac",
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "audio/flac"
+        assert response.content[:4] == b"fLaC"
+
+    def test_speech_opus_format(self, client):
+        """Test TTS with opus response_format."""
+        response = client.post(
+            "/v1/audio/speech",
+            json={
+                "model": "test-tts-model",
+                "input": "Hello!",
+                "response_format": "opus",
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "audio/opus"
+        assert len(response.content) > 0
+
+    def test_speech_pcm_format(self, client):
+        """Test TTS with pcm response_format returns raw PCM."""
+        response = client.post(
+            "/v1/audio/speech",
+            json={
+                "model": "test-tts-model",
+                "input": "Hello!",
+                "response_format": "pcm",
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.headers["content-type"] == "audio/pcm"
+        # PCM should not have WAV header (no RIFF)
+        assert response.content[:4] != b"RIFF"
+
+    def test_speech_unsupported_format(self, client):
+        """Test TTS rejects unsupported format."""
+        response = client.post(
+            "/v1/audio/speech",
+            json={
+                "model": "test-tts-model",
+                "input": "Hello!",
+                "response_format": "aac",
+            },
+        )
+
+        assert response.status_code == 400
+        assert "Unsupported format" in response.json()["detail"]
+
+    def test_speech_with_speed(self, client):
+        """Test TTS with speed parameter."""
+        response = client.post(
+            "/v1/audio/speech",
+            json={
+                "model": "test-tts-model",
+                "input": "Hello!",
+                "speed": 1.5,
+            },
+        )
+
+        assert response.status_code == 200
+        # Speed applied via ffmpeg, output is still WAV
+        assert response.content[:4] == b"RIFF"
+
+    def test_speech_speed_out_of_range(self, client):
+        """Test TTS rejects speed outside 0.25-4.0."""
+        response = client.post(
+            "/v1/audio/speech",
+            json={
+                "model": "test-tts-model",
+                "input": "Hello!",
+                "speed": 10.0,
+            },
+        )
+
+        assert response.status_code == 400
+        assert "Speed" in response.json()["detail"]
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Speakers endpoint tests
