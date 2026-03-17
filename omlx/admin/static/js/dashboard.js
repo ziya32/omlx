@@ -926,6 +926,9 @@
                     specprefill_draft_model: settings.specprefill_draft_model || '',
                     specprefill_keep_pct: settings.specprefill_keep_pct ? String(settings.specprefill_keep_pct) : '0.2',
                     specprefill_threshold: settings.specprefill_threshold || null,
+                    default_voice: settings.default_voice || '',
+                    default_instruct: settings.default_instruct || '',
+                    default_language: settings.default_language || '',
                     ctKwargEntries,
                 };
                 this.showModelSettingsModal = true;
@@ -984,6 +987,9 @@
                                 max_tool_result_tokens: this.modelSettings.enableToolResultLimit
                                     ? (this.modelSettings.max_tool_result_tokens || null)
                                     : 0,
+                                default_voice: this.modelSettings.default_voice?.trim() || null,
+                                default_instruct: this.modelSettings.default_instruct?.trim() || null,
+                                default_language: this.modelSettings.default_language?.trim() || null,
                                 chat_template_kwargs: Object.keys(chatTemplateKwargs).length > 0
                                     ? chatTemplateKwargs : null,
                                 forced_ct_kwargs: forcedCtKwargs.length > 0

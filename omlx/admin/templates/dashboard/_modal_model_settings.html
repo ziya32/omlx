@@ -56,6 +56,7 @@
                                         <option value="vlm">VLM</option>
                                         <option value="embedding">Embedding</option>
                                         <option value="reranker">Reranker</option>
+                                        <option value="llm_reranker">LLM Reranker</option>
                                         <option value="audio_stt">Audio STT</option>
                                         <option value="audio_tts">Audio TTS</option>
                                         <option value="audio_sts">Audio STS</option>
@@ -317,6 +318,44 @@
                                 <!-- Empty state -->
                                 <p x-show="modelSettings.ctKwargEntries.length === 0" class="text-xs text-neutral-400 text-center py-1">{{ t('modal.model_settings.no_kwargs') }}</p>
                             </div>
+
+                            <!-- Audio Settings (shown for TTS/ASR models) -->
+                            <template x-if="selectedModel?.model_type === 'tts' || selectedModel?.model_type === 'asr' || modelSettings.model_type_override === 'tts' || modelSettings.model_type_override === 'asr'">
+                                <div>
+                                    <h4 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mt-2 mb-3">{{ t('modal.model_settings.audio_label') }}</h4>
+                                    <div class="p-4 bg-neutral-50 rounded-xl space-y-4">
+                                        <p class="text-xs text-neutral-400">{{ t('modal.model_settings.audio_hint') }}</p>
+
+                                        <!-- Default Voice (TTS only) -->
+                                        <template x-if="selectedModel?.model_type === 'tts' || modelSettings.model_type_override === 'tts'">
+                                            <div class="space-y-3">
+                                                <div>
+                                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.default_voice') }}</label>
+                                                    <input type="text" x-model="modelSettings.default_voice"
+                                                           placeholder="{{ t('modal.model_settings.default_voice_placeholder') }}"
+                                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                </div>
+                                                <div>
+                                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.default_instruct') }}</label>
+                                                    <input type="text" x-model="modelSettings.default_instruct"
+                                                           placeholder="{{ t('modal.model_settings.default_instruct_placeholder') }}"
+                                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                </div>
+                                            </div>
+                                        </template>
+
+                                        <!-- Default Language (ASR only) -->
+                                        <template x-if="selectedModel?.model_type === 'asr' || modelSettings.model_type_override === 'asr'">
+                                            <div>
+                                                <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.default_language') }}</label>
+                                                <input type="text" x-model="modelSettings.default_language"
+                                                       placeholder="{{ t('modal.model_settings.default_language_placeholder') }}"
+                                                       class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                            </div>
+                                        </template>
+                                    </div>
+                                </div>
+                            </template>
 
                             <!-- Experimental Features -->
                             <h4 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('modal.model_settings.experimental_label') }}</h4>
