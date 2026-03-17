@@ -512,7 +512,27 @@ The plan reads as entirely future work, but the following are already implemente
 - `_do_transcribe()` runs as a single executor submission
 - For long audio (5+ minutes), this blocks all LLM token generation
 - `generate_transcription()` is not a generator so chunked yielding isn't directly possible
-- [Ola] Acknowledged, known limitation. ASR transcription is typically fast (a few seconds even for long audio due to Whisper's chunked architecture internally). Adding audio splitting would introduce segment boundary artifacts. Documenting as a known limitation is the right approach.
+- [Ola] Fixed: ASR now uses per-chunk executor yielding with 60s chunk duration.
+  `_do_transcribe()` loads the audio and splits it via Qwen3-ASR's
+  `split_audio_into_chunks(chunk_duration=60.0)`, which finds silence boundaries
+  within a ±5s search window. Each chunk is processed in a separate
+  `run_in_executor()` call, yielding the executor between chunks so other
+  engines (LLM, embedding) can interleave.
+
+  E2E validation (`tests/integration/test_asr_long_audio.py`) transcribes a
+  7-hour interview while firing concurrent embedding requests:
+
+  | Metric | 20-min chunks (before) | 60s chunks (after) |
+  |--------|----------------------|-------------------|
+  | Total time | 38 min | 24 min |
+  | Segments | 29 | 374 |
+  | Transcript length | 136K chars | 141K chars |
+  | Worst embedding latency | 125.8s | 40.4s (model loading) |
+  | Typical embedding latency | 125s | 2-3s |
+
+  Quality is unaffected — silence-boundary splitting avoids mid-sentence cuts,
+  and Qwen3-ASR processes chunks independently regardless of duration.
+  For audio ≤ 60s, the single-call fast path is used with no overhead.
 
 ### Nanobot Integration Notes
 
