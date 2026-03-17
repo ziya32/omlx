@@ -166,11 +166,14 @@ from .engine.reranker import RerankerEngine
 from .engine.tts import TTSEngine
 from .engine_pool import EnginePool
 from .exceptions import (
+    AudioError,
     EnginePoolError,
     InsufficientMemoryError,
+    InvalidAudioFormatError,
     ModelLoadingError,
     ModelNotFoundError,
     ModelTooLargeError,
+    VoiceCloningError,
 )
 from .model_discovery import format_size
 from .server_metrics import get_server_metrics, reset_server_metrics
@@ -1808,11 +1811,16 @@ async def create_transcription(
 
     try:
         start_time = time.perf_counter()
-        output = await engine.transcribe(
-            tmp_path,
-            language=language,
-            prompt=str(prompt) if prompt else None,
-        )
+        try:
+            output = await engine.transcribe(
+                tmp_path,
+                language=language,
+                prompt=str(prompt) if prompt else None,
+            )
+        except InvalidAudioFormatError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except AudioError as e:
+            raise HTTPException(status_code=422, detail=str(e))
         elapsed = time.perf_counter() - start_time
 
         logger.info(
@@ -1926,13 +1934,18 @@ async def create_speech(
 
     start_time = time.perf_counter()
 
-    output = await engine.synthesize(
-        text=request.input,
-        speaker=speaker,
-        instruct=instruct,
-        ref_audio=request.ref_audio,
-        ref_text=request.ref_text,
-    )
+    try:
+        output = await engine.synthesize(
+            text=request.input,
+            speaker=speaker,
+            instruct=instruct,
+            ref_audio=request.ref_audio,
+            ref_text=request.ref_text,
+        )
+    except VoiceCloningError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except AudioError as e:
+        raise HTTPException(status_code=422, detail=str(e))
 
     elapsed = time.perf_counter() - start_time
     logger.info(

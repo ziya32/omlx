@@ -24,6 +24,7 @@ import mlx.core as mx
 import numpy as np
 
 from ..engine_core import get_mlx_executor
+from ..exceptions import AudioError, VoiceCloningError
 from .audio_utils import DEFAULT_SAMPLE_RATE as _DEFAULT_SAMPLE_RATE
 from .audio_utils import audio_to_wav_bytes as _audio_to_wav_bytes
 from .base import BaseNonStreamingEngine
@@ -267,7 +268,16 @@ class TTSEngine(BaseNonStreamingEngine):
             # Step 1: Create generator on executor (quick)
             def _create_gen():
                 logger.debug(f"[TTS] Synthesizing: variant={self._variant}")
-                return model.generate(**gen_kwargs)
+                try:
+                    return model.generate(**gen_kwargs)
+                except Exception as e:
+                    if variant == "base" and ref_audio:
+                        raise VoiceCloningError(
+                            f"Voice cloning failed: {e}"
+                        ) from e
+                    raise AudioError(
+                        f"TTS generation failed: {e}"
+                    ) from e
 
             gen = await loop.run_in_executor(executor, _create_gen)
 
@@ -276,7 +286,12 @@ class TTSEngine(BaseNonStreamingEngine):
             segments = []
 
             def _next_seg(g):
-                return next(g, None)
+                try:
+                    return next(g, None)
+                except Exception as e:
+                    raise AudioError(
+                        f"TTS segment generation failed: {e}"
+                    ) from e
 
             while True:
                 seg = await loop.run_in_executor(executor, _next_seg, gen)
@@ -285,7 +300,7 @@ class TTSEngine(BaseNonStreamingEngine):
                 segments.append(seg)
 
             if not segments:
-                raise RuntimeError("TTS model produced no audio output")
+                raise AudioError("TTS produced no audio segments")
 
             # Step 3: Concatenate and encode WAV (quick)
             def _finalize(segs):
@@ -358,12 +373,27 @@ class TTSEngine(BaseNonStreamingEngine):
         total_duration = 0.0
 
         try:
-            gen = await loop.run_in_executor(
-                executor, lambda: model.generate(**gen_kwargs)
-            )
+            def _create_stream_gen():
+                try:
+                    return model.generate(**gen_kwargs)
+                except Exception as e:
+                    if variant == "base" and ref_audio:
+                        raise VoiceCloningError(
+                            f"Voice cloning failed: {e}"
+                        ) from e
+                    raise AudioError(
+                        f"TTS generation failed: {e}"
+                    ) from e
+
+            gen = await loop.run_in_executor(executor, _create_stream_gen)
 
             def _next_seg(g):
-                return next(g, None)
+                try:
+                    return next(g, None)
+                except Exception as e:
+                    raise AudioError(
+                        f"TTS segment generation failed: {e}"
+                    ) from e
 
             def _segment_to_pcm(seg):
                 audio = np.array(seg.audio)

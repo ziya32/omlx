@@ -17,6 +17,7 @@ from typing import Any, Dict
 import mlx.core as mx
 
 from ..engine_core import get_mlx_executor
+from ..exceptions import AudioError, InvalidAudioFormatError
 from .base import BaseNonStreamingEngine
 
 logger = logging.getLogger(__name__)
@@ -138,7 +139,16 @@ class ASREngine(BaseNonStreamingEngine):
             )
 
             logger.debug(f"[ASR] Loading audio: {audio_path}")
-            audio = load_audio(audio_path)
+            try:
+                audio = load_audio(audio_path)
+            except (OSError, IOError) as e:
+                raise InvalidAudioFormatError(
+                    f"Failed to read audio file: {e}"
+                ) from e
+            except Exception as e:
+                raise InvalidAudioFormatError(
+                    f"Invalid audio format: {e}"
+                ) from e
             audio_np = (
                 np.array(audio) if isinstance(audio, mx.array) else audio
             )
@@ -186,9 +196,14 @@ class ASREngine(BaseNonStreamingEngine):
                 if prompt:
                     kw["initial_prompt"] = prompt
 
-                return generate_transcription(
-                    model=model, audio=audio_chunk, **kw
-                ), offset
+                try:
+                    return generate_transcription(
+                        model=model, audio=audio_chunk, **kw
+                    ), offset
+                except Exception as e:
+                    raise AudioError(
+                        f"Transcription failed on chunk at {offset:.0f}s: {e}"
+                    ) from e
 
             result, offset = await loop.run_in_executor(
                 executor, _transcribe_chunk
@@ -243,9 +258,23 @@ class ASREngine(BaseNonStreamingEngine):
             if prompt:
                 kw["initial_prompt"] = prompt
 
-            result = generate_transcription(
-                model=model, audio=audio_path, **kw
-            )
+            try:
+                result = generate_transcription(
+                    model=model, audio=audio_path, **kw
+                )
+            except (OSError, IOError) as e:
+                raise InvalidAudioFormatError(
+                    f"Failed to read audio file: {e}"
+                ) from e
+            except Exception as e:
+                err_msg = str(e).lower()
+                if "audio" in err_msg or "wav" in err_msg or "format" in err_msg:
+                    raise InvalidAudioFormatError(
+                        f"Invalid audio format: {e}"
+                    ) from e
+                raise AudioError(
+                    f"Transcription failed: {e}"
+                ) from e
 
             text = result.text or ""
             raw_lang = result.language

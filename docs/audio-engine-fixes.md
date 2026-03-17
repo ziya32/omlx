@@ -479,7 +479,11 @@ The plan reads as entirely future work, but the following are already implemente
 - Neither `tts.py` nor `asr.py` imports or raises any of them
 - `server.py` doesn't catch `AudioError`
 - Raw mlx-audio exceptions propagate as 500 Internal Server Error
-- [Ola] Acknowledged, deferred — wrapping mlx-audio exceptions adds complexity; the 500 errors include the original message which is descriptive enough for now. Will revisit when format conversion (Phase 5a) adds more failure modes.
+- [Ola] Fixed: `synthesize()`, `stream_synthesize()`, and `transcribe()` now wrap
+  mlx-audio exceptions with `AudioError` subclasses. `VoiceCloningError` raised for
+  base-variant failures, `InvalidAudioFormatError` for bad audio files, generic
+  `AudioError` for other failures. Server catches these and returns 400 (bad input)
+  or 422 (processing failure) instead of 500.
 
 **7. No `GET /v1/audio/languages` endpoint**
 - Phase 8 says to add this endpoint
