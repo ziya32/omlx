@@ -137,10 +137,10 @@ class EngineCore:
         self._running = True
         self._start_time = time.time()
         self._task = asyncio.create_task(self._engine_loop())
-        logger.info("Engine started")
+        logger.info("Engine started: %s", self.config.model_name)
 
     async def stop(self) -> None:
-        """Stop the engine loop."""
+        """Stop the engine loop and release model references."""
         self._running = False
         if self._task:
             self._task.cancel()
@@ -149,7 +149,15 @@ class EngineCore:
             except asyncio.CancelledError:
                 pass
             self._task = None
-        logger.info("Engine stopped")
+
+        # Release scheduler and model references so MLX tensors can be
+        # garbage collected. Without this, model weights stay in Metal
+        # memory until the engine object itself is collected.
+        if hasattr(self, 'scheduler') and self.scheduler is not None:
+            self.scheduler.shutdown()
+            self.scheduler = None
+
+        logger.info("Engine stopped: %s", self.config.model_name)
 
     def is_running(self) -> bool:
         """Check if engine is running."""
@@ -640,10 +648,9 @@ class EngineCore:
         self._closed = True
 
         # Shutdown scheduler (clears paged SSD cache if configured)
-        self.scheduler.shutdown()
-
-        # Reset scheduler to clear BatchGenerator and all caches
-        self.scheduler.deep_reset()
+        if self.scheduler is not None:
+            self.scheduler.shutdown()
+            self.scheduler = None
 
         # Clear output collectors
         for collector in self._output_collectors.values():

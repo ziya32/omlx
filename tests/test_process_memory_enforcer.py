@@ -17,6 +17,7 @@ def _make_entry(model_id, engine=None, is_loading=False, is_pinned=False):
     entry.is_loading = is_loading
     entry.is_pinned = is_pinned
     entry.abort_loading = False
+    entry.active_uses = 0
     return entry
 
 
@@ -144,8 +145,12 @@ class TestCheckAndEnforce:
         assert enforcer._engine_pool._unload_engine.call_count == 2
 
     @pytest.mark.asyncio
-    async def test_aborts_loading_model_when_no_lru_victim(self, enforcer):
-        """Aborts a loading model when no LRU victim is available."""
+    async def test_logs_warning_for_loading_model_when_no_lru_victim(self, enforcer):
+        """Logs warning when a model is loading and no LRU victim available.
+
+        Metal ops cannot be interrupted mid-load, so the enforcer just logs
+        and waits for the load to complete and deferred cleanup to free memory.
+        """
         enforcer._engine_pool._find_drain_or_evict_candidate.return_value = None
         loading_entry = _make_entry(
             "loading-model", engine=None, is_loading=True
@@ -159,12 +164,12 @@ class TestCheckAndEnforce:
             ]
             await enforcer._check_and_enforce()
 
-        assert loading_entry.abort_loading is True
+        # No unload — loading cannot be interrupted
         enforcer._engine_pool._unload_engine.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_evicts_lru_before_aborting_loading(self, enforcer):
-        """Evicts LRU models first, then aborts loading model."""
+    async def test_evicts_lru_then_logs_for_loading(self, enforcer):
+        """Evicts LRU models first, then logs warning for loading model."""
         # Need 2 loaded non-pinned so model-a gets evicted (not abort path)
         engine_a = MagicMock()
         engine_a.abort_all_requests = AsyncMock(return_value=0)
@@ -202,8 +207,6 @@ class TestCheckAndEnforce:
 
         # LRU victim evicted first
         enforcer._engine_pool._unload_engine.assert_called_once_with("model-a")
-        # Then loading model abort requested
-        assert loading_entry.abort_loading is True
 
     @pytest.mark.asyncio
     async def test_no_models_loaded_or_loading(self, enforcer):

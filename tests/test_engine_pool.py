@@ -582,6 +582,10 @@ class TestEnginePoolAsync:
             initial_memory = pool.current_model_memory
 
             await pool._unload_engine("model-a")
+            # _unload_engine defers engine.stop() to a background task;
+            # await pending cleanup so the assertion below can check it.
+            if pool._cleanup_tasks:
+                await asyncio.gather(*pool._cleanup_tasks, return_exceptions=True)
 
         mock_engine.stop.assert_called_once()
         assert pool.current_model_memory < initial_memory

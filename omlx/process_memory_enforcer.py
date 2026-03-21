@@ -216,6 +216,8 @@ class ProcessMemoryEnforcer:
         )
 
         # Acquire EnginePool lock and unload LRU models until under limit.
+        # Skips victims with active_uses > 0 (request handlers holding the
+        # engine via acquire_engine) to avoid stopping an engine mid-request.
         # Note: prefill loops self-check via _memory_limit_bytes (same thread,
         # no GIL issue), so they will abort independently of this enforcer.
         async with self._engine_pool._tracked_lock("process_memory_enforcer"):
@@ -230,10 +232,21 @@ class ProcessMemoryEnforcer:
                     ]
                     if len(loaded_non_pinned) > 1:
                         # Multiple models: evict LRU victim.
-                        # First abort active requests so clients receive
+                        entry = self._engine_pool._entries.get(victim)
+
+                        # Skip victims with active request handlers —
+                        # they will release soon and the next poll will
+                        # find them idle.
+                        if entry and entry.active_uses > 0:
+                            logger.info(
+                                f"Skipping eviction of '{victim}': "
+                                f"active_uses={entry.active_uses}"
+                            )
+                            break
+
+                        # Abort active requests so clients receive
                         # error messages — EngineCore.stop() only cancels
                         # the engine loop silently without notifying collectors.
-                        entry = self._engine_pool._entries.get(victim)
                         if entry and entry.engine is not None:
                             if hasattr(entry.engine, "abort_all_requests"):
                                 aborted = await entry.engine.abort_all_requests()
@@ -266,21 +279,23 @@ class ProcessMemoryEnforcer:
                         break
 
                 # No loaded non-pinned model to evict.
-                # Check if any model is currently loading — request abort.
-                aborted_any = False
-                for entry in self._engine_pool._entries.values():
-                    if entry.is_loading and not entry.abort_loading:
-                        logger.warning(
-                            f"Requesting abort of loading model "
-                            f"'{entry.model_id}' — process memory "
-                            f"limit exceeded"
-                        )
-                        entry.abort_loading = True
-                        aborted_any = True
-
-                if not aborted_any:
-                    # Nothing we can do — all models are either pinned
-                    # or there are no loaded/loading models
+                # Check what's happening for diagnostics.
+                loading = [
+                    e.model_id
+                    for e in self._engine_pool._entries.values()
+                    if e.is_loading
+                ]
+                if loading:
+                    # A model is loading on the MLX executor — we
+                    # can't interrupt it (Metal ops are not cancellable).
+                    # Memory will be reclaimed once cleanup tasks run
+                    # after the load completes.
+                    logger.warning(
+                        f"Process memory limit exceeded while loading "
+                        f"{loading}. Waiting for load to complete and "
+                        f"deferred cleanup to free Metal memory."
+                    )
+                else:
                     has_loaded = any(
                         e.engine is not None
                         for e in self._engine_pool._entries.values()

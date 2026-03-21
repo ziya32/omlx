@@ -230,6 +230,12 @@ class MockEnginePool:
     def resolve_model_id(self, model_id_or_alias, settings_manager=None):
         return model_id_or_alias
 
+    def acquire_engine(self, model_id) -> None:
+        pass
+
+    def release_engine(self, model_id) -> None:
+        pass
+
     def get_model_ids(self):
         return list(self._entries.keys())
 

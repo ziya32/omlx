@@ -3740,13 +3740,24 @@ class Scheduler:
         """
         Graceful shutdown.
 
-        Flushes hot cache to SSD and closes the background writer.
+        Flushes hot cache to SSD, closes the background writer, and releases
+        model/tokenizer references so MLX tensors can be garbage collected.
         paged SSD cache files are NOT cleared to allow reuse on reload.
         """
         logger.info("Scheduler shutdown initiated...")
         if self.paged_ssd_cache_manager is not None:
             self.paged_ssd_cache_manager.close()
             self.paged_ssd_cache_manager = None
+
+        # Deep reset clears all cache state including model-level caches
+        self.deep_reset()
+
+        # Release model and tokenizer references so MLX tensors can be
+        # freed by gc.collect() + mx.clear_cache().
+        self.model = None
+        self.tokenizer = None
+
+        mx.clear_cache()
         logger.info("Scheduler shutdown completed")
 
     # =========================================================================

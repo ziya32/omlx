@@ -165,6 +165,20 @@ def serve_command(args):
     _crash_file = open(crash_log_path, "a")
     faulthandler.enable(file=_crash_file, all_threads=True)
 
+    # When stderr is not a real terminal (e.g., subprocess pipe), remove the
+    # stderr StreamHandler to prevent pipe-buffer deadlocks.  If the parent
+    # process does not read the pipe fast enough, the pipe buffer fills up,
+    # the write() in the StreamHandler blocks while holding the logging lock,
+    # and the asyncio event loop deadlocks (nothing can log, serve, or respond
+    # to health checks).  File logging is always available for diagnostics.
+    if not sys.stderr.isatty():
+        root = logging.getLogger()
+        root.handlers = [
+            h for h in root.handlers
+            if not isinstance(h, logging.StreamHandler)
+            or isinstance(h, logging.FileHandler)
+        ]
+
     # Validate settings
     errors = settings.validate()
     if errors:
