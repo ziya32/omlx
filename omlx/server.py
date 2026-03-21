@@ -2436,6 +2436,11 @@ async def create_chat_completion(
             "xtc_threshold": xtc_threshold,
         }
 
+        # Add thinking budget if applicable
+        thinking_budget = _resolve_thinking_budget(request, request.model)
+        if thinking_budget is not None:
+            chat_kwargs["thinking_budget"] = thinking_budget
+
         # Add compiled grammar for logit-level structured output.
         # When a reasoning_parser is configured, the structural tag includes
         # a thinking phase — auto-set a thinking_budget so the model exits
