@@ -22,6 +22,7 @@ State machine per model:
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import gc
 import logging
 import time
@@ -82,7 +83,7 @@ class EngineEntry:
     engine: BaseEngine | EmbeddingEngine | RerankerEngine | LLMRerankerEngine | STTEngine | STSEngine | TTSEngine | None = None  # Loaded engine instance
     last_access: float = 0.0  # Timestamp for LRU (0 if never loaded)
     is_pinned: bool = False  # Never evict if True
-    abort_loading: bool = False  # Legacy: used by process_memory_enforcer
+    abort_loading: bool = False  # Deprecated: kept for backward compat only
 
     # State machine fields
     state: EngineState = EngineState.UNLOADED
@@ -92,6 +93,7 @@ class EngineEntry:
     load_error: Exception | None = None           # Propagated to waiters
     load_started: float = 0.0                     # For watchdog/diagnostics
     load_failed_at: float = 0.0                   # Cooldown after load failure
+    active_uses: int = 0                          # Number of request handlers currently using this engine
 
     @property
     def is_loading(self) -> bool:
@@ -110,8 +112,13 @@ class EnginePool:
     - Model pinning to prevent eviction
     - Automatic engine type selection based on model type
 
-    Deferred (Phase 2):
-    - Load watchdog: background task to detect stuck LOADING states
+    Diagnostics:
+    - Watchdog: background task to detect stuck LOADING/DRAINING states
+      and unresponsive MLX executor thread
+    - get_debug_status(): lock-free snapshot for /debug/pool endpoint
+    - Load timing: elapsed time logged for every model load
+
+    Deferred:
     - Per-request trace_id propagation through get_engine/drain/load
     """
 
@@ -143,6 +150,10 @@ class EnginePool:
         self._max_wait_timeout = max_wait_timeout
         # Incremented on ANY timeout firing. Tests assert this stays at 0.
         self._timeout_counter: int = 0
+        # Watchdog background task — started lazily on first get_engine() call
+        self._watchdog_task: asyncio.Task | None = None
+        # Track deferred engine cleanup tasks so shutdown can wait for them
+        self._cleanup_tasks: list[asyncio.Task] = []
 
     # -------------------------------------------------------------------------
     # State transition helpers
@@ -184,6 +195,7 @@ class EnginePool:
             )
         acquired = time.monotonic()
         wait_ms = (acquired - t0) * 1000
+        # logger.info(f"engine_pool._tracked_lock: lock acquired at {acquired:.0f}s, wait={wait_ms:.0f}ms caller={caller}")
 
         if wait_ms > 1000:
             logger.warning(f"lock wait={wait_ms:.0f}ms caller={caller}")
@@ -193,8 +205,73 @@ class EnginePool:
         finally:
             held_ms = (time.monotonic() - acquired) * 1000
             self._lock.release()
+            # logger.info(f"engine_pool._tracked_lock: lock released at {time.monotonic():.0f}s, held={held_ms:.0f}ms caller={caller}")
             if held_ms > 500:
                 logger.warning(f"lock held={held_ms:.0f}ms caller={caller}")
+
+    # -------------------------------------------------------------------------
+    # Watchdog — periodic health check for stuck states
+    # -------------------------------------------------------------------------
+
+    async def _watchdog(self) -> None:
+        """Periodic check for stuck states. Runs every 10s.
+
+        Reads entry state for diagnostic purposes only — does NOT hold the
+        pool lock (lock-free read-only snapshot).
+        """
+        while True:
+            await asyncio.sleep(10)
+            now = time.time()
+            for model_id, entry in self._entries.items():
+                if entry.state == EngineState.LOADING:
+                    elapsed = now - entry.load_started
+                    if elapsed > 120:
+                        logger.error(
+                            f"WATCHDOG: {model_id} stuck in LOADING "
+                            f"for {elapsed:.0f}s (expected <60s)"
+                        )
+                    elif elapsed > 60:
+                        logger.warning(
+                            f"WATCHDOG: {model_id} in LOADING for {elapsed:.0f}s"
+                        )
+
+                if entry.state == EngineState.DRAINING:
+                    elapsed = now - entry.drain_started
+                    if elapsed > self._drain_timeout + 30:
+                        logger.error(
+                            f"WATCHDOG: {model_id} stuck in DRAINING "
+                            f"for {elapsed:.0f}s "
+                            f"(drain_timeout={self._drain_timeout}s)"
+                        )
+
+            # Check if the MLX executor thread is responsive
+            if not self._check_executor_health():
+                logger.error(
+                    "WATCHDOG: MLX executor not responding! "
+                    "A submitted task may be blocking the single "
+                    "executor thread."
+                )
+
+    def _check_executor_health(self) -> bool:
+        """Submit a no-op to the MLX executor to check if it's alive.
+
+        Returns True if the executor responds within 5s, False otherwise.
+        """
+        executor = get_mlx_executor()
+        try:
+            future = executor.submit(lambda: True)
+            future.result(timeout=5)
+            return True
+        except concurrent.futures.TimeoutError:
+            return False
+        except Exception:
+            # Executor might be shut down or broken
+            return False
+
+    def _start_watchdog(self) -> None:
+        """Start the watchdog task if not already running."""
+        if self._watchdog_task is None:
+            self._watchdog_task = asyncio.create_task(self._watchdog())
 
     # -------------------------------------------------------------------------
     # Memory accounting
@@ -437,6 +514,9 @@ class EnginePool:
             ModelTooLargeError: If model exceeds memory limit (permanent)
             ModelLoadingError: If wait times out or model in load cooldown
         """
+        # Start watchdog lazily on first get_engine() call
+        self._start_watchdog()
+
         start_time = time.monotonic()
         iterations = 0
 
@@ -507,10 +587,32 @@ class EnginePool:
                         entry.load_error = None
                         entry.load_started = time.time()
                         should_load = True
+                        logger.info(f"get_engine({model_id}) loading model {entry.model_path}")
+                else:
+                    logger.info(f"unrecognized state {entry.state.value} for model {model_id}")
+                    raise EnginePoolError(f"unrecognized state {entry.state.value} for model {model_id}")
 
             # --- Outside lock (INV-1) ---
 
             if should_load:
+                # Wait for any pending cleanup tasks (engine.stop +
+                # mx.clear_cache) so that Metal memory is actually freed
+                # before we start loading.  Without this, the new model
+                # load occupies the single MLX executor thread, starving
+                # mx.clear_cache() and causing OOM.
+                if self._cleanup_tasks:
+                    await asyncio.gather(
+                        *self._cleanup_tasks, return_exceptions=True
+                    )
+                    # Second GC + clear_cache pass: the cleanup tasks ran
+                    # gc.collect() + mx.clear_cache(), but Metal's page
+                    # deallocation is asynchronous.  A second round gives
+                    # Metal a chance to reclaim pages before we allocate
+                    # new ones for the model load.
+                    gc.collect()
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(get_mlx_executor(), mx.clear_cache)
+
                 # Load the model (long operation, outside lock)
                 load_error = None
                 try:
@@ -559,8 +661,28 @@ class EnginePool:
                     )
                 except asyncio.TimeoutError:
                     elapsed = time.monotonic() - start_time
+
+                    # If we're waiting for a drain and the draining model
+                    # still has active inference, extend the wait — same
+                    # logic as the drain monitor's active_uses extension.
+                    if wait_target == "drain_complete":
+                        draining_entry = self._find_draining_entry(event)
+                        if draining_entry is not None and draining_entry.active_uses > 0:
+                            logger.warning(
+                                f"get_engine({model_id}) wait timeout but "
+                                f"drain target {draining_entry.model_id} has "
+                                f"active_uses={draining_entry.active_uses}, "
+                                f"extending wait "
+                                f"(elapsed={elapsed:.1f}s)"
+                            )
+                            continue
+
                     self._record_timeout(
                         "get_engine_wait", model_id, elapsed
+                    )
+                    logger.error(
+                        f"get_engine({model_id}) model named {entry.model_path} timed out waiting for {wait_target}, "
+                        f"state={entry.state.value}"
                     )
                     raise ModelLoadingError(
                         f"Timed out waiting for model {model_id} "
@@ -569,7 +691,7 @@ class EnginePool:
                     )
 
                 logger.debug(
-                    f"get_engine({model_id}) woke from {wait_target}, "
+                    f"get_engine({model_id}) model named {entry.model_path} woke from {wait_target}, "
                     f"state={entry.state.value}"
                 )
 
@@ -583,6 +705,82 @@ class EnginePool:
                         f"Model {model_id} failed to load: {entry.load_error}",
                         model_id=model_id,
                     )
+
+    def _find_draining_entry(self, event: asyncio.Event) -> EngineEntry | None:
+        """Find the EngineEntry whose drain_complete matches *event*."""
+        for e in self._entries.values():
+            if e.drain_complete is event:
+                return e
+        return None
+
+    # -------------------------------------------------------------------------
+    # Engine use-counting (prevents eviction while request handlers use engine)
+    #
+    # Every server endpoint that holds a reference to an engine MUST bracket
+    # its use with acquire_engine / release_engine (or use_engine context
+    # manager).  This increments active_uses on the EngineEntry, which is
+    # checked by:
+    #   - _prepare_memory_for   → drains instead of killing busy engines
+    #   - _drain_monitor        → waits for active_uses==0 before unloading,
+    #                             and extends the drain if timeout is hit
+    #                             while active_uses > 0
+    #   - process_memory_enforcer → skips victims with active_uses > 0
+    #
+    # For non-streaming endpoints, use try/finally:
+    #     pool.acquire_engine(resolved_id)
+    #     try:
+    #         output = await engine.chat(...)
+    #     finally:
+    #         pool.release_engine(resolved_id)
+    #
+    # For streaming endpoints, use _with_engine_guard() which releases
+    # in its finally block (handles normal completion, errors, and
+    # client disconnect / GeneratorExit):
+    #     pool.acquire_engine(resolved_id)
+    #     return StreamingResponse(
+    #         _with_engine_guard(stream_gen, pool, resolved_id)
+    #     )
+    # -------------------------------------------------------------------------
+
+    def acquire_engine(self, model_id: str) -> None:
+        """Increment active_uses for model_id.
+
+        Called by server request handlers immediately after get_engine()
+        returns, to protect the engine from eviction by the drain monitor
+        and process_memory_enforcer while the handler is using it.
+
+        Must be paired with release_engine().
+        """
+        entry = self._entries.get(model_id)
+        if entry is not None:
+            entry.active_uses += 1
+
+    def release_engine(self, model_id: str) -> None:
+        """Decrement active_uses for model_id.
+
+        Called when a request handler finishes using the engine.
+        """
+        entry = self._entries.get(model_id)
+        if entry is not None and entry.active_uses > 0:
+            entry.active_uses -= 1
+
+    @asynccontextmanager
+    async def use_engine(self, model_id: str):
+        """Context manager: get_engine + acquire/release use-counting.
+
+        Usage:
+            async with pool.use_engine(model_id) as engine:
+                await engine.transcribe(...)
+
+        The engine is protected from eviction for the duration of the
+        context manager.
+        """
+        engine = await self.get_engine(model_id)
+        self.acquire_engine(model_id)
+        try:
+            yield engine
+        finally:
+            self.release_engine(model_id)
 
     # -------------------------------------------------------------------------
     # Memory preparation (drain instead of reject)
@@ -605,6 +803,23 @@ class EnginePool:
             ModelTooLargeError: If model can't fit even with all non-pinned
                 models evicted (permanent failure, not retryable).
         """
+        # Serialize model loading: only one model may be in LOADING state at
+        # a time. Concurrent loads can exhaust Metal memory because weight
+        # files are read into GPU memory on the MLX executor thread, and if
+        # two models load simultaneously their combined peak memory exceeds
+        # the process limit even though each fits individually.
+        for mid, e in self._entries.items():
+            if (
+                mid != entry.model_id
+                and e.state == EngineState.LOADING
+                and e.ready_event is not None
+            ):
+                logger.debug(
+                    f"Serializing load: waiting for {mid} to finish "
+                    f"loading before starting {entry.model_id}"
+                )
+                return e.ready_event
+
         if self._max_model_memory is None:
             # No model memory limit — also check process memory
             return await self._check_process_memory(entry)
@@ -643,8 +858,13 @@ class EnginePool:
                 )
 
             victim = self._entries[victim_id]
-            if victim.engine is not None and self._engine_has_active_work(victim.engine):
-                # Victim has in-flight requests — drain, don't kill
+            victim_busy = (
+                victim.engine is not None
+                and (self._engine_has_active_work(victim.engine)
+                     or victim.active_uses > 0)
+            )
+            if victim_busy:
+                # Victim has in-flight requests or active uses — drain, don't kill
                 self._start_drain(victim_id)
                 # Return the drain event — caller waits for it, then retries
                 return victim.drain_complete
@@ -662,6 +882,13 @@ class EnginePool:
         """Check process memory limit before loading.
 
         Called under self._lock. Returns None if OK, or a drain event to wait on.
+
+        Note: mx.get_active_memory() reflects Metal allocator state which may
+        lag behind our evictions (gc.collect + mx.clear_cache don't guarantee
+        immediate Metal deallocation). When all evictable models are gone but
+        Metal memory is still high, we fall back to checking _committed_memory()
+        which tracks our known model weights. If that fits, we proceed — Metal
+        will reclaim the memory during or shortly after the load.
         """
         if self._process_memory_enforcer is None:
             return None
@@ -680,7 +907,12 @@ class EnginePool:
             victim_id = self._find_drain_or_evict_candidate()
             if victim_id is not None:
                 victim = self._entries[victim_id]
-                if victim.engine is not None and self._engine_has_active_work(victim.engine):
+                victim_busy = (
+                    victim.engine is not None
+                    and (self._engine_has_active_work(victim.engine)
+                         or victim.active_uses > 0)
+                )
+                if victim_busy:
                     self._start_drain(victim_id)
                     return victim.drain_complete
                 else:
@@ -700,7 +932,58 @@ class EnginePool:
                 if e.state == EngineState.DRAINING:
                     return e.drain_complete
 
-            # No more victims — cannot fit
+            # No more victims to evict. If there are pending cleanup tasks,
+            # wait for them to finish (mx.clear_cache) before re-checking.
+            if self._cleanup_tasks:
+                # Release the lock temporarily so cleanup can proceed,
+                # then return a synthetic event to re-enter get_engine().
+                wait_event = asyncio.Event()
+
+                async def _wait_for_cleanup():
+                    await asyncio.gather(
+                        *self._cleanup_tasks, return_exceptions=True
+                    )
+                    wait_event.set()
+
+                asyncio.create_task(_wait_for_cleanup())
+                return wait_event
+
+            # All cleanup done. Re-check actual Metal memory — Metal's
+            # allocator may not have reclaimed pages even after clear_cache.
+            current_active = mx.get_active_memory()
+            projected = current_active + entry.estimated_size
+            if projected <= enforcer.max_bytes:
+                logger.info(
+                    f"Process memory after cleanup: "
+                    f"{format_size(current_active)} + "
+                    f"{entry.model_id} ({format_size(entry.estimated_size)}) "
+                    f"= {format_size(projected)} <= "
+                    f"{format_size(enforcer.max_bytes)}. Proceeding."
+                )
+                return None
+
+            # Projected memory still too high. Check if committed model
+            # weights alone fit and the overshoot is modest (within 25%
+            # headroom). Metal may reuse freed pages during the load.
+            committed = self._committed_memory()
+            headroom = int(enforcer.max_bytes * 0.25)
+            if (
+                committed + entry.estimated_size <= enforcer.max_bytes
+                and projected <= enforcer.max_bytes + headroom
+            ):
+                logger.warning(
+                    f"Process memory after cleanup still high "
+                    f"({format_size(current_active)}), but committed "
+                    f"({format_size(committed)}) + "
+                    f"{entry.model_id} ({format_size(entry.estimated_size)}) "
+                    f"fits. Metal residual "
+                    f"{format_size(current_active - committed)} may be "
+                    f"reclaimed during load. Proceeding cautiously."
+                )
+                return None
+
+            # Truly cannot fit — even with cleanup done, Metal retains too
+            # much memory for the new model to load safely.
             raise InsufficientMemoryError(
                 required=entry.estimated_size,
                 current=current_active,
@@ -708,7 +991,8 @@ class EnginePool:
                     f"Cannot load {entry.model_id}: projected memory "
                     f"{format_size(projected)} would exceed process "
                     f"limit {format_size(enforcer.max_bytes)} "
-                    f"(current: {format_size(current_active)}, "
+                    f"(current Metal: {format_size(current_active)}, "
+                    f"committed: {format_size(committed)}, "
                     f"model: {format_size(entry.estimated_size)})"
                 ),
             )
@@ -733,6 +1017,13 @@ class EnginePool:
         All checks and state transitions happen under self._lock to prevent
         TOCTOU races (e.g., has_active_work returns False, but a stale
         reference is used after unload).
+
+        Checks both _engine_has_active_work (in-flight GPU requests in the
+        scheduler) AND active_uses > 0 (request handlers that have acquired
+        the engine via acquire_engine but may not have started GPU work yet).
+        If the drain timeout is reached but active_uses > 0, the drain is
+        extended rather than force-unloading — this prevents stopping an
+        engine while a request handler is mid-validation or mid-stream.
         """
         entry = self._entries[model_id]
 
@@ -747,7 +1038,12 @@ class EnginePool:
 
                     elapsed = time.time() - entry.drain_started
 
-                    if entry.engine is None or not self._engine_has_active_work(entry.engine):
+                    has_work = (
+                        entry.engine is not None
+                        and (self._engine_has_active_work(entry.engine)
+                             or entry.active_uses > 0)
+                    )
+                    if not has_work:
                         # All requests finished — unload
                         logger.info(
                             f"Drain complete for {model_id} "
@@ -761,6 +1057,14 @@ class EnginePool:
                         return
 
                     if elapsed > self._drain_timeout:
+                        if entry.active_uses > 0:
+                            logger.warning(
+                                f"Drain timeout for {model_id} but "
+                                f"active_uses={entry.active_uses}, "
+                                f"extending drain"
+                            )
+                            continue
+
                         self._record_timeout("drain", model_id, elapsed)
 
                         # Abort sends error to collectors so clients see a
@@ -838,7 +1142,9 @@ class EnginePool:
         Find the least recently used non-pinned loaded model suitable for
         eviction or draining. Skips models already in DRAINING state.
 
-        Prefers idle models over models with active requests.
+        Prefers idle models over models with active requests or active
+        use-count (request handlers that have acquired the engine via
+        acquire_engine/use_engine).
 
         Returns:
             Model ID of the candidate, or None if no evictable models exist.
@@ -851,7 +1157,9 @@ class EnginePool:
                 continue  # Already being drained
             if e.state == EngineState.LOADING:
                 continue  # Don't evict something being loaded
-            has_active = self._engine_has_active_work(e.engine)
+            has_active = (
+                self._engine_has_active_work(e.engine) or e.active_uses > 0
+            )
             candidates.append((has_active, e.last_access, mid))
         if not candidates:
             return None
@@ -868,6 +1176,14 @@ class EnginePool:
 
         Sets state to UNLOADED. This aborts any in-progress requests.
 
+        IMPORTANT: This method is often called under self._lock.  The state
+        transition and engine reference clearing happen quickly (no awaits),
+        then the heavy async cleanup (engine.stop + mx.clear_cache) runs
+        AFTER the caller releases the lock via _deferred_engine_cleanup().
+        This prevents the pool lock from being held while waiting for the
+        MLX executor, which would block all get_engine() callers and cause
+        cascading timeouts.
+
         Args:
             model_id: The model ID to unload
             reason: Reason string for state transition logging
@@ -881,13 +1197,40 @@ class EnginePool:
 
         logger.info(f"Unloading model: {model_id}")
 
+        # Capture engine reference before clearing it from the entry.
+        # State transition is synchronous (no awaits, safe under lock).
+        engine_to_stop = entry.engine
+        entry.engine = None
+        entry.last_access = 0.0
+        self._set_state(entry, EngineState.UNLOADED, reason)
+
+        # Schedule heavy async cleanup as an independent task so the
+        # pool lock is NOT held during engine.stop() and mx.clear_cache().
+        task = asyncio.create_task(
+            self._deferred_engine_cleanup(model_id, engine_to_stop)
+        )
+        self._cleanup_tasks.append(task)
+        task.add_done_callback(lambda t: self._cleanup_tasks.remove(t)
+                               if t in self._cleanup_tasks else None)
+
+    async def _deferred_engine_cleanup(
+        self, model_id: str, engine: Any
+    ) -> None:
+        """Stop engine and clear Metal cache outside the pool lock.
+
+        This runs as an independent asyncio task so that _unload_engine()
+        (which is typically called under self._lock) returns immediately
+        after the state transition.  The actual engine teardown and
+        mx.clear_cache() happen here without holding the pool lock,
+        preventing cascading timeouts on get_engine() callers.
+        """
         try:
-            await asyncio.wait_for(entry.engine.stop(), timeout=30)
+            await asyncio.wait_for(engine.stop(), timeout=30)
         except asyncio.TimeoutError:
             self._record_timeout("engine_stop", model_id, 30.0)
             # Force cleanup without waiting for graceful stop
             try:
-                engine_core = getattr(entry.engine, '_engine', None)
+                engine_core = getattr(engine, '_engine', None)
                 if engine_core is not None:
                     inner = getattr(engine_core, 'engine', None)
                     if inner is not None:
@@ -897,10 +1240,10 @@ class EnginePool:
         except Exception as e:
             logger.warning(f"Error stopping engine for {model_id}: {e}")
 
-        # Clear engine reference and transition state
-        entry.engine = None
-        entry.last_access = 0.0
-        self._set_state(entry, EngineState.UNLOADED, reason)
+        # Drop the engine reference so model tensors can be collected.
+        # Without this, gc.collect() can't free the MLX arrays because
+        # they're still reachable via the local `engine` variable.
+        del engine
 
         # Force garbage collection to release memory.
         # Run mx.clear_cache on the global MLX executor to avoid concurrent
@@ -944,6 +1287,7 @@ class EnginePool:
             logger.info(f"Loading model as LM (force_lm=True): {model_id}")
         else:
             logger.info(f"Loading model: {model_id}")
+        t0 = time.monotonic()
 
         # Retrieve per-model settings for post-load transforms
         model_settings = None
@@ -1136,8 +1480,9 @@ class EnginePool:
             lambda: (mx.synchronize(), mx.clear_cache()),
         )
 
+        elapsed = time.monotonic() - t0
         logger.info(
-            f"Loaded model: {model_id} "
+            f"Loaded model: {model_id} in {elapsed:.1f}s "
             f"(estimated: {format_size(entry.estimated_size)}, "
             f"total: {format_size(self._committed_memory())})"
         )
@@ -1170,6 +1515,16 @@ class EnginePool:
         starting while we're tearing down.  This is acceptable because
         shutdown is a terminal operation — no new requests should arrive.
         """
+        # Cancel watchdog before acquiring lock (it doesn't hold the lock,
+        # but we want a clean shutdown)
+        if self._watchdog_task is not None:
+            self._watchdog_task.cancel()
+            try:
+                await self._watchdog_task
+            except asyncio.CancelledError:
+                pass
+            self._watchdog_task = None
+
         async with self._tracked_lock("shutdown"):
             for model_id in list(self._entries.keys()):
                 entry = self._entries.get(model_id)
@@ -1196,6 +1551,15 @@ class EnginePool:
                     entry.drain_complete.set()
                 if entry.ready_event and not entry.ready_event.is_set():
                     entry.ready_event.set()
+
+        # Wait for deferred cleanup tasks (engine.stop + mx.clear_cache)
+        # outside the lock so they can actually run.
+        if self._cleanup_tasks:
+            logger.info(
+                f"Waiting for {len(self._cleanup_tasks)} engine cleanup tasks..."
+            )
+            await asyncio.gather(*self._cleanup_tasks, return_exceptions=True)
+            self._cleanup_tasks.clear()
 
         logger.info("Engine pool shutdown complete")
 
@@ -1229,6 +1593,51 @@ class EnginePool:
                 }
                 for mid, e in sorted(self._entries.items())
             ],
+        }
+
+    def get_debug_status(self) -> dict:
+        """Get detailed pool status for the /debug/pool diagnostic endpoint.
+
+        Lock-free read-only snapshot — fast and safe to call at any time.
+        Only includes non-UNLOADED models to keep the response small.
+        """
+        now = time.time()
+        models = {}
+        for mid, e in self._entries.items():
+            if e.state == EngineState.UNLOADED:
+                continue
+            info: dict[str, Any] = {
+                "state": e.state.value,
+                "loaded": e.engine is not None,
+            }
+            if e.state == EngineState.LOADING:
+                info["load_elapsed_s"] = round(now - e.load_started, 1)
+            if e.state == EngineState.DRAINING:
+                info["drain_elapsed_s"] = round(now - e.drain_started, 1)
+            if e.state == EngineState.ACTIVE:
+                info["active_requests"] = (
+                    self._engine_has_active_work(e.engine)
+                    if e.engine
+                    else False
+                )
+            models[mid] = info
+
+        unloaded_count = sum(
+            1 for e in self._entries.values()
+            if e.state == EngineState.UNLOADED
+        )
+
+        return {
+            "lock_held": self._lock.locked(),
+            "committed_memory_gb": round(self._committed_memory() / 1e9, 2),
+            "max_model_memory_gb": (
+                round(self._max_model_memory / 1e9, 2)
+                if self._max_model_memory
+                else None
+            ),
+            "timeout_counter": self._timeout_counter,
+            "active_models": models,
+            "unloaded_count": unloaded_count,
         }
 
     async def check_ttl_expirations(
