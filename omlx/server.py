@@ -423,6 +423,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Test-only debug capture endpoint (no-op unless OMLX_DEBUG_CAPTURE=1)
+from .debug_capture import register_debug_endpoint
+register_debug_endpoint(app)
+
 # Include MCP routes
 from .api.mcp_routes import router as mcp_router, set_mcp_manager_getter
 set_mcp_manager_getter(get_mcp_manager)
@@ -723,6 +727,64 @@ async def get_engine(
             )
 
     return engine
+
+
+@asynccontextmanager
+async def use_engine(
+    model_id: str | None = None,
+    engine_type: EngineType = EngineType.LLM,
+):
+    """Context manager: get engine with eviction protection.
+
+    Increments active_uses on the engine entry so the drain monitor
+    and process_memory_enforcer won't evict this engine while the
+    caller is using it.  Suitable for non-streaming endpoints
+    (embedding, ASR, TTS, reranker, token counting) where the entire
+    operation completes within the context manager scope.
+
+    For LLM streaming endpoints, use acquire_engine() directly with
+    _with_engine_guard() instead, since the stream outlives the handler.
+
+    Usage:
+        async with use_engine(model_id, EngineType.EMBEDDING) as engine:
+            output = await engine.embed(texts)
+    """
+    pool = get_engine_pool()
+    engine = await get_engine(model_id, engine_type)
+
+    # Resolve the model_id to find the right entry
+    resolved_id = model_id
+    if resolved_id is None:
+        resolved_id = _server_state.default_model
+    if resolved_id is not None:
+        resolved_id = pool.resolve_model_id(
+            resolved_id, _server_state.settings_manager
+        )
+
+    pool.acquire_engine(resolved_id)
+    try:
+        yield engine
+    finally:
+        pool.release_engine(resolved_id)
+
+
+async def _with_engine_guard(
+    generator: AsyncIterator[str],
+    pool: "EnginePool",
+    resolved_model_id: str,
+) -> AsyncIterator[str]:
+    """Wrap a streaming generator with engine eviction protection.
+
+    Releases the engine (decrements active_uses) when the generator
+    finishes, errors, or is closed by client disconnect.  The caller
+    must have already called pool.acquire_engine() before yielding
+    into this wrapper.
+    """
+    try:
+        async for item in generator:
+            yield item
+    finally:
+        pool.release_engine(resolved_model_id)
 
 
 async def get_engine_for_model(model: str | None = None) -> BaseEngine:
@@ -1421,6 +1483,7 @@ async def health():
         pool_status = {
             "model_count": _server_state.engine_pool.model_count,
             "loaded_count": _server_state.engine_pool.loaded_model_count,
+            "loaded_models": _server_state.engine_pool.get_loaded_model_ids(),
             "max_model_memory": _server_state.engine_pool.max_model_memory,
             "current_model_memory": _server_state.engine_pool.current_model_memory,
         }
@@ -1431,6 +1494,18 @@ async def health():
         "engine_pool": pool_status,
         "mcp": mcp_info,
     }
+
+
+@app.get("/debug/pool")
+async def debug_pool():
+    """Diagnostic endpoint for engine pool state.
+
+    Returns a lock-free read-only snapshot of pool internals including
+    stuck-state detection, memory accounting, and executor health.
+    No authentication required — intended for local debugging.
+    """
+    pool = get_engine_pool()
+    return pool.get_debug_status()
 
 
 @app.get("/api/status")
@@ -1717,8 +1792,6 @@ async def create_rerank(
             detail="Server is busy with oQ quantization. Please try again after quantization completes.",
         )
 
-    engine = await get_reranker_engine(request.model)
-
     # Normalize documents to list of strings
     documents = normalize_documents(request.documents)
 
@@ -1731,11 +1804,12 @@ async def create_rerank(
     # Perform reranking
     start_time = time.perf_counter()
 
-    output = await engine.rerank(
-        query=request.query,
-        documents=documents,
-        top_n=request.top_n,
-    )
+    async with use_engine(request.model, EngineType.RERANKER) as engine:
+        output = await engine.rerank(
+            query=request.query,
+            documents=documents,
+            top_n=request.top_n,
+        )
 
     elapsed = time.perf_counter() - start_time
     logger.info(
@@ -1808,8 +1882,6 @@ async def create_transcription(
             language = "auto"
     language = str(language)
 
-    engine = await get_asr_engine(model_str)
-
     # Write uploaded file to temp path for mlx_audio
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         content = await audio_file.read()
@@ -1818,16 +1890,17 @@ async def create_transcription(
 
     try:
         start_time = time.perf_counter()
-        try:
-            output = await engine.transcribe(
-                tmp_path,
-                language=language,
-                prompt=str(prompt) if prompt else None,
-            )
-        except InvalidAudioFormatError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-        except AudioError as e:
-            raise HTTPException(status_code=422, detail=str(e))
+        async with use_engine(model_str, EngineType.ASR) as engine:
+            try:
+                output = await engine.transcribe(
+                    tmp_path,
+                    language=language,
+                    prompt=str(prompt) if prompt else None,
+                )
+            except InvalidAudioFormatError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            except AudioError as e:
+                raise HTTPException(status_code=422, detail=str(e))
         elapsed = time.perf_counter() - start_time
 
         logger.info(
@@ -1892,8 +1965,6 @@ async def create_speech(
 
     Returns binary WAV audio (24 kHz) or streaming PCM.
     """
-    engine = await get_tts_engine(request.model)
-
     # Apply model settings defaults
     speaker = request.voice if request.voice != "default" else None
     instruct = request.instructions
@@ -1939,15 +2010,26 @@ async def create_speech(
                 detail=f"Streaming only supports wav/pcm format, got {fmt}",
             )
 
+        # For streaming TTS, acquire the engine for the entire stream
+        pool = get_engine_pool()
+        resolved = pool.resolve_model_id(
+            request.model, _server_state.settings_manager
+        )
+        engine = await get_tts_engine(request.model)
+        pool.acquire_engine(resolved)
+
         async def _stream_pcm():
-            async for chunk in engine.stream_synthesize(
-                text=request.input,
-                speaker=speaker,
-                instruct=instruct,
-                ref_audio=request.ref_audio,
-                ref_text=request.ref_text,
-            ):
-                yield chunk.audio_bytes
+            try:
+                async for chunk in engine.stream_synthesize(
+                    text=request.input,
+                    speaker=speaker,
+                    instruct=instruct,
+                    ref_audio=request.ref_audio,
+                    ref_text=request.ref_text,
+                ):
+                    yield chunk.audio_bytes
+            finally:
+                pool.release_engine(resolved)
 
         return StreamingResponse(
             _stream_pcm(),
@@ -1961,18 +2043,19 @@ async def create_speech(
 
     start_time = time.perf_counter()
 
-    try:
-        output = await engine.synthesize(
-            text=request.input,
-            speaker=speaker,
-            instruct=instruct,
-            ref_audio=request.ref_audio,
-            ref_text=request.ref_text,
-        )
-    except VoiceCloningError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except AudioError as e:
-        raise HTTPException(status_code=422, detail=str(e))
+    async with use_engine(request.model, EngineType.TTS) as engine:
+        try:
+            output = await engine.synthesize(
+                text=request.input,
+                speaker=speaker,
+                instruct=instruct,
+                ref_audio=request.ref_audio,
+                ref_text=request.ref_text,
+            )
+        except VoiceCloningError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except AudioError as e:
+            raise HTTPException(status_code=422, detail=str(e))
 
     elapsed = time.perf_counter() - start_time
 
@@ -2027,8 +2110,8 @@ async def list_speakers(
                 detail="No TTS model specified and none currently loaded"
             )
 
-    engine = await get_tts_engine(model)
-    speakers = engine.get_speakers()
+    async with use_engine(model, EngineType.TTS) as engine:
+        speakers = engine.get_speakers()
 
     return SpeakersResponse(
         speakers=speakers,
@@ -2057,8 +2140,8 @@ async def list_languages(
                 detail="No ASR model specified and none available"
             )
 
-    engine = await get_asr_engine(model)
-    languages = engine.get_languages()
+    async with use_engine(model, EngineType.ASR) as engine:
+        languages = engine.get_languages()
 
     return LanguagesResponse(
         languages=languages,
@@ -2082,74 +2165,87 @@ async def create_completion(
             status_code=503,
             detail="Server is busy with oQ quantization. Please try again after quantization completes.",
         )
+
+    pool = get_engine_pool()
+    resolved_model = resolve_model_id(request.model) or request.model
+
     load_start = time.perf_counter()
     engine = await get_engine_for_model(request.model)
     model_load_duration = time.perf_counter() - load_start
 
-    # Handle single prompt or list of prompts
-    prompts = request.prompt if isinstance(request.prompt, list) else [request.prompt]
+    pool.acquire_engine(resolved_model)
+    released = False
+    try:
+        # Handle single prompt or list of prompts
+        prompts = request.prompt if isinstance(request.prompt, list) else [request.prompt]
 
-    # Validate context window for each prompt
-    for prompt in prompts:
-        num_tokens = len(engine.tokenizer.encode(prompt))
-        validate_context_window(num_tokens, request.model)
+        # Validate context window for each prompt
+        for prompt in prompts:
+            num_tokens = len(engine.tokenizer.encode(prompt))
+            validate_context_window(num_tokens, request.model)
 
-    if request.stream:
-        return StreamingResponse(
-            _with_sse_keepalive(
-                stream_completion(engine, prompts[0], request, model_load_duration=model_load_duration),
-                http_request=http_request,
-            ),
-            media_type="text/event-stream",
-            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+        if request.stream:
+            released = True  # _with_engine_guard takes ownership
+            return StreamingResponse(
+                _with_engine_guard(
+                    _with_sse_keepalive(
+                        stream_completion(engine, prompts[0], request, model_load_duration=model_load_duration),
+                        http_request=http_request,
+                    ),
+                    pool, resolved_model,
+                ),
+                media_type="text/event-stream",
+            )
+
+        # Non-streaming response with timing
+        start_time = time.perf_counter()
+        choices = []
+        total_completion_tokens = 0
+        total_prompt_tokens = 0
+        total_cached_tokens = 0
+
+        temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = get_sampling_params(
+            request.temperature, request.top_p, request.model,
+            req_min_p=getattr(request, 'min_p', None),
+            req_presence_penalty=getattr(request, 'presence_penalty', None),
+            req_frequency_penalty=getattr(request, 'frequency_penalty', None),
+            req_max_tokens=request.max_tokens,
+            req_xtc_probability=getattr(request, 'xtc_probability', None),
+            req_xtc_threshold=getattr(request, 'xtc_threshold', None),
         )
 
-    # Non-streaming response with timing
-    start_time = time.perf_counter()
-    choices = []
-    total_completion_tokens = 0
-    total_prompt_tokens = 0
-    total_cached_tokens = 0
+        for i, prompt in enumerate(prompts):
+            output = await _run_with_disconnect_guard(
+                http_request,
+                engine.generate(
+                    prompt=prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                    top_k=top_k,
+                    min_p=min_p,
+                    repetition_penalty=repetition_penalty,
+                    presence_penalty=presence_penalty,
+                    frequency_penalty=frequency_penalty,
+                    xtc_probability=xtc_probability,
+                    xtc_threshold=xtc_threshold,
+                    stop=request.stop,
+                ),
+            )
+            if output is None:
+                return  # Client disconnected
 
-    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = get_sampling_params(
-        request.temperature, request.top_p, request.model,
-        req_min_p=getattr(request, 'min_p', None),
-        req_presence_penalty=getattr(request, 'presence_penalty', None),
-        req_frequency_penalty=getattr(request, 'frequency_penalty', None),
-        req_max_tokens=request.max_tokens,
-        req_xtc_probability=getattr(request, 'xtc_probability', None),
-        req_xtc_threshold=getattr(request, 'xtc_threshold', None),
-    )
-
-    for i, prompt in enumerate(prompts):
-        output = await _run_with_disconnect_guard(
-            http_request,
-            engine.generate(
-                prompt=prompt,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                min_p=min_p,
-                repetition_penalty=repetition_penalty,
-                presence_penalty=presence_penalty,
-                frequency_penalty=frequency_penalty,
-                xtc_probability=xtc_probability,
-                xtc_threshold=xtc_threshold,
-                stop=request.stop,
-            ),
-        )
-        if output is None:
-            return  # Client disconnected
-
-        choices.append(CompletionChoice(
-            index=i,
-            text=output.text,
-            finish_reason=output.finish_reason,
-        ))
-        total_completion_tokens += output.completion_tokens
-        total_prompt_tokens += output.prompt_tokens
-        total_cached_tokens += output.cached_tokens
+            choices.append(CompletionChoice(
+                index=i,
+                text=output.text,
+                finish_reason=output.finish_reason,
+            ))
+            total_completion_tokens += output.completion_tokens
+            total_prompt_tokens += output.prompt_tokens
+            total_cached_tokens += output.cached_tokens
+    finally:
+        if not released:
+            pool.release_engine(resolved_model)
 
     elapsed = time.perf_counter() - start_time
     tokens_per_sec = total_completion_tokens / elapsed if elapsed > 0 else 0
@@ -2200,6 +2296,15 @@ async def create_chat_completion(
     }
     ```
     """
+    # Test-only request capture (no-op unless OMLX_DEBUG_CAPTURE=1)
+    from .debug_capture import capture_request
+    capture_request(
+        model=request.model,
+        messages=request.messages,
+        tools_count=len(request.tools) if request.tools else 0,
+        tool_choice=request.tool_choice,
+    )
+
     # Log incoming request summary at debug, message content at trace
     logger.debug(f"Chat completion request received: model={request.model}, "
                  f"messages={len(request.messages)}, stream={request.stream}, "
@@ -2216,175 +2321,180 @@ async def create_chat_completion(
             detail="Server is busy with oQ quantization. Please try again after quantization completes.",
         )
 
+    # Resolve alias to real model ID for settings lookups
+    resolved_model = resolve_model_id(request.model) or request.model
+    pool = get_engine_pool()
+
     load_start = time.perf_counter()
     engine = await get_engine_for_model(request.model)
     model_load_duration = time.perf_counter() - load_start
 
-    # Resolve alias to real model ID for settings lookups
-    resolved_model = resolve_model_id(request.model) or request.model
-
-    # Get per-model settings
-    max_tool_result_tokens = None
-    merged_ct_kwargs = {}
-    forced_keys: set[str] = set()
-    reasoning_parser = None
-    if _server_state.settings_manager:
-        ms = _server_state.settings_manager.get_settings(resolved_model)
-        max_tool_result_tokens = ms.max_tool_result_tokens
-        reasoning_parser = ms.reasoning_parser
-        if ms.chat_template_kwargs:
-            merged_ct_kwargs.update(ms.chat_template_kwargs)
-        forced_keys = set(ms.forced_ct_kwargs or [])
-    # Per-request kwargs override model settings (except forced keys)
-    if request.chat_template_kwargs:
-        for k, v in request.chat_template_kwargs.items():
-            if k not in forced_keys:
-                merged_ct_kwargs[k] = v
-
-    # Extract messages - different engines need different content handling
-    is_vlm = isinstance(engine, VLMBatchedEngine)
-    extractor = getattr(engine, "message_extractor", None)
-    if extractor is not None:
-        messages = extractor(request.messages, max_tool_result_tokens, engine.tokenizer)
-    elif is_vlm:
-        # VLM: preserve image_url content parts for vision processing
-        messages = extract_multimodal_content(
-            request.messages, max_tool_result_tokens, engine.tokenizer
-        )
-    else:
-        messages = extract_text_content(
-            request.messages, max_tool_result_tokens, engine.tokenizer
-        )
-
-    # Compile grammar for structured output (logit-level enforcement).
-    # Grammar compilation needs the tokenizer, so ensure the engine is loaded.
-    response_format = request.response_format
-    if request.structured_outputs is not None or response_format:
-        await engine.start()
-    compiled_grammar = _compile_grammar_for_request(
-        engine,
-        structured_outputs=request.structured_outputs,
-        response_format=response_format,
-        chat_template_kwargs=merged_ct_kwargs or None,
-        reasoning_parser=reasoning_parser,
-    )
-    # Fall back to prompt injection when grammar is not compiled
-    if compiled_grammar is None and response_format:
-        json_instruction = build_json_system_prompt(response_format)
-        if json_instruction:
-            messages = _inject_json_instruction(messages, json_instruction)
-
-    # Merge MCP tools with user-provided tools
-    effective_tools = request.tools
-    if _server_state.mcp_manager:
-        # Convert Pydantic ToolDefinition models to dicts for merge_tools
-        user_tools_dicts = [t.model_dump() for t in request.tools] if request.tools else None
-        effective_tools = _server_state.mcp_manager.get_merged_tools(user_tools_dicts)
-
-    # Validate context window before sending to model
-    tools_for_template = convert_tools_for_template(effective_tools) if effective_tools else None
+    pool.acquire_engine(resolved_model)
+    released = False
     try:
-        num_prompt_tokens = engine.count_chat_tokens(
-            messages, tools_for_template,
+        # Get per-model settings
+        max_tool_result_tokens = None
+        merged_ct_kwargs = {}
+        forced_keys: set[str] = set()
+        reasoning_parser = None
+        if _server_state.settings_manager:
+            ms = _server_state.settings_manager.get_settings(resolved_model)
+            max_tool_result_tokens = ms.max_tool_result_tokens
+            reasoning_parser = ms.reasoning_parser
+            if ms.chat_template_kwargs:
+                merged_ct_kwargs.update(ms.chat_template_kwargs)
+            forced_keys = set(ms.forced_ct_kwargs or [])
+        # Per-request kwargs override model settings (except forced keys)
+        if request.chat_template_kwargs:
+            for k, v in request.chat_template_kwargs.items():
+                if k not in forced_keys:
+                    merged_ct_kwargs[k] = v
+
+        # Extract messages - different engines need different content handling
+        is_vlm = isinstance(engine, VLMBatchedEngine)
+        extractor = getattr(engine, "message_extractor", None)
+        if extractor is not None:
+            messages = extractor(request.messages, max_tool_result_tokens, engine.tokenizer)
+        elif is_vlm:
+            # VLM: preserve image_url content parts for vision processing
+            messages = extract_multimodal_content(
+                request.messages, max_tool_result_tokens, engine.tokenizer
+            )
+        else:
+            messages = extract_text_content(
+                request.messages, max_tool_result_tokens, engine.tokenizer
+            )
+
+        # Compile grammar for structured output (logit-level enforcement).
+        # Grammar compilation needs the tokenizer, so ensure the engine is loaded.
+        response_format = request.response_format
+        if request.structured_outputs is not None or response_format:
+            await engine.start()
+        compiled_grammar = _compile_grammar_for_request(
+            engine,
+            structured_outputs=request.structured_outputs,
+            response_format=response_format,
             chat_template_kwargs=merged_ct_kwargs or None,
+            reasoning_parser=reasoning_parser,
         )
-    except Exception as e:
-        # Catch chat template rendering failures: Jinja2 TemplateError,
-        # AssertionError from strict role validation, ValueError, etc.
-        err_name = type(e).__name__.lower()
-        err_msg = str(e).lower()
-        if (
-            "template" in err_name
-            or "template" in err_msg
-            or isinstance(e, (AssertionError, ValueError))
-        ):
-            raise HTTPException(
-                status_code=400, detail=f"Chat template error: {e}"
+        # Fall back to prompt injection when grammar is not compiled
+        if compiled_grammar is None and response_format:
+            json_instruction = build_json_system_prompt(response_format)
+            if json_instruction:
+                messages = _inject_json_instruction(messages, json_instruction)
+
+        # Merge MCP tools with user-provided tools
+        effective_tools = request.tools
+        if _server_state.mcp_manager:
+            # Convert Pydantic ToolDefinition models to dicts for merge_tools
+            user_tools_dicts = [t.model_dump() for t in request.tools] if request.tools else None
+            effective_tools = _server_state.mcp_manager.get_merged_tools(user_tools_dicts)
+
+        # Validate context window before sending to model
+        tools_for_template = convert_tools_for_template(effective_tools) if effective_tools else None
+        try:
+            num_prompt_tokens = engine.count_chat_tokens(
+                messages, tools_for_template,
+                chat_template_kwargs=merged_ct_kwargs or None,
             )
-        raise
-    validate_context_window(num_prompt_tokens, request.model)
+        except Exception as e:
+            # Catch chat template rendering failures: Jinja2 TemplateError,
+            # AssertionError from strict role validation, ValueError, etc.
+            err_name = type(e).__name__.lower()
+            err_msg = str(e).lower()
+            if (
+                "template" in err_name
+                or "template" in err_msg
+                or isinstance(e, (AssertionError, ValueError))
+            ):
+                raise HTTPException(
+                    status_code=400, detail=f"Chat template error: {e}"
+                )
+            raise
+        validate_context_window(num_prompt_tokens, request.model)
 
-    # Prepare kwargs
-    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = get_sampling_params(
-        request.temperature, request.top_p, request.model,
-        req_min_p=getattr(request, 'min_p', None),
-        req_presence_penalty=getattr(request, 'presence_penalty', None),
-        req_frequency_penalty=getattr(request, 'frequency_penalty', None),
-        req_max_tokens=request.max_tokens,
-        req_xtc_probability=getattr(request, 'xtc_probability', None),
-        req_xtc_threshold=getattr(request, 'xtc_threshold', None),
-    )
-    chat_kwargs = {
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "top_p": top_p,
-        "top_k": top_k,
-        "min_p": min_p,
-        "repetition_penalty": repetition_penalty,
-        "presence_penalty": presence_penalty,
-        "frequency_penalty": frequency_penalty,
-        "xtc_probability": xtc_probability,
-        "xtc_threshold": xtc_threshold,
-    }
-
-    # Add thinking budget if applicable
-    thinking_budget = _resolve_thinking_budget(request, request.model)
-    if thinking_budget is not None:
-        chat_kwargs["thinking_budget"] = thinking_budget
-
-    # Add compiled grammar for logit-level structured output.
-    # When a reasoning_parser is configured, the structural tag includes
-    # a thinking phase — auto-set a thinking_budget so the model exits
-    # the reasoning phase and the grammar can activate.
-    if compiled_grammar is not None:
-        chat_kwargs["compiled_grammar"] = compiled_grammar
-        if reasoning_parser and "thinking_budget" not in chat_kwargs:
-            default_budget = min(max_tokens // 2, 4096)
-            chat_kwargs["thinking_budget"] = default_budget
-            logger.debug(
-                "Auto-set thinking_budget=%d for grammar-constrained request",
-                default_budget,
-            )
-
-    # Add tools if provided (includes MCP tools)
-    if tools_for_template:
-        chat_kwargs["tools"] = tools_for_template
-
-    # Add chat template kwargs
-    if merged_ct_kwargs:
-        chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
-
-    # SpecPrefill: per-request overrides (fall back to model_settings)
-    if request.specprefill is not None:
-        chat_kwargs["specprefill"] = request.specprefill
-    if request.specprefill_keep_pct is not None:
-        chat_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
-    elif _server_state.settings_manager and ms.specprefill_keep_pct is not None:
-        chat_kwargs["specprefill_keep_pct"] = ms.specprefill_keep_pct
-    if getattr(request, "specprefill_threshold", None) is not None:
-        chat_kwargs["specprefill_threshold"] = request.specprefill_threshold
-    elif _server_state.settings_manager and ms.specprefill_threshold is not None:
-        chat_kwargs["specprefill_threshold"] = ms.specprefill_threshold
-
-    if request.stream:
-        return StreamingResponse(
-            _with_sse_keepalive(
-                stream_chat_completion(engine, messages, request, model_load_duration=model_load_duration, **chat_kwargs),
-                http_request=http_request,
-            ),
-            media_type="text/event-stream",
-            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+        # Prepare kwargs
+        temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = get_sampling_params(
+            request.temperature, request.top_p, request.model,
+            req_min_p=getattr(request, 'min_p', None),
+            req_presence_penalty=getattr(request, 'presence_penalty', None),
+            req_frequency_penalty=getattr(request, 'frequency_penalty', None),
+            req_max_tokens=request.max_tokens,
+            req_xtc_probability=getattr(request, 'xtc_probability', None),
+            req_xtc_threshold=getattr(request, 'xtc_threshold', None),
         )
+        chat_kwargs = {
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "min_p": min_p,
+            "repetition_penalty": repetition_penalty,
+            "presence_penalty": presence_penalty,
+            "frequency_penalty": frequency_penalty,
+            "xtc_probability": xtc_probability,
+            "xtc_threshold": xtc_threshold,
+        }
 
-    # Non-streaming response with timing
-    start_time = time.perf_counter()
+        # Add compiled grammar for logit-level structured output.
+        # When a reasoning_parser is configured, the structural tag includes
+        # a thinking phase — auto-set a thinking_budget so the model exits
+        # the reasoning phase and the grammar can activate.
+        if compiled_grammar is not None:
+            chat_kwargs["compiled_grammar"] = compiled_grammar
+            if reasoning_parser and "thinking_budget" not in chat_kwargs:
+                default_budget = min(max_tokens // 2, 4096)
+                chat_kwargs["thinking_budget"] = default_budget
+                logger.debug(
+                    "Auto-set thinking_budget=%d for grammar-constrained request",
+                    default_budget,
+                )
 
-    output = await _run_with_disconnect_guard(
-        http_request,
-        engine.chat(messages=messages, **chat_kwargs),
-    )
-    if output is None:
-        return  # Client disconnected
+        # Add tools if provided (includes MCP tools)
+        if tools_for_template:
+            chat_kwargs["tools"] = tools_for_template
+
+        # Add chat template kwargs
+        if merged_ct_kwargs:
+            chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
+
+        # SpecPrefill: per-request overrides (fall back to model_settings)
+        if request.specprefill is not None:
+            chat_kwargs["specprefill"] = request.specprefill
+        if request.specprefill_keep_pct is not None:
+            chat_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
+        elif _server_state.settings_manager and ms.specprefill_keep_pct is not None:
+            chat_kwargs["specprefill_keep_pct"] = ms.specprefill_keep_pct
+        if getattr(request, "specprefill_threshold", None) is not None:
+            chat_kwargs["specprefill_threshold"] = request.specprefill_threshold
+        elif _server_state.settings_manager and ms.specprefill_threshold is not None:
+            chat_kwargs["specprefill_threshold"] = ms.specprefill_threshold
+
+        if request.stream:
+            released = True  # _with_engine_guard takes ownership
+            return StreamingResponse(
+                _with_engine_guard(
+                    _with_sse_keepalive(
+                        stream_chat_completion(engine, messages, request, model_load_duration=model_load_duration, **chat_kwargs),
+                        http_request=http_request,
+                    ),
+                    pool, resolved_model,
+                ),
+                media_type="text/event-stream",
+            )
+
+        # Non-streaming response with timing
+        start_time = time.perf_counter()
+
+        output = await _run_with_disconnect_guard(
+            http_request,
+            engine.chat(messages=messages, **chat_kwargs),
+        )
+        if output is None:
+            return  # Client disconnected
+    finally:
+        if not released:
+            pool.release_engine(resolved_model)
 
     elapsed = time.perf_counter() - start_time
     tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
@@ -3400,150 +3510,160 @@ async def create_anthropic_message(
             detail="Server is busy with oQ quantization. Please try again after quantization completes.",
         )
 
-    engine = await get_engine_for_model(request.model)
-
     # Resolve alias to real model ID for settings lookups
     resolved_model = resolve_model_id(request.model) or request.model
+    pool = get_engine_pool()
 
-    # Get per-model settings
-    max_tool_result_tokens = None
-    merged_ct_kwargs = {}
-    forced_keys: set[str] = set()
-    if _server_state.settings_manager:
-        ms = _server_state.settings_manager.get_settings(resolved_model)
-        max_tool_result_tokens = ms.max_tool_result_tokens
-        if ms.chat_template_kwargs:
-            merged_ct_kwargs.update(ms.chat_template_kwargs)
-        forced_keys = set(ms.forced_ct_kwargs or [])
-    # Per-request kwargs override model settings (except forced keys)
-    if request.chat_template_kwargs:
-        for k, v in request.chat_template_kwargs.items():
-            if k not in forced_keys:
-                merged_ct_kwargs[k] = v
+    engine = await get_engine_for_model(request.model)
 
-    # Pass Anthropic thinking config to chat template (except forced keys)
-    if hasattr(request, 'thinking') and request.thinking:
-        if "enable_thinking" not in forced_keys:
-            thinking_type = getattr(request.thinking, 'type', None)
-            if thinking_type in ("enabled", "adaptive"):
-                merged_ct_kwargs["enable_thinking"] = True
-            elif thinking_type == "disabled":
-                merged_ct_kwargs["enable_thinking"] = False
-
-    logger.debug(
-        f"Tool result truncation config: max_tokens={max_tool_result_tokens}, "
-        f"has_tokenizer={engine.tokenizer is not None}"
-    )
-
-    # Convert Anthropic format to internal format
-    # Harmony models need special handling to preserve tool format
-    is_vlm = isinstance(engine, VLMBatchedEngine)
-    if engine.model_type == "gpt_oss":
-        messages = convert_anthropic_to_internal_harmony(
-            request, max_tool_result_tokens, engine.tokenizer
-        )
-    else:
-        messages = convert_anthropic_to_internal(
-            request, max_tool_result_tokens, engine.tokenizer,
-            preserve_images=is_vlm,
-        )
-
-    # Apply model-specific message extraction (e.g. Gemma 4 converts
-    # role=tool messages into tool_responses on assistant turns).
-    extractor = getattr(engine, "message_extractor", None)
-    if extractor is not None:
-        messages = extractor(messages, max_tool_result_tokens, engine.tokenizer)
-
-    # Prepare kwargs
-    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = get_sampling_params(
-        request.temperature, request.top_p, request.model,
-        req_max_tokens=request.max_tokens,
-    )
-
-    chat_kwargs = {
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "top_p": top_p,
-        "top_k": top_k,
-        "min_p": min_p,
-        "repetition_penalty": repetition_penalty,
-        "presence_penalty": presence_penalty,
-        "frequency_penalty": frequency_penalty,
-        "xtc_probability": xtc_probability,
-        "xtc_threshold": xtc_threshold,
-    }
-
-    # Add thinking budget if applicable
-    thinking_budget = _resolve_thinking_budget(request, request.model)
-    if thinking_budget is not None:
-        chat_kwargs["thinking_budget"] = thinking_budget
-
-    # Merge MCP tools with user-provided Anthropic tools
-    user_internal = convert_anthropic_tools_to_internal(request.tools)
-    if _server_state.mcp_manager:
-        mcp_openai_tools = _server_state.mcp_manager.get_all_tools_openai()
-        combined = (mcp_openai_tools or []) + (user_internal or [])
-        # Deduplicate by function name (user tools take precedence)
-        if combined:
-            seen = {}
-            for tool in combined:
-                name = tool.get("function", {}).get("name", "")
-                seen[name] = tool
-            internal_tools = list(seen.values())
-        else:
-            internal_tools = None
-    else:
-        internal_tools = user_internal
-    if internal_tools:
-        chat_kwargs["tools"] = internal_tools
-
-    # Add chat template kwargs
-    if merged_ct_kwargs:
-        chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
-
-    # Validate context window before sending to model
+    pool.acquire_engine(resolved_model)
+    released = False
     try:
-        num_prompt_tokens = engine.count_chat_tokens(
-            messages, internal_tools,
-            chat_template_kwargs=merged_ct_kwargs or None,
+        # Get per-model settings
+        max_tool_result_tokens = None
+        merged_ct_kwargs = {}
+        forced_keys: set[str] = set()
+        if _server_state.settings_manager:
+            ms = _server_state.settings_manager.get_settings(resolved_model)
+            max_tool_result_tokens = ms.max_tool_result_tokens
+            if ms.chat_template_kwargs:
+                merged_ct_kwargs.update(ms.chat_template_kwargs)
+            forced_keys = set(ms.forced_ct_kwargs or [])
+        # Per-request kwargs override model settings (except forced keys)
+        if request.chat_template_kwargs:
+            for k, v in request.chat_template_kwargs.items():
+                if k not in forced_keys:
+                    merged_ct_kwargs[k] = v
+
+        # Pass Anthropic thinking config to chat template (except forced keys)
+        if hasattr(request, 'thinking') and request.thinking:
+            if "enable_thinking" not in forced_keys:
+                thinking_type = getattr(request.thinking, 'type', None)
+                if thinking_type in ("enabled", "adaptive"):
+                    merged_ct_kwargs["enable_thinking"] = True
+                elif thinking_type == "disabled":
+                    merged_ct_kwargs["enable_thinking"] = False
+
+        logger.debug(
+            f"Tool result truncation config: max_tokens={max_tool_result_tokens}, "
+            f"has_tokenizer={engine.tokenizer is not None}"
         )
-    except Exception as e:
-        err_name = type(e).__name__.lower()
-        err_msg = str(e).lower()
-        if (
-            "template" in err_name
-            or "template" in err_msg
-            or isinstance(e, (AssertionError, ValueError))
-        ):
-            raise HTTPException(
-                status_code=400, detail=f"Chat template error: {e}"
+
+        # Convert Anthropic format to internal format
+        # Harmony models need special handling to preserve tool format
+        is_vlm = isinstance(engine, VLMBatchedEngine)
+        if engine.model_type == "gpt_oss":
+            messages = convert_anthropic_to_internal_harmony(
+                request, max_tool_result_tokens, engine.tokenizer
             )
-        raise
-    validate_context_window(num_prompt_tokens, request.model)
+        else:
+            messages = convert_anthropic_to_internal(
+                request, max_tool_result_tokens, engine.tokenizer,
+                preserve_images=is_vlm,
+            )
 
-    # Add stop sequences
-    if request.stop_sequences:
-        chat_kwargs["stop"] = request.stop_sequences
+        # Apply model-specific message extraction (e.g. Gemma 4 converts
+        # role=tool messages into tool_responses on assistant turns).
+        extractor = getattr(engine, "message_extractor", None)
+        if extractor is not None:
+            messages = extractor(messages, max_tool_result_tokens, engine.tokenizer)
 
-    if request.stream:
-        return StreamingResponse(
-            _with_sse_keepalive(
-                stream_anthropic_messages(engine, messages, request, **chat_kwargs),
-                http_request=http_request,
-            ),
-            media_type="text/event-stream",
-            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+        # Prepare kwargs
+        temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = get_sampling_params(
+            request.temperature, request.top_p, request.model,
+            req_max_tokens=request.max_tokens,
         )
 
-    # Non-streaming response
-    start_time = time.perf_counter()
+        chat_kwargs = {
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "min_p": min_p,
+            "repetition_penalty": repetition_penalty,
+            "presence_penalty": presence_penalty,
+            "frequency_penalty": frequency_penalty,
+            "xtc_probability": xtc_probability,
+            "xtc_threshold": xtc_threshold,
+        }
 
-    output = await _run_with_disconnect_guard(
-        http_request,
-        engine.chat(messages=messages, **chat_kwargs),
-    )
-    if output is None:
-        return  # Client disconnected
+        # Add thinking budget if applicable
+        thinking_budget = _resolve_thinking_budget(request, request.model)
+        if thinking_budget is not None:
+            chat_kwargs["thinking_budget"] = thinking_budget
+
+        # Merge MCP tools with user-provided Anthropic tools
+        user_internal = convert_anthropic_tools_to_internal(request.tools)
+        if _server_state.mcp_manager:
+            mcp_openai_tools = _server_state.mcp_manager.get_all_tools_openai()
+            combined = (mcp_openai_tools or []) + (user_internal or [])
+            # Deduplicate by function name (user tools take precedence)
+            if combined:
+                seen = {}
+                for tool in combined:
+                    name = tool.get("function", {}).get("name", "")
+                    seen[name] = tool
+                internal_tools = list(seen.values())
+            else:
+                internal_tools = None
+        else:
+            internal_tools = user_internal
+        if internal_tools:
+            chat_kwargs["tools"] = internal_tools
+
+        # Add chat template kwargs
+        if merged_ct_kwargs:
+            chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
+
+        # Validate context window before sending to model
+        try:
+            num_prompt_tokens = engine.count_chat_tokens(
+                messages, internal_tools,
+                chat_template_kwargs=merged_ct_kwargs or None,
+            )
+        except Exception as e:
+            err_name = type(e).__name__.lower()
+            err_msg = str(e).lower()
+            if (
+                "template" in err_name
+                or "template" in err_msg
+                or isinstance(e, (AssertionError, ValueError))
+            ):
+                raise HTTPException(
+                    status_code=400, detail=f"Chat template error: {e}"
+                )
+            raise
+        validate_context_window(num_prompt_tokens, request.model)
+
+        # Add stop sequences
+        if request.stop_sequences:
+            chat_kwargs["stop"] = request.stop_sequences
+
+        if request.stream:
+            released = True  # _with_engine_guard takes ownership
+            return StreamingResponse(
+                _with_engine_guard(
+                    _with_sse_keepalive(
+                        stream_anthropic_messages(engine, messages, request, **chat_kwargs),
+                        http_request=http_request,
+                    ),
+                    pool, resolved_model,
+                ),
+                media_type="text/event-stream",
+            )
+
+        # Non-streaming response
+        start_time = time.perf_counter()
+
+        output = await _run_with_disconnect_guard(
+            http_request,
+            engine.chat(messages=messages, **chat_kwargs),
+        )
+        if output is None:
+            return  # Client disconnected
+    finally:
+        if not released:
+            pool.release_engine(resolved_model)
 
     elapsed = time.perf_counter() - start_time
     tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
@@ -3629,48 +3749,47 @@ async def count_anthropic_tokens(
             detail="Server is busy with oQ quantization. Please try again after quantization completes.",
         )
 
-    engine = await get_engine_for_model(request.model)
-
-    # Convert Anthropic format to internal format
-    # Create a temporary MessagesRequest to reuse existing conversion logic
-    temp_request = AnthropicMessagesRequest(
-        model=request.model,
-        max_tokens=1,  # Dummy value, not used for token counting
-        messages=request.messages,
-        system=request.system,
-        tools=request.tools,
-        tool_choice=request.tool_choice,
-        thinking=request.thinking,
-    )
-    messages = convert_anthropic_to_internal(temp_request)
-
-    # Convert tools if present
-    internal_tools = convert_anthropic_tools_to_internal(request.tools)
-
-    # Apply chat template to get prompt
-    tokenizer = engine.tokenizer
-    template_kwargs = {
-        "tokenize": False,
-        "add_generation_prompt": True,
-    }
-    if internal_tools:
-        template_kwargs["tools"] = internal_tools
-
-    try:
-        prompt = tokenizer.apply_chat_template(messages, **template_kwargs)
-    except Exception as e:
-        logger.warning(f"Failed to apply chat template: {e}, using simple concatenation")
-        # Fallback: simple concatenation
-        prompt = "\n".join(
-            f"{msg.get('role', 'user')}: {msg.get('content', '')}"
-            for msg in messages
+    async with use_engine(request.model) as engine:
+        # Convert Anthropic format to internal format
+        # Create a temporary MessagesRequest to reuse existing conversion logic
+        temp_request = AnthropicMessagesRequest(
+            model=request.model,
+            max_tokens=1,  # Dummy value, not used for token counting
+            messages=request.messages,
+            system=request.system,
+            tools=request.tools,
+            tool_choice=request.tool_choice,
+            thinking=request.thinking,
         )
+        messages = convert_anthropic_to_internal(temp_request)
 
-    # Tokenize to count tokens
-    if isinstance(prompt, str):
-        token_ids = tokenizer.encode(prompt)
-    else:
-        token_ids = prompt  # Already tokenized
+        # Convert tools if present
+        internal_tools = convert_anthropic_tools_to_internal(request.tools)
+
+        # Apply chat template to get prompt
+        tokenizer = engine.tokenizer
+        template_kwargs = {
+            "tokenize": False,
+            "add_generation_prompt": True,
+        }
+        if internal_tools:
+            template_kwargs["tools"] = internal_tools
+
+        try:
+            prompt = tokenizer.apply_chat_template(messages, **template_kwargs)
+        except Exception as e:
+            logger.warning(f"Failed to apply chat template: {e}, using simple concatenation")
+            # Fallback: simple concatenation
+            prompt = "\n".join(
+                f"{msg.get('role', 'user')}: {msg.get('content', '')}"
+                for msg in messages
+            )
+
+        # Tokenize to count tokens
+        if isinstance(prompt, str):
+            token_ids = tokenizer.encode(prompt)
+        else:
+            token_ids = prompt  # Already tokenized
 
     input_tokens = scale_anthropic_tokens(len(token_ids), request.model)
     logger.debug(f"Token count: {input_tokens} tokens for {len(messages)} messages")
@@ -3743,175 +3862,185 @@ async def create_response(
         f"Responses API request: model={request.model}, stream={request.stream}"
     )
 
+    resolved_model = resolve_model_id(request.model) or request.model
+    pool = get_engine_pool()
+
     load_start = time.perf_counter()
     engine = await get_engine_for_model(request.model)
     model_load_duration = time.perf_counter() - load_start
 
-    resolved_model = resolve_model_id(request.model) or request.model
-
-    current_input_messages = convert_responses_input_to_messages(request.input)
-
-    # Build previous context from previous_response_id
-    previous_messages = None
-    if request.previous_response_id:
-        previous_messages = _resolve_previous_response_messages(
-            request.previous_response_id
-        )
-
-    # Convert Responses API input → internal messages
-    messages = convert_responses_input_to_messages(
-        request.input, request.instructions, previous_messages
-    )
-
-    # Convert tools: flat → nested
-    openai_tools = convert_responses_tools(request.tools)
-
-    # Get per-model settings
-    max_tool_result_tokens = None
-    merged_ct_kwargs = {}
-    forced_keys: set[str] = set()
-    reasoning_parser = None
-    if _server_state.settings_manager:
-        ms = _server_state.settings_manager.get_settings(resolved_model)
-        max_tool_result_tokens = ms.max_tool_result_tokens
-        reasoning_parser = ms.reasoning_parser
-        if ms.chat_template_kwargs:
-            merged_ct_kwargs.update(ms.chat_template_kwargs)
-        forced_keys = set(ms.forced_ct_kwargs or [])
-
-    # Note: extract_text_content/extract_harmony_messages/extract_multimodal_content
-    # are NOT called here because convert_responses_input_to_messages() already
-    # returns plain dicts in {"role": str, "content": str} format.
-    # Those extract functions expect Pydantic Message objects from OpenAI/Anthropic requests.
-
-    # Handle text.format (structured output)
-    response_format = None
-    compiled_grammar = None
-    if request.text and request.text.format:
-        fmt = request.text.format
-        if fmt.type == "json_object":
-            response_format = {"type": "json_object"}
-        elif fmt.type == "json_schema":
-            response_format = {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": fmt.name or "response",
-                    "schema": fmt.schema_ or {},
-                    "strict": fmt.strict or False,
-                },
-            }
-        if response_format:
-            from .api.openai_models import ResponseFormat
-
-            await engine.start()
-            rf = ResponseFormat(**response_format)
-            compiled_grammar = _compile_grammar_for_request(
-                engine, response_format=rf,
-                chat_template_kwargs=merged_ct_kwargs or None,
-                reasoning_parser=reasoning_parser,
-            )
-            if compiled_grammar is None:
-                json_instruction = build_json_system_prompt(rf)
-                if json_instruction:
-                    messages = _inject_json_instruction(messages, json_instruction)
-        else:
-            compiled_grammar = None
-
-    # Merge MCP tools
-    effective_tools = openai_tools
-    if _server_state.mcp_manager and openai_tools:
-        effective_tools = _server_state.mcp_manager.get_merged_tools(openai_tools)
-
-    # Convert tools for chat template
-    tools_for_template = (
-        convert_tools_for_template(effective_tools) if effective_tools else None
-    )
-
-    # Validate context window
+    pool.acquire_engine(resolved_model)
+    released = False
     try:
-        num_prompt_tokens = engine.count_chat_tokens(
-            messages,
-            tools_for_template,
-            chat_template_kwargs=merged_ct_kwargs or None,
+        current_input_messages = convert_responses_input_to_messages(request.input)
+
+        # Build previous context from previous_response_id
+        previous_messages = None
+        if request.previous_response_id:
+            previous_messages = _resolve_previous_response_messages(
+                request.previous_response_id
+            )
+
+        # Convert Responses API input → internal messages
+        messages = convert_responses_input_to_messages(
+            request.input, request.instructions, previous_messages
         )
-    except Exception as e:
-        err_name = type(e).__name__.lower()
-        err_msg = str(e).lower()
-        if (
-            "template" in err_name
-            or "template" in err_msg
-            or isinstance(e, (AssertionError, ValueError))
-        ):
-            raise HTTPException(
-                status_code=400, detail=f"Chat template error: {e}"
+
+        # Convert tools: flat → nested
+        openai_tools = convert_responses_tools(request.tools)
+
+        # Get per-model settings
+        max_tool_result_tokens = None
+        merged_ct_kwargs = {}
+        forced_keys: set[str] = set()
+        reasoning_parser = None
+        if _server_state.settings_manager:
+            ms = _server_state.settings_manager.get_settings(resolved_model)
+            max_tool_result_tokens = ms.max_tool_result_tokens
+            reasoning_parser = ms.reasoning_parser
+            if ms.chat_template_kwargs:
+                merged_ct_kwargs.update(ms.chat_template_kwargs)
+            forced_keys = set(ms.forced_ct_kwargs or [])
+
+        # Note: extract_text_content/extract_harmony_messages/extract_multimodal_content
+        # are NOT called here because convert_responses_input_to_messages() already
+        # returns plain dicts in {"role": str, "content": str} format.
+        # Those extract functions expect Pydantic Message objects from OpenAI/Anthropic requests.
+
+        # Handle text.format (structured output)
+        response_format = None
+        compiled_grammar = None
+        if request.text and request.text.format:
+            fmt = request.text.format
+            if fmt.type == "json_object":
+                response_format = {"type": "json_object"}
+            elif fmt.type == "json_schema":
+                response_format = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": fmt.name or "response",
+                        "schema": fmt.schema_ or {},
+                        "strict": fmt.strict or False,
+                    },
+                }
+            if response_format:
+                from .api.openai_models import ResponseFormat
+
+                await engine.start()
+                rf = ResponseFormat(**response_format)
+                compiled_grammar = _compile_grammar_for_request(
+                    engine, response_format=rf,
+                    chat_template_kwargs=merged_ct_kwargs or None,
+                    reasoning_parser=reasoning_parser,
+                )
+                if compiled_grammar is None:
+                    json_instruction = build_json_system_prompt(rf)
+                    if json_instruction:
+                        messages = _inject_json_instruction(messages, json_instruction)
+            else:
+                compiled_grammar = None
+
+        # Merge MCP tools
+        effective_tools = openai_tools
+        if _server_state.mcp_manager and openai_tools:
+            effective_tools = _server_state.mcp_manager.get_merged_tools(openai_tools)
+
+        # Convert tools for chat template
+        tools_for_template = (
+            convert_tools_for_template(effective_tools) if effective_tools else None
+        )
+
+        # Validate context window
+        try:
+            num_prompt_tokens = engine.count_chat_tokens(
+                messages,
+                tools_for_template,
+                chat_template_kwargs=merged_ct_kwargs or None,
             )
-        raise
-    validate_context_window(num_prompt_tokens, request.model)
+        except Exception as e:
+            err_name = type(e).__name__.lower()
+            err_msg = str(e).lower()
+            if (
+                "template" in err_name
+                or "template" in err_msg
+                or isinstance(e, (AssertionError, ValueError))
+            ):
+                raise HTTPException(
+                    status_code=400, detail=f"Chat template error: {e}"
+                )
+            raise
+        validate_context_window(num_prompt_tokens, request.model)
 
-    # Build sampling kwargs
-    temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = (
-        get_sampling_params(request.temperature, request.top_p, request.model, req_max_tokens=request.max_output_tokens)
-    )
-    chat_kwargs = {
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "top_p": top_p,
-        "top_k": top_k,
-        "min_p": min_p,
-        "repetition_penalty": repetition_penalty,
-        "presence_penalty": presence_penalty,
-        "frequency_penalty": frequency_penalty,
-        "xtc_probability": xtc_probability,
-        "xtc_threshold": xtc_threshold,
-    }
+        # Build sampling kwargs
+        temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = (
+            get_sampling_params(request.temperature, request.top_p, request.model, req_max_tokens=request.max_output_tokens)
+        )
+        chat_kwargs = {
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "min_p": min_p,
+            "repetition_penalty": repetition_penalty,
+            "presence_penalty": presence_penalty,
+            "frequency_penalty": frequency_penalty,
+            "xtc_probability": xtc_probability,
+            "xtc_threshold": xtc_threshold,
+        }
 
-    # Add thinking budget if applicable
-    thinking_budget = _resolve_thinking_budget(request, request.model)
-    if thinking_budget is not None:
-        chat_kwargs["thinking_budget"] = thinking_budget
+        # Add thinking budget if applicable
+        thinking_budget = _resolve_thinking_budget(request, request.model)
+        if thinking_budget is not None:
+            chat_kwargs["thinking_budget"] = thinking_budget
 
-    # Add compiled grammar for logit-level structured output.
-    if compiled_grammar is not None:
-        chat_kwargs["compiled_grammar"] = compiled_grammar
-        if reasoning_parser and "thinking_budget" not in chat_kwargs:
-            default_budget = min(max_tokens // 2, 4096)
-            chat_kwargs["thinking_budget"] = default_budget
-            logger.debug(
-                "Auto-set thinking_budget=%d for grammar-constrained request",
-                default_budget,
-            )
+        # Add compiled grammar for logit-level structured output.
+        if compiled_grammar is not None:
+            chat_kwargs["compiled_grammar"] = compiled_grammar
+            if reasoning_parser and "thinking_budget" not in chat_kwargs:
+                default_budget = min(max_tokens // 2, 4096)
+                chat_kwargs["thinking_budget"] = default_budget
+                logger.debug(
+                    "Auto-set thinking_budget=%d for grammar-constrained request",
+                    default_budget,
+                )
 
-    if tools_for_template:
-        chat_kwargs["tools"] = tools_for_template
-    if merged_ct_kwargs:
-        chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
+        if tools_for_template:
+            chat_kwargs["tools"] = tools_for_template
+        if merged_ct_kwargs:
+            chat_kwargs["chat_template_kwargs"] = merged_ct_kwargs
 
-    if request.stream:
-        return StreamingResponse(
-            _with_sse_keepalive(
-                stream_responses_api(
-                    engine,
-                    messages,
-                    request,
-                    input_messages=current_input_messages,
-                    store_response=_should_store_response(request.store),
-                    model_load_duration=model_load_duration,
-                    **chat_kwargs,
+        if request.stream:
+            released = True  # _with_engine_guard takes ownership
+            return StreamingResponse(
+                _with_engine_guard(
+                    _with_sse_keepalive(
+                        stream_responses_api(
+                            engine,
+                            messages,
+                            request,
+                            input_messages=current_input_messages,
+                            store_response=_should_store_response(request.store),
+                            model_load_duration=model_load_duration,
+                            **chat_kwargs,
+                        ),
+                        http_request=http_request,
+                    ),
+                    pool, resolved_model,
                 ),
-                http_request=http_request,
-            ),
-            media_type="text/event-stream",
-            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
-        )
+                media_type="text/event-stream",
+            )
 
-    # Non-streaming
-    start_time = time.perf_counter()
-    output = await _run_with_disconnect_guard(
-        http_request,
-        engine.chat(messages=messages, **chat_kwargs),
-    )
-    if output is None:
-        return
+        # Non-streaming
+        start_time = time.perf_counter()
+        output = await _run_with_disconnect_guard(
+            http_request,
+            engine.chat(messages=messages, **chat_kwargs),
+        )
+        if output is None:
+            return
+    finally:
+        if not released:
+            pool.release_engine(resolved_model)
 
     elapsed = time.perf_counter() - start_time
     tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0

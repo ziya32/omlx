@@ -471,6 +471,7 @@ class VLMBatchedEngine(BaseEngine):
         self._grammar_compiler_init_attempted = False
         self._vision_cache = None
         self._vision_cache_enabled = True
+        self._stopped = False
 
     @property
     def model_name(self) -> str:
@@ -565,6 +566,8 @@ class VLMBatchedEngine(BaseEngine):
 
     async def start(self) -> None:
         """Load VLM model and processor via mlx-vlm, create engine with VLMModelAdapter."""
+        if self._stopped:
+            raise RuntimeError(f"VLMBatchedEngine for {self._model_name} has been stopped and cannot be restarted")
         if self._loaded:
             return
 
@@ -711,7 +714,17 @@ class VLMBatchedEngine(BaseEngine):
         logger.info(f"VLMBatchedEngine loaded: {self._model_name}")
 
     async def stop(self) -> None:
-        """Stop the engine and cleanup resources."""
+        """Stop the engine and cleanup resources.
+
+        Sets _stopped=True first so that any concurrent or subsequent
+        calls to generate/stream_generate/chat/stream_chat raise
+        RuntimeError instead of silently restarting the engine.
+        This is defense-in-depth — the primary protection is
+        acquire_engine/release_engine in the server endpoints which
+        prevents the drain monitor from calling stop() while requests
+        are in-flight.
+        """
+        self._stopped = True
         if self._engine:
             await self._engine.stop()
             self._engine.engine.close()
@@ -1192,6 +1205,8 @@ class VLMBatchedEngine(BaseEngine):
         **kwargs,
     ) -> GenerationOutput:
         """Generate a complete response (non-streaming)."""
+        if self._stopped:
+            raise RuntimeError(f"VLMBatchedEngine for {self._model_name} has been stopped")
         if not self._loaded:
             await self.start()
 
@@ -1257,6 +1272,8 @@ class VLMBatchedEngine(BaseEngine):
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """Stream generation token by token."""
+        if self._stopped:
+            raise RuntimeError(f"VLMBatchedEngine for {self._model_name} has been stopped")
         if not self._loaded:
             await self.start()
 
@@ -1343,6 +1360,8 @@ class VLMBatchedEngine(BaseEngine):
         **kwargs,
     ) -> GenerationOutput:
         """Chat completion with vision support (non-streaming)."""
+        if self._stopped:
+            raise RuntimeError(f"VLMBatchedEngine for {self._model_name} has been stopped")
         if not self._loaded:
             await self.start()
 
@@ -1351,6 +1370,11 @@ class VLMBatchedEngine(BaseEngine):
             self._engine._mlx_executor,
             self._process_chat_messages, messages, tools, kwargs,
         )
+
+        # Test-only capture (no-op unless OMLX_DEBUG_CAPTURE=1)
+        if isinstance(prompt, str):
+            from ..debug_capture import capture_prompt
+            capture_prompt(prompt)
 
         return await self.generate(
             prompt=prompt,
@@ -1381,6 +1405,8 @@ class VLMBatchedEngine(BaseEngine):
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """Stream chat completion with vision support."""
+        if self._stopped:
+            raise RuntimeError(f"VLMBatchedEngine for {self._model_name} has been stopped")
         if not self._loaded:
             await self.start()
 
@@ -1393,6 +1419,11 @@ class VLMBatchedEngine(BaseEngine):
             self._engine._mlx_executor,
             self._process_chat_messages, messages, tools, kwargs,
         )
+
+        # Test-only capture (no-op unless OMLX_DEBUG_CAPTURE=1)
+        if isinstance(prompt, str):
+            from ..debug_capture import capture_prompt
+            capture_prompt(prompt)
 
         # SpecPrefill: compute system prompt token count for protection.
         # Can't template system-only messages (most templates require user),
