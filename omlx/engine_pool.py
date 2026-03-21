@@ -986,11 +986,15 @@ class EnginePool:
 
                     if elapsed > self._drain_timeout:
                         if entry.active_uses > 0:
-                            logger.warning(
-                                f"Drain timeout for {model_id} but "
-                                f"active_uses={entry.active_uses}, "
-                                f"extending drain"
-                            )
+                            if not hasattr(entry, '_last_drain_ext_log') or (
+                                time.time() - entry._last_drain_ext_log >= 5
+                            ):
+                                logger.warning(
+                                    f"Drain timeout for {model_id} but "
+                                    f"active_uses={entry.active_uses}, "
+                                    f"extending drain"
+                                )
+                                entry._last_drain_ext_log = time.time()
                             continue
 
                         self._record_timeout("drain", model_id, elapsed)
