@@ -9,16 +9,22 @@ Never enable in production.
 
 from __future__ import annotations
 
+import collections
+import logging
 import os
 import threading
 from typing import Any
 
+logger = logging.getLogger(__name__)
+
 # Kill switch: only active when explicitly enabled
 ENABLED = os.environ.get("OMLX_DEBUG_CAPTURE") == "1"
 
+_MAXLEN = 100
+
 _lock = threading.Lock()
-_requests: list[dict[str, Any]] = []
-_prompts: list[str] = []
+_requests: collections.deque[dict[str, Any]] = collections.deque(maxlen=_MAXLEN)
+_prompts: collections.deque[str] = collections.deque(maxlen=_MAXLEN)
 _capture_id: int = 0  # Incremented by reset; groups requests per test
 
 
@@ -43,6 +49,8 @@ def capture_request(
     if not ENABLED:
         return
     with _lock:
+        if len(_requests) == _MAXLEN:
+            logger.warning("debug_capture: _requests deque full, oldest entry will be dropped")
         _requests.append({
             "model": model,
             "messages": [
@@ -61,6 +69,8 @@ def capture_prompt(prompt: str) -> None:
     if not ENABLED:
         return
     with _lock:
+        if len(_prompts) == _MAXLEN:
+            logger.warning("debug_capture: _prompts deque full, oldest entry will be dropped")
         _prompts.append(prompt)
 
 

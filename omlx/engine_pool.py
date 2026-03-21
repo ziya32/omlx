@@ -22,7 +22,6 @@ State machine per model:
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import gc
 import logging
 import time
@@ -91,7 +90,7 @@ class EngineEntry:
     drain_complete: asyncio.Event | None = None   # Set when DRAINING → UNLOADED
     drain_started: float = 0.0                    # For timeout tracking
     load_error: Exception | None = None           # Propagated to waiters
-    load_started: float = 0.0                     # For watchdog/diagnostics
+    load_started: float = 0.0                     # For diagnostics
     load_failed_at: float = 0.0                   # Cooldown after load failure
     active_uses: int = 0                          # Number of request handlers currently using this engine
 
@@ -113,8 +112,6 @@ class EnginePool:
     - Automatic engine type selection based on model type
 
     Diagnostics:
-    - Watchdog: background task to detect stuck LOADING/DRAINING states
-      and unresponsive MLX executor thread
     - get_debug_status(): lock-free snapshot for /debug/pool endpoint
     - Load timing: elapsed time logged for every model load
 
@@ -150,8 +147,6 @@ class EnginePool:
         self._max_wait_timeout = max_wait_timeout
         # Incremented on ANY timeout firing. Tests assert this stays at 0.
         self._timeout_counter: int = 0
-        # Watchdog background task — started lazily on first get_engine() call
-        self._watchdog_task: asyncio.Task | None = None
         # Track deferred engine cleanup tasks so shutdown can wait for them
         self._cleanup_tasks: list[asyncio.Task] = []
 
@@ -208,70 +203,6 @@ class EnginePool:
             # logger.info(f"engine_pool._tracked_lock: lock released at {time.monotonic():.0f}s, held={held_ms:.0f}ms caller={caller}")
             if held_ms > 500:
                 logger.warning(f"lock held={held_ms:.0f}ms caller={caller}")
-
-    # -------------------------------------------------------------------------
-    # Watchdog — periodic health check for stuck states
-    # -------------------------------------------------------------------------
-
-    async def _watchdog(self) -> None:
-        """Periodic check for stuck states. Runs every 10s.
-
-        Reads entry state for diagnostic purposes only — does NOT hold the
-        pool lock (lock-free read-only snapshot).
-        """
-        while True:
-            await asyncio.sleep(10)
-            now = time.time()
-            for model_id, entry in self._entries.items():
-                if entry.state == EngineState.LOADING:
-                    elapsed = now - entry.load_started
-                    if elapsed > 120:
-                        logger.error(
-                            f"WATCHDOG: {model_id} stuck in LOADING "
-                            f"for {elapsed:.0f}s (expected <60s)"
-                        )
-                    elif elapsed > 60:
-                        logger.warning(
-                            f"WATCHDOG: {model_id} in LOADING for {elapsed:.0f}s"
-                        )
-
-                if entry.state == EngineState.DRAINING:
-                    elapsed = now - entry.drain_started
-                    if elapsed > self._drain_timeout + 30:
-                        logger.error(
-                            f"WATCHDOG: {model_id} stuck in DRAINING "
-                            f"for {elapsed:.0f}s "
-                            f"(drain_timeout={self._drain_timeout}s)"
-                        )
-
-            # Check if the MLX executor thread is responsive
-            if not self._check_executor_health():
-                logger.error(
-                    "WATCHDOG: MLX executor not responding! "
-                    "A submitted task may be blocking the single "
-                    "executor thread."
-                )
-
-    def _check_executor_health(self) -> bool:
-        """Submit a no-op to the MLX executor to check if it's alive.
-
-        Returns True if the executor responds within 5s, False otherwise.
-        """
-        executor = get_mlx_executor()
-        try:
-            future = executor.submit(lambda: True)
-            future.result(timeout=5)
-            return True
-        except concurrent.futures.TimeoutError:
-            return False
-        except Exception:
-            # Executor might be shut down or broken
-            return False
-
-    def _start_watchdog(self) -> None:
-        """Start the watchdog task if not already running."""
-        if self._watchdog_task is None:
-            self._watchdog_task = asyncio.create_task(self._watchdog())
 
     # -------------------------------------------------------------------------
     # Memory accounting
@@ -514,9 +445,6 @@ class EnginePool:
             ModelTooLargeError: If model exceeds memory limit (permanent)
             ModelLoadingError: If wait times out or model in load cooldown
         """
-        # Start watchdog lazily on first get_engine() call
-        self._start_watchdog()
-
         start_time = time.monotonic()
         iterations = 0
 
@@ -1515,16 +1443,6 @@ class EnginePool:
         starting while we're tearing down.  This is acceptable because
         shutdown is a terminal operation — no new requests should arrive.
         """
-        # Cancel watchdog before acquiring lock (it doesn't hold the lock,
-        # but we want a clean shutdown)
-        if self._watchdog_task is not None:
-            self._watchdog_task.cancel()
-            try:
-                await self._watchdog_task
-            except asyncio.CancelledError:
-                pass
-            self._watchdog_task = None
-
         async with self._tracked_lock("shutdown"):
             for model_id in list(self._entries.keys()):
                 entry = self._entries.get(model_id)

@@ -1371,7 +1371,11 @@ class VLMBatchedEngine(BaseEngine):
             self._process_chat_messages, messages, tools, kwargs,
         )
 
-        # Test-only capture (no-op unless OMLX_DEBUG_CAPTURE=1)
+        # Test-only capture (no-op unless OMLX_DEBUG_CAPTURE=1).
+        # When images are present, the prompt is token IDs (list[int]) from the
+        # vision pipeline, so it can't be captured as text.  Text-only messages
+        # (where tool definitions live) always produce a str prompt and are
+        # captured here.
         if isinstance(prompt, str):
             from ..debug_capture import capture_prompt
             capture_prompt(prompt)
@@ -1420,7 +1424,11 @@ class VLMBatchedEngine(BaseEngine):
             self._process_chat_messages, messages, tools, kwargs,
         )
 
-        # Test-only capture (no-op unless OMLX_DEBUG_CAPTURE=1)
+        # Test-only capture (no-op unless OMLX_DEBUG_CAPTURE=1).
+        # When images are present, the prompt is token IDs (list[int]) from the
+        # vision pipeline, so it can't be captured as text.  Text-only messages
+        # (where tool definitions live) always produce a str prompt and are
+        # captured here.
         if isinstance(prompt, str):
             from ..debug_capture import capture_prompt
             capture_prompt(prompt)
