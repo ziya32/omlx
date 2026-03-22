@@ -311,7 +311,7 @@ class ProcessMemoryEnforcer:
                 ]
                 if loading:
                     logger.warning(
-                        f"🚨 Memory limit exceeded while loading "
+                        f"Memory limit exceeded while loading "
                         f"{loading} — waiting for load to complete "
                         f"and deferred cleanup to free Metal memory."
                     )
@@ -328,13 +328,13 @@ class ProcessMemoryEnforcer:
                     ]
                     if draining:
                         logger.warning(
-                            f"🚨 Memory limit exceeded while draining "
+                            f"Memory limit exceeded while draining "
                             f"{draining} — waiting for active requests "
                             f"to finish."
                         )
                     elif pinned:
                         logger.warning(
-                            f"🚨 Memory limit exceeded but all loaded "
+                            f"Memory limit exceeded but all loaded "
                             f"models are pinned ({pinned}) — cannot evict."
                         )
                     else:
