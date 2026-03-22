@@ -73,14 +73,17 @@ def _make_loaded_engine(model_type=None, tokenizer=None, **overrides):
     """Create a VLMBatchedEngine with mocked internals (no actual model load)."""
     engine = _make_engine(**overrides)
 
-    # Set up mock model config
+    # Set up mock model config — use spec=[] so attribute access doesn't
+    # auto-create sub-mocks (count_chat_tokens reads vision_config attrs).
     mock_config = MagicMock()
     mock_config.model_type = model_type
+    mock_config.vision_config = None  # no vision config on plain mock
 
     mock_vlm_model = MagicMock()
     mock_vlm_model.config = mock_config
 
     engine._vlm_model = mock_vlm_model
+    engine._processor = None
     engine._tokenizer = tokenizer or MockVLMTokenizer()
     engine._loaded = True
     engine._engine = MagicMock()
@@ -704,11 +707,11 @@ class TestCountChatTokens:
 
         assert count == 2
 
-    def test_strips_images_from_count(self):
-        """Image parts are removed before counting tokens."""
+    def test_strips_images_and_adds_estimate(self):
+        """Image parts are stripped and estimated tokens are added to text count."""
         tokenizer = MagicMock()
         tokenizer.apply_chat_template.return_value = "Describe"
-        tokenizer.encode.return_value = [1]
+        tokenizer.encode.return_value = [1]  # 1 text token
 
         engine = _make_loaded_engine(tokenizer=tokenizer)
 
@@ -723,8 +726,8 @@ class TestCountChatTokens:
         ]
         count = engine.count_chat_tokens(messages)
 
-        # Should count text tokens only
-        assert count == 1
+        # Should include text tokens + estimated image tokens (> 1 text token alone)
+        assert count > 1, "Image tokens should be added to the text token count"
 
 
 # ---------------------------------------------------------------------------

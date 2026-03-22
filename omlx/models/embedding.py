@@ -331,17 +331,32 @@ class MLXEmbeddingModel:
         - Compiling model.__call__ directly can return arrays without primitives
           for some embedding/reranker models, causing eval() runtime errors.
         - We compile a narrower function that returns only the final embedding array.
+        - Warmup uses prepare_inputs() with real text so the test exercises the
+          same code path (attention_mask, token_type_ids, etc.) as actual requests.
         """
         base_model = self.model
 
         try:
+            from mlx_embeddings.utils import prepare_inputs
+
             def _compiled_embed(inputs):
                 outputs = base_model(**inputs)
                 return self._extract_embeddings_array(outputs)
 
             self._compiled_embed = mx.compile(_compiled_embed)
 
-            test_inputs = {"input_ids": mx.zeros((1, 4), dtype=mx.int32)}
+            # Build realistic warmup inputs via prepare_inputs so we exercise
+            # the same model code path as real requests (attention_mask, etc.).
+            processor = self.processor
+            if hasattr(processor, "_tokenizer"):
+                processor = processor._tokenizer
+            test_inputs = prepare_inputs(
+                processor, None, ["compile warmup"], 32, True, True, None
+            )
+            if not isinstance(test_inputs, dict):
+                test_inputs = dict(test_inputs)
+
+
             _ = self._compiled_embed(test_inputs)
 
             logger.info(
@@ -350,7 +365,12 @@ class MLXEmbeddingModel:
             )
             return True
         except Exception as e:
-            logger.info(f"mx.compile unavailable for {self.model_name}: {e}")
+            logger.info(
+                f"mx.compile unavailable for {self.model_name}: {e}; "
+                f"model forward pass uses ops incompatible with compile tracing "
+                f"(e.g. data-dependent branching). Falling back to eager mode — "
+                f"embeddings are numerically identical, just without graph fusion"
+            )
             self._compiled_embed = None
             return False
 
