@@ -189,6 +189,26 @@ class BaseEngine(ABC):
         pass
 
     @property
+    def scheduler(self) -> Optional[Any]:
+        """Get the engine's scheduler, if any.
+
+        Used by ProcessMemoryEnforcer to propagate memory limits for
+        inline prefill checking.  Returns None by default; overridden
+        by BatchedEngine / VLMBatchedEngine which have a scheduler via
+        their AsyncEngineCore.
+        """
+        return None
+
+    @property
+    def max_context_window(self) -> Optional[int]:
+        """Get the model's max context window from its config.
+
+        Returns max_position_embeddings (or equivalent) if available,
+        otherwise None. Subclasses may override for model-specific logic.
+        """
+        return None
+
+    @property
     @abstractmethod
     def model_type(self) -> Optional[str]:
         """Get the model type from config.json (e.g., 'gpt_oss', 'llama', 'qwen2').

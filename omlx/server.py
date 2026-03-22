@@ -427,6 +427,63 @@ app = FastAPI(
 from .debug_capture import register_debug_endpoint
 register_debug_endpoint(app)
 
+
+@app.get("/debug/engine-diagnostics")
+async def debug_engine_diagnostics():
+    """Expose per-engine scheduler memory limits for diagnostic/test use.
+
+    Returns the enforcer's max_bytes and, for each loaded engine, the
+    scheduler's _memory_limit_bytes — navigating the real wrapper chain
+    and also showing what _propagate_memory_limit() would find.
+    """
+    pool = get_engine_pool()
+    engines: dict = {}
+
+    for model_id, entry in pool._entries.items():
+        if entry.engine is None:
+            continue
+
+        info: dict = {
+            "state": entry.state.name,
+            "engine_type": entry.engine_type,
+            "estimated_size_gb": round(entry.estimated_size / (1024**3), 2),
+        }
+
+        # _propagate_memory_limit uses getattr(entry.engine, "scheduler", None).
+        # With the BaseEngine.scheduler property, this now works for all engine types.
+        scheduler = getattr(entry.engine, "scheduler", None)
+        info["propagate_finds_scheduler"] = scheduler is not None
+
+        if scheduler is not None:
+            info["scheduler_memory_limit_bytes"] = scheduler._memory_limit_bytes
+            info["scheduler_memory_hard_limit_bytes"] = (
+                scheduler._memory_hard_limit_bytes
+            )
+        else:
+            info["scheduler_memory_limit_bytes"] = None
+            info["scheduler_memory_hard_limit_bytes"] = None
+
+        engines[model_id] = info
+
+    enforcer_status = {}
+    if pool._process_memory_enforcer:
+        enforcer_status = pool._process_memory_enforcer.get_status()
+
+    return {
+        "enforcer": enforcer_status,
+        "engines": engines,
+    }
+
+
+@app.post("/debug/reset-enforcer-peak")
+async def debug_reset_enforcer_peak():
+    """Reset the enforcer's peak memory and overage counter (for tests)."""
+    pool = get_engine_pool()
+    if pool._process_memory_enforcer:
+        pool._process_memory_enforcer.reset_peak()
+    return {"ok": True}
+
+
 # Include MCP routes
 from .api.mcp_routes import router as mcp_router, set_mcp_manager_getter
 set_mcp_manager_getter(get_mcp_manager)
@@ -1054,7 +1111,7 @@ def get_max_context_window(model_id: str | None = None) -> int | None:
     """
     Get effective max context window limit.
 
-    Priority: model setting > global setting.
+    Priority: per-model user setting > model's own config > global default.
 
     Returns:
         Max context window token count, or None if not set.
@@ -1062,6 +1119,7 @@ def get_max_context_window(model_id: str | None = None) -> int | None:
     # Resolve alias so per-model settings are found by real model ID
     model_id = resolve_model_id(model_id)
 
+    # 1. Per-model user setting (explicit override)
     model_settings = None
     if model_id and _server_state.settings_manager:
         model_settings = _server_state.settings_manager.get_settings(model_id)
@@ -1069,6 +1127,16 @@ def get_max_context_window(model_id: str | None = None) -> int | None:
     if model_settings and model_settings.max_context_window is not None:
         return model_settings.max_context_window
 
+    # 2. Model's own config (max_position_embeddings from loaded engine)
+    pool = _server_state.engine_pool
+    if model_id and pool:
+        entry = pool.get_entry(model_id)
+        if entry and entry.engine is not None:
+            model_ctx = getattr(entry.engine, "max_context_window", None)
+            if isinstance(model_ctx, int) and model_ctx > 0:
+                return model_ctx
+
+    # 3. Global default
     return _server_state.sampling.max_context_window
 
 
@@ -1426,6 +1494,7 @@ async def _with_sse_keepalive(
                 yield result
     finally:
         if task is not None and not task.done():
+            logger.info("Client disconnected during streaming (generator closed), cancelling")
             task.cancel()
             try:
                 await task

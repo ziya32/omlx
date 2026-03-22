@@ -3460,6 +3460,15 @@ class Scheduler:
         failed_ids: List[str] = []
         count = 0
         for request_id, request in list(self.running.items()):
+            # Skip requests that already have a pending abort — they will
+            # be cleaned up by _process_pending_aborts() on the next step().
+            # Rescheduling them would just put them back in waiting only to
+            # be immediately removed, and wastes a prefill cycle if the
+            # abort processing races with _schedule_waiting().
+            if request_id in self._pending_abort_ids:
+                del self.running[request_id]
+                continue
+
             if is_corruption:
                 request.cache_corruption_retries += 1
                 if request.cache_corruption_retries > max_corruption_retries:

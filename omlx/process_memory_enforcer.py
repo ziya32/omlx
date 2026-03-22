@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import TYPE_CHECKING
 
 import mlx.core as mx
@@ -65,6 +66,10 @@ class ProcessMemoryEnforcer:
         self._prefill_memory_guard = prefill_memory_guard
         self._task: asyncio.Task | None = None
         self._running = False
+        # Diagnostic counters (readable via get_status / debug endpoints)
+        self._peak_memory_bytes: int = 0
+        self._overage_count: int = 0
+        self._last_overage_log: float = 0.0  # monotonic timestamp
 
     @property
     def max_bytes(self) -> int:
@@ -205,15 +210,21 @@ class ProcessMemoryEnforcer:
             return
 
         current = mx.get_active_memory()
+        if current > self._peak_memory_bytes:
+            self._peak_memory_bytes = current
         if current <= self._max_bytes:
             return
 
+        self._overage_count += 1
         overage = current - self._max_bytes
-        logger.warning(
-            f"Process memory limit exceeded: "
-            f"{_format_gb(current)} / {_format_gb(self._max_bytes)} "
-            f"(over by {_format_gb(overage)})"
-        )
+        now = time.monotonic()
+        if now - self._last_overage_log >= 5.0:
+            self._last_overage_log = now
+            logger.warning(
+                f"Process memory limit exceeded: "
+                f"{_format_gb(current)} / {_format_gb(self._max_bytes)} "
+                f"(over by {_format_gb(overage)})"
+            )
 
         # Acquire EnginePool lock and unload LRU models until under limit.
         # Skips victims with active_uses > 0 (request handlers holding the
@@ -262,20 +273,24 @@ class ProcessMemoryEnforcer:
                         await self._engine_pool._unload_engine(victim)
                         continue
                     else:
-                        # Single model: abort all requests, keep model
-                        # loaded. This frees KV cache blocks internally
-                        # so short-context requests can be served without
-                        # new Metal allocation.
-                        entry = self._engine_pool._entries.get(victim)
-                        if entry and entry.engine is not None:
-                            if hasattr(entry.engine, "abort_all_requests"):
-                                aborted = await entry.engine.abort_all_requests()
-                                if aborted > 0:
-                                    logger.warning(
-                                        f"Aborted {aborted} requests on "
-                                        f"'{victim}' due to memory pressure "
-                                        f"(model kept loaded)"
-                                    )
+                        # Single model: only abort at the hard limit.
+                        # Between soft and hard limits the scheduler's
+                        # inline prefill check handles it (logs a warning
+                        # and lets the request complete if possible).
+                        hard_limit = self._get_hard_limit_bytes()
+                        current_mem = mx.get_active_memory()
+                        if hard_limit > 0 and current_mem > hard_limit:
+                            entry = self._engine_pool._entries.get(victim)
+                            if entry and entry.engine is not None:
+                                if hasattr(entry.engine, "abort_all_requests"):
+                                    aborted = await entry.engine.abort_all_requests()
+                                    if aborted > 0:
+                                        logger.warning(
+                                            f"Aborted {aborted} requests on "
+                                            f"'{victim}' — hard memory limit "
+                                            f"exceeded ({_format_gb(current_mem)}"
+                                            f" > {_format_gb(hard_limit)})"
+                                        )
                         break
 
                 # No loaded non-pinned model to evict.
@@ -324,4 +339,12 @@ class ProcessMemoryEnforcer:
             "utilization": (
                 current / self._max_bytes if self._max_bytes > 0 else 0.0
             ),
+            "peak_memory_bytes": self._peak_memory_bytes,
+            "peak_memory_formatted": _format_gb(self._peak_memory_bytes),
+            "overage_count": self._overage_count,
         }
+
+    def reset_peak(self) -> None:
+        """Reset peak memory and overage counter (for tests)."""
+        self._peak_memory_bytes = 0
+        self._overage_count = 0

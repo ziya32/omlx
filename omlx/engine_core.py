@@ -704,6 +704,11 @@ class AsyncEngineCore:
         """Expose the MLX executor for VLM vision encoding."""
         return self.engine._mlx_executor
 
+    @property
+    def scheduler(self):
+        """Expose the inner EngineCore's scheduler (may be None after stop)."""
+        return self.engine.scheduler if self.engine is not None else None
+
     async def __aenter__(self) -> "AsyncEngineCore":
         await self.engine.start()
         return self

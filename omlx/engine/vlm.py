@@ -482,6 +482,39 @@ class VLMBatchedEngine(BaseEngine):
         return self._tokenizer
 
     @property
+    def scheduler(self):
+        """Get the scheduler via AsyncEngineCore (may be None before start)."""
+        return self._engine.scheduler if self._engine is not None else None
+
+    @property
+    def max_context_window(self) -> int | None:
+        """Get model's max context window from config.
+
+        VLM models store it in text_config.max_position_embeddings.
+        Falls back to root-level fields.
+        """
+        try:
+            config = getattr(self._vlm_model, "config", None)
+            if config is None:
+                return None
+            # VLM models: check text_config first (Qwen-VL, etc.)
+            text_config = getattr(config, "text_config", None)
+            if text_config is not None:
+                for attr in ("max_position_embeddings", "max_seq_len"):
+                    val = getattr(text_config, attr, None)
+                    if isinstance(val, int) and val > 0:
+                        return val
+            # Fallback to root-level
+            for attr in ("max_position_embeddings", "max_seq_len",
+                         "seq_length", "n_positions"):
+                val = getattr(config, attr, None)
+                if isinstance(val, int) and val > 0:
+                    return val
+        except Exception:
+            pass
+        return None
+
+    @property
     def model_type(self) -> str | None:
         if self._vlm_model is not None and hasattr(self._vlm_model, "config"):
             config = self._vlm_model.config
@@ -1341,6 +1374,8 @@ class VLMBatchedEngine(BaseEngine):
                 )
         except GeneratorExit:
             logger.info(f"[vlm_stream_generate] GeneratorExit for request {request_id}")
+        except asyncio.CancelledError:
+            logger.info(f"[vlm_stream_generate] CancelledError for request {request_id}")
         finally:
             if not finished_normally:
                 logger.info(f"[vlm_stream_generate] Aborting request {request_id}")
@@ -1567,20 +1602,46 @@ class VLMBatchedEngine(BaseEngine):
         tools: list[dict] | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
     ) -> int:
-        """Count prompt tokens for chat messages (text-only approximation).
+        """Count prompt tokens for chat messages including image token estimates.
 
-        For VLM messages with images, this counts only the text tokens.
-        Image tokens are added during vision encoding and vary by model.
+        Strips image parts from messages without loading them via PIL, then
+        estimates image tokens from the base64 header dimensions using the
+        model's vision config (patch_size, merge_size).
         """
-        # Extract text-only version for token counting
-        from ..utils.image import extract_images_from_messages
-        text_messages, _ = extract_images_from_messages(messages)
+        from ..utils.image import strip_images_and_estimate_tokens
+
+        # Read vision config from the loaded model
+        patch_size = 14
+        merge_size = 2
+        min_pixels = 56 * 56
+        max_pixels = 14 * 14 * 4 * 1280
+        if self._vlm_model is not None and hasattr(self._vlm_model, "config"):
+            vc = getattr(self._vlm_model.config, "vision_config", None)
+            if vc is not None:
+                patch_size = getattr(vc, "patch_size", patch_size)
+                merge_size = getattr(vc, "spatial_merge_size",
+                                     getattr(vc, "merge_size", merge_size))
+        # Read pixel bounds from processor if available
+        if self._processor is not None:
+            ip = getattr(self._processor, "image_processor", None)
+            if ip is not None:
+                min_pixels = getattr(ip, "min_pixels", min_pixels)
+                max_pixels = getattr(ip, "max_pixels", max_pixels)
+
+        text_messages, image_tokens = strip_images_and_estimate_tokens(
+            messages,
+            patch_size=patch_size,
+            merge_size=merge_size,
+            min_pixels=min_pixels,
+            max_pixels=max_pixels,
+        )
 
         template_tools = convert_tools_for_template(tools) if tools else None
         prompt = self._apply_chat_template(
             text_messages, template_tools, chat_template_kwargs=chat_template_kwargs
         )
-        return len(self._tokenizer.encode(prompt))
+        text_tokens = len(self._tokenizer.encode(prompt))
+        return text_tokens + image_tokens
 
     def has_active_requests(self) -> bool:
         """Check if the engine has active in-flight requests."""

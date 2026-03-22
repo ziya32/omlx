@@ -6,6 +6,7 @@ This engine wraps AsyncEngineCore to provide continuous batching
 for better throughput when serving multiple concurrent requests.
 """
 
+import asyncio
 import copy
 import logging
 from collections.abc import AsyncIterator
@@ -81,6 +82,32 @@ class BatchedEngine(BaseEngine):
     def tokenizer(self) -> Any:
         """Get the tokenizer."""
         return self._tokenizer
+
+    @property
+    def scheduler(self):
+        """Get the scheduler via AsyncEngineCore (may be None before start)."""
+        return self._engine.scheduler if self._engine is not None else None
+
+    @property
+    def max_context_window(self) -> int | None:
+        """Get model's max context window from config."""
+        try:
+            config = getattr(self._model, "config", None)
+            if config is None:
+                return None
+            # Non-VLM models: max_position_embeddings at root
+            for attr in ("max_position_embeddings", "max_seq_len",
+                         "seq_length", "n_positions"):
+                val = getattr(config, attr, None)
+                if isinstance(val, int) and val > 0:
+                    return val
+                if isinstance(config, dict):
+                    val = config.get(attr)
+                    if isinstance(val, int) and val > 0:
+                        return val
+        except Exception:
+            pass
+        return None
 
     @property
     def model_type(self) -> str | None:
@@ -539,6 +566,8 @@ class BatchedEngine(BaseEngine):
         except GeneratorExit:
             # Client disconnected
             logger.info(f"[stream_generate] GeneratorExit caught for request {request_id}")
+        except asyncio.CancelledError:
+            logger.info(f"[stream_generate] CancelledError for request {request_id}")
         finally:
             # Abort the request if client disconnected before completion
             if not finished_normally:
