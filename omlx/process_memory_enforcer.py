@@ -72,6 +72,7 @@ class ProcessMemoryEnforcer:
         self._peak_memory_bytes: int = 0
         self._overage_count: int = 0
         self._last_overage_log: float = 0.0  # monotonic timestamp
+        self._last_no_candidate_log: float = 0.0
 
     @property
     def max_bytes(self) -> int:
@@ -295,22 +296,24 @@ class ProcessMemoryEnforcer:
                                         )
                         break
 
-                # No loaded non-pinned model to evict.
-                # Check what's happening for diagnostics.
+                # No eviction candidate — throttle this diagnostic to
+                # once per 5 seconds (it can repeat every poll cycle).
+                now = time.monotonic()
+                if now - self._last_no_candidate_log < 5.0:
+                    break
+
+                self._last_no_candidate_log = now
+
                 loading = [
                     e.model_id
                     for e in self._engine_pool._entries.values()
                     if e.is_loading
                 ]
                 if loading:
-                    # A model is loading on the MLX executor — we
-                    # can't interrupt it (Metal ops are not cancellable).
-                    # Memory will be reclaimed once cleanup tasks run
-                    # after the load completes.
                     logger.warning(
-                        f"Process memory limit exceeded while loading "
-                        f"{loading}. Waiting for load to complete and "
-                        f"deferred cleanup to free Metal memory."
+                        f"🚨 Memory limit exceeded while loading "
+                        f"{loading} — waiting for load to complete "
+                        f"and deferred cleanup to free Metal memory."
                     )
                 else:
                     draining = [
@@ -325,20 +328,19 @@ class ProcessMemoryEnforcer:
                     ]
                     if draining:
                         logger.warning(
-                            f"Process memory limit exceeded while "
-                            f"draining {draining} — waiting for "
-                            f"active requests to finish."
+                            f"🚨 Memory limit exceeded while draining "
+                            f"{draining} — waiting for active requests "
+                            f"to finish."
                         )
                     elif pinned:
                         logger.warning(
-                            f"Process memory limit exceeded but all "
-                            f"loaded models are pinned ({pinned}) "
-                            f"— cannot evict."
+                            f"🚨 Memory limit exceeded but all loaded "
+                            f"models are pinned ({pinned}) — cannot evict."
                         )
                     else:
                         logger.warning(
-                            "Process memory limit exceeded but no "
-                            "models are loaded to evict."
+                            "🚨 Memory limit exceeded but no models "
+                            "are loaded to evict."
                         )
                 break
 
