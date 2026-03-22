@@ -20,6 +20,8 @@ from typing import TYPE_CHECKING
 
 import mlx.core as mx
 
+from .engine_pool import EngineState
+
 if TYPE_CHECKING:
     from .engine_pool import EnginePool
     from .model_settings import ModelSettingsManager
@@ -311,14 +313,27 @@ class ProcessMemoryEnforcer:
                         f"deferred cleanup to free Metal memory."
                     )
                 else:
-                    has_loaded = any(
-                        e.engine is not None
+                    draining = [
+                        e.model_id
                         for e in self._engine_pool._entries.values()
-                    )
-                    if has_loaded:
+                        if e.state == EngineState.DRAINING
+                    ]
+                    pinned = [
+                        e.model_id
+                        for e in self._engine_pool._entries.values()
+                        if e.engine is not None and e.is_pinned
+                    ]
+                    if draining:
                         logger.warning(
-                            "Process memory limit exceeded but all "
-                            "loaded models are pinned — cannot evict."
+                            f"Process memory limit exceeded while "
+                            f"draining {draining} — waiting for "
+                            f"active requests to finish."
+                        )
+                    elif pinned:
+                        logger.warning(
+                            f"Process memory limit exceeded but all "
+                            f"loaded models are pinned ({pinned}) "
+                            f"— cannot evict."
                         )
                     else:
                         logger.warning(
