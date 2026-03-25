@@ -18,6 +18,8 @@ from omlx.api.responses_utils import ResponseStore
 from omlx.engine.embedding import EmbeddingEngine
 from omlx.engine.reranker import RerankerEngine
 
+TEST_API_KEY = "test-api-key"
+
 
 @dataclass
 class MockEmbeddingOutput:
@@ -322,16 +324,19 @@ def client(mock_engine_pool):
     # Store original state
     original_pool = _server_state.engine_pool
     original_default = _server_state.default_model
+    original_api_key = _server_state.api_key
 
     # Set mock state
     _server_state.engine_pool = mock_engine_pool
     _server_state.default_model = "test-model"
+    _server_state.api_key = TEST_API_KEY
 
-    yield TestClient(app)
+    yield TestClient(app, headers={"Authorization": f"Bearer {TEST_API_KEY}"})
 
     # Restore original state
     _server_state.engine_pool = original_pool
     _server_state.default_model = original_default
+    _server_state.api_key = original_api_key
 
 
 class TestHealthEndpoint:
@@ -412,11 +417,13 @@ class TestResponsesEndpoint:
         original_pool = _server_state.engine_pool
         original_default = _server_state.default_model
         original_store = _server_state.responses_store
+        original_api_key = _server_state.api_key
         try:
             _server_state.engine_pool = pool
             _server_state.default_model = "test-model"
             _server_state.responses_store = ResponseStore(state_dir=state_dir)
-            client = TestClient(app)
+            _server_state.api_key = TEST_API_KEY
+            client = TestClient(app, headers={"Authorization": f"Bearer {TEST_API_KEY}"})
 
             response = client.post(
                 "/v1/responses",
@@ -451,6 +458,7 @@ class TestResponsesEndpoint:
             _server_state.engine_pool = original_pool
             _server_state.default_model = original_default
             _server_state.responses_store = original_store
+            _server_state.api_key = original_api_key
 
     def test_previous_response_id_persists_across_store_restart(self, tmp_path):
         from omlx.server import app, _server_state
@@ -473,11 +481,13 @@ class TestResponsesEndpoint:
         original_pool = _server_state.engine_pool
         original_default = _server_state.default_model
         original_store = _server_state.responses_store
+        original_api_key = _server_state.api_key
         try:
             _server_state.engine_pool = pool
             _server_state.default_model = "test-model"
             _server_state.responses_store = ResponseStore(state_dir=state_dir)
-            client = TestClient(app)
+            _server_state.api_key = TEST_API_KEY
+            client = TestClient(app, headers={"Authorization": f"Bearer {TEST_API_KEY}"})
 
             first = client.post(
                 "/v1/responses",
@@ -518,6 +528,7 @@ class TestResponsesEndpoint:
             _server_state.engine_pool = original_pool
             _server_state.default_model = original_default
             _server_state.responses_store = original_store
+            _server_state.api_key = original_api_key
 
     def test_missing_previous_response_id_returns_404(self, tmp_path):
         from omlx.server import app, _server_state
@@ -528,13 +539,15 @@ class TestResponsesEndpoint:
         original_pool = _server_state.engine_pool
         original_default = _server_state.default_model
         original_store = _server_state.responses_store
+        original_api_key = _server_state.api_key
         try:
             _server_state.engine_pool = pool
             _server_state.default_model = "test-model"
             _server_state.responses_store = ResponseStore(
                 state_dir=tmp_path / "response-state"
             )
-            client = TestClient(app)
+            _server_state.api_key = TEST_API_KEY
+            client = TestClient(app, headers={"Authorization": f"Bearer {TEST_API_KEY}"})
 
             response = client.post(
                 "/v1/responses",
@@ -549,6 +562,7 @@ class TestResponsesEndpoint:
             _server_state.engine_pool = original_pool
             _server_state.default_model = original_default
             _server_state.responses_store = original_store
+            _server_state.api_key = original_api_key
 
 
 class TestModelsStatusEndpoint:

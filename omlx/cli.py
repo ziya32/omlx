@@ -186,19 +186,6 @@ def serve_command(args):
             print(f"Configuration error: {error}")
         sys.exit(1)
 
-    # Auto-generate API key when bound to non-loopback and none configured
-    if (
-        settings.auth.api_key is None
-        and settings.server.host not in ("127.0.0.1", "::1", "localhost")
-    ):
-        import secrets
-        key = secrets.token_urlsafe(32)
-        settings.auth.api_key = key
-        settings.save()
-        print(f"Generated API key: {key}")
-        print("Saved to omlx settings.json")
-        _push_api_key_to_nanobot(key)
-
     # Import server and config
     from .server import app, init_server
     from .config import parse_size

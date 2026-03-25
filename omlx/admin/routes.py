@@ -175,7 +175,6 @@ class GlobalSettingsRequest(BaseModel):
 
     # Auth settings
     api_key: Optional[str] = None
-    skip_api_key_verification: Optional[bool] = None
 
 
 class HFDownloadRequest(BaseModel):
@@ -1782,7 +1781,6 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         "auth": {
             "api_key_set": bool(global_settings.auth.api_key),
             "api_key": global_settings.auth.api_key or "",
-            "skip_api_key_verification": global_settings.auth.skip_api_key_verification,
             "sub_keys": [sk.to_dict() for sk in global_settings.auth.sub_keys],
         },
         "claude_code": {
@@ -1847,9 +1845,6 @@ async def update_global_settings(
     # Apply server settings
     if request.host is not None:
         global_settings.server.host = request.host
-        # Reset skip_api_key_verification when host is not localhost
-        if request.host != "127.0.0.1":
-            global_settings.auth.skip_api_key_verification = False
     if request.port is not None:
         global_settings.server.port = request.port
     if request.log_level is not None:
@@ -2126,14 +2121,6 @@ async def update_global_settings(
         _server_state.api_key = request.api_key
         runtime_applied.append("api_key")
         logger.info("API key updated via admin settings")
-
-    if request.skip_api_key_verification is not None:
-        # Only allow enabling when host is localhost
-        if request.skip_api_key_verification and global_settings.server.host != "127.0.0.1":
-            global_settings.auth.skip_api_key_verification = False
-        else:
-            global_settings.auth.skip_api_key_verification = request.skip_api_key_verification
-        runtime_applied.append("skip_api_key_verification")
 
     # Validate settings
     errors = global_settings.validate()

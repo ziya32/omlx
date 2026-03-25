@@ -384,7 +384,6 @@ class TestAuthSettings:
         assert result == {
             "api_key": "my-key",
             "secret_key": None,
-            "skip_api_key_verification": False,
             "sub_keys": [],
         }
 

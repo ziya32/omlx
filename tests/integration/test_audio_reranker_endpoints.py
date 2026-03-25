@@ -18,6 +18,8 @@ from fastapi.testclient import TestClient
 
 from omlx.engine.asr import ASREngine, TranscriptionOutput
 from omlx.engine.llm_reranker import LLMRerankerEngine
+
+TEST_API_KEY = "test-api-key"
 from omlx.engine.reranker import RerankerEngine
 from omlx.engine.tts import TTSEngine, SpeechOutput
 from omlx.models.reranker import RerankOutput
@@ -265,14 +267,17 @@ def client():
 
     original_pool = _server_state.engine_pool
     original_default = _server_state.default_model
+    original_api_key = _server_state.api_key
 
     _server_state.engine_pool = pool
     _server_state.default_model = "test-llm-model"
+    _server_state.api_key = TEST_API_KEY
 
-    yield TestClient(app)
+    yield TestClient(app, headers={"Authorization": f"Bearer {TEST_API_KEY}"})
 
     _server_state.engine_pool = original_pool
     _server_state.default_model = original_default
+    _server_state.api_key = original_api_key
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -525,7 +530,7 @@ class TestSpeechEndpoint:
         )
 
         assert response.status_code == 400
-        assert "Unsupported format" in response.json()["detail"]
+        assert "Unsupported format" in response.json()["error"]["message"]
 
     def test_speech_with_speed(self, client):
         """Test TTS with speed parameter."""
@@ -554,7 +559,7 @@ class TestSpeechEndpoint:
         )
 
         assert response.status_code == 400
-        assert "Speed" in response.json()["detail"]
+        assert "Speed" in response.json()["error"]["message"]
 
 
 # ──────────────────────────────────────────────────────────────────────

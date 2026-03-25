@@ -18,18 +18,20 @@ def _mock_request(headers=None):
 class TestVerifyApiKey:
     """Tests for verify_api_key function."""
 
-    def test_verify_api_key_no_auth_required(self):
-        """Test that no auth is required when api_key is None."""
+    def test_verify_api_key_rejects_when_no_key_configured(self):
+        """Test that requests are rejected with 401 when api_key is None."""
         from omlx.server import verify_api_key, _server_state
+        from fastapi import HTTPException
         import asyncio
 
         original_key = _server_state.api_key
         _server_state.api_key = None
 
         try:
-            # Should return True without any credentials
-            result = asyncio.run(verify_api_key(request=_mock_request(), credentials=None))
-            assert result is True
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(verify_api_key(credentials=None))
+            assert exc_info.value.status_code == 401
+            assert "not configured" in exc_info.value.detail.lower()
         finally:
             _server_state.api_key = original_key
 
@@ -186,7 +188,6 @@ class TestSubKeyVerification:
         mock_gs.auth.sub_keys = [
             SubKeyEntry(key="sub-key-1", name="Test Sub Key"),
         ]
-        mock_gs.auth.skip_api_key_verification = False
         mock_gs.server.host = "127.0.0.1"
         _server_state.global_settings = mock_gs
 
@@ -214,7 +215,6 @@ class TestSubKeyVerification:
         mock_gs.auth.sub_keys = [
             SubKeyEntry(key="sub-key-1", name="Test Sub Key"),
         ]
-        mock_gs.auth.skip_api_key_verification = False
         mock_gs.server.host = "0.0.0.0"
         _server_state.global_settings = mock_gs
 
@@ -242,7 +242,6 @@ class TestSubKeyVerification:
         mock_gs.auth.sub_keys = [
             SubKeyEntry(key="sub-key-1", name="Test Sub Key"),
         ]
-        mock_gs.auth.skip_api_key_verification = False
         mock_gs.server.host = "0.0.0.0"
         _server_state.global_settings = mock_gs
 
@@ -255,63 +254,28 @@ class TestSubKeyVerification:
             _server_state.global_settings = original_gs
 
 
-class TestSkipApiKeyVerification:
-    """Tests for skip_api_key_verification feature."""
+class TestAuthSettingsNoSkipVerification:
+    """Tests verifying that skip_api_key_verification has been removed."""
 
-    def _make_global_settings(self, host="127.0.0.1", skip=True):
-        from omlx.settings import GlobalSettings, ServerSettings, AuthSettings
-        from dataclasses import dataclass
-        gs = GlobalSettings.__new__(GlobalSettings)
-        gs.server = ServerSettings(host=host)
-        gs.auth = AuthSettings(api_key="test-key", skip_api_key_verification=skip)
-        return gs
-
-    def test_skip_verification_when_localhost(self):
-        """Skip API key verification when enabled and host is localhost."""
-        from omlx.server import verify_api_key, _server_state
-        import asyncio
-
-        original_key = _server_state.api_key
-        original_gs = _server_state.global_settings
-        _server_state.api_key = "test-key"
-        _server_state.global_settings = self._make_global_settings(
-            host="127.0.0.1", skip=True
-        )
-
-        try:
-            result = asyncio.run(verify_api_key(request=_mock_request(), credentials=None))
-            assert result is True
-        finally:
-            _server_state.api_key = original_key
-            _server_state.global_settings = original_gs
-
-    def test_skip_verification_ignored_when_not_localhost(self):
-        """Do not skip verification when host is not localhost."""
-        from omlx.server import verify_api_key, _server_state
-        from fastapi import HTTPException
-        import asyncio
-
-        original_key = _server_state.api_key
-        original_gs = _server_state.global_settings
-        _server_state.api_key = "test-key"
-        _server_state.global_settings = self._make_global_settings(
-            host="0.0.0.0", skip=True
-        )
-
-        try:
-            with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(verify_api_key(request=_mock_request(), credentials=None))
-            assert exc_info.value.status_code == 401
-        finally:
-            _server_state.api_key = original_key
-            _server_state.global_settings = original_gs
-
-    def test_skip_verification_disabled_by_default(self):
-        """Default skip_api_key_verification is False."""
+    def test_auth_settings_has_no_skip_field(self):
+        """AuthSettings no longer has skip_api_key_verification field."""
         from omlx.settings import AuthSettings
-
         auth = AuthSettings()
-        assert auth.skip_api_key_verification is False
+        assert not hasattr(auth, "skip_api_key_verification")
+
+    def test_auth_settings_to_dict_no_skip(self):
+        """to_dict does not include skip_api_key_verification."""
+        from omlx.settings import AuthSettings
+        auth = AuthSettings(api_key="test")
+        d = auth.to_dict()
+        assert "skip_api_key_verification" not in d
+
+    def test_auth_settings_from_dict_ignores_skip(self):
+        """from_dict ignores skip_api_key_verification if present in data."""
+        from omlx.settings import AuthSettings
+        data = {"api_key": "test", "skip_api_key_verification": True}
+        auth = AuthSettings.from_dict(data)
+        assert not hasattr(auth, "skip_api_key_verification")
 
 
 class TestAdminAuth:

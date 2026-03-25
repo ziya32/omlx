@@ -379,7 +379,6 @@ class AuthSettings:
 
     api_key: str | None = None
     secret_key: str | None = None
-    skip_api_key_verification: bool = False
     sub_keys: list[SubKeyEntry] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -387,7 +386,6 @@ class AuthSettings:
         return {
             "api_key": self.api_key,
             "secret_key": self.secret_key,
-            "skip_api_key_verification": self.skip_api_key_verification,
             "sub_keys": [sk.to_dict() for sk in self.sub_keys],
         }
 
@@ -397,7 +395,6 @@ class AuthSettings:
         return cls(
             api_key=data.get("api_key"),
             secret_key=data.get("secret_key"),
-            skip_api_key_verification=data.get("skip_api_key_verification", False),
             sub_keys=[
                 SubKeyEntry.from_dict(sk) for sk in data.get("sub_keys", [])
             ],

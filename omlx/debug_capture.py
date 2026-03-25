@@ -89,12 +89,23 @@ def get_capture() -> dict[str, Any] | None:
         }
 
 
-def register_debug_endpoint(app) -> None:
-    """Register debug endpoints. Only called when ENABLED."""
+def register_debug_endpoint(app, auth_dependency=None) -> None:
+    """Register debug endpoints. Only called when ENABLED.
+
+    Args:
+        app: FastAPI application instance.
+        auth_dependency: Optional FastAPI dependency for API key verification.
+            When provided, the debug endpoints require authentication
+            consistent with other /debug/* endpoints.
+    """
     if not ENABLED:
         return
 
-    @app.get("/debug/last-request")
+    from fastapi import Depends
+
+    deps = [Depends(auth_dependency)] if auth_dependency else []
+
+    @app.get("/debug/last-request", dependencies=deps)
     async def debug_last_request():
         """Return all captured requests and prompts.
 
@@ -105,7 +116,7 @@ def register_debug_endpoint(app) -> None:
             return {"error": "No request captured yet"}
         return data
 
-    @app.post("/debug/reset-capture")
+    @app.post("/debug/reset-capture", dependencies=deps)
     async def debug_reset_capture():
         """Clear captured data. Call before each test."""
         reset()

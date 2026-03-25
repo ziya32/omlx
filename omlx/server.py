@@ -272,17 +272,13 @@ async def verify_api_key(
     """
     from .admin.auth import verify_any_api_key
 
-    # No auth required if no API key is configured
+    # Reject all requests when no API key is configured
     if _server_state.api_key is None:
-        return True
-
-    # Skip verification if enabled and host is localhost
-    if (
-        _server_state.global_settings is not None
-        and _server_state.global_settings.auth.skip_api_key_verification
-        and _server_state.global_settings.server.host == "127.0.0.1"
-    ):
-        return True
+        raise HTTPException(
+            status_code=401,
+            detail="API key required but not configured. "
+                   "Start omlx with --api-key or set OMLX_API_KEY.",
+        )
 
     # Extract API key from Bearer token or x-api-key header
     if credentials is not None:
@@ -425,11 +421,11 @@ app = FastAPI(
 
 # Test-only debug capture endpoint (no-op unless OMLX_DEBUG_CAPTURE=1)
 from .debug_capture import register_debug_endpoint
-register_debug_endpoint(app)
+register_debug_endpoint(app, auth_dependency=verify_api_key)
 
 
 @app.get("/debug/engine-diagnostics")
-async def debug_engine_diagnostics():
+async def debug_engine_diagnostics(_: bool = Depends(verify_api_key)):
     """Expose per-engine scheduler memory limits for diagnostic/test use.
 
     Returns the enforcer's max_bytes and, for each loaded engine, the
@@ -476,7 +472,7 @@ async def debug_engine_diagnostics():
 
 
 @app.post("/debug/reset-enforcer-peak")
-async def debug_reset_enforcer_peak():
+async def debug_reset_enforcer_peak(_: bool = Depends(verify_api_key)):
     """Reset the enforcer's peak memory and overage counter (for tests)."""
     pool = get_engine_pool()
     if pool._process_memory_enforcer:
@@ -485,8 +481,9 @@ async def debug_reset_enforcer_peak():
 
 
 # Include MCP routes
-from .api.mcp_routes import router as mcp_router, set_mcp_manager_getter
+from .api.mcp_routes import router as mcp_router, set_mcp_manager_getter, set_auth_dependency
 set_mcp_manager_getter(get_mcp_manager)
+set_auth_dependency(verify_api_key)
 app.include_router(mcp_router)
 
 # Include audio routes only when mlx-audio is installed.
@@ -1566,12 +1563,11 @@ async def health():
 
 
 @app.get("/debug/pool")
-async def debug_pool():
+async def debug_pool(_: bool = Depends(verify_api_key)):
     """Diagnostic endpoint for engine pool state.
 
     Returns a lock-free read-only snapshot of pool internals including
     stuck-state detection, memory accounting, and executor health.
-    No authentication required — intended for local debugging.
     """
     pool = get_engine_pool()
     return pool.get_debug_status()

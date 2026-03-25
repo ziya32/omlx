@@ -39,6 +39,8 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport
 
+TEST_API_KEY = "test-api-key"
+
 pytestmark = [
     pytest.mark.slow,
     pytest.mark.skipif(
@@ -205,6 +207,7 @@ def server_app(model_dir, model_ids):
         init_server(
             model_dirs=str(model_dir),
             max_model_memory=max_mem,
+            api_key=TEST_API_KEY,
         )
 
         # Apply our overrides after init_server's own apply_settings_overrides
@@ -234,6 +237,7 @@ async def client(server_app):
         transport=transport,
         base_url="http://test",
         timeout=httpx.Timeout(600.0),  # 10min per request for large models
+        headers={"Authorization": f"Bearer {TEST_API_KEY}"},
     ) as ac:
         yield ac
 

@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
+TEST_API_KEY = "test-api-key"
+
 
 @dataclass
 class MockGenerationOutput:
@@ -173,6 +175,9 @@ class MockEnginePool:
     def get_model_ids(self) -> List[str]:
         return [m["id"] for m in self._models]
 
+    def get_entry(self, model_id: str):
+        return None
+
     def get_status(self) -> Dict[str, Any]:
         return {"models": self._models}
 
@@ -217,14 +222,17 @@ class TestOpenAIStreamingFormat:
 
         original_pool = _server_state.engine_pool
         original_default = _server_state.default_model
+        original_api_key = _server_state.api_key
 
         _server_state.engine_pool = mock_engine_pool
         _server_state.default_model = "test-model"
+        _server_state.api_key = TEST_API_KEY
 
-        yield TestClient(app)
+        yield TestClient(app, headers={"Authorization": f"Bearer {TEST_API_KEY}"})
 
         _server_state.engine_pool = original_pool
         _server_state.default_model = original_default
+        _server_state.api_key = original_api_key
 
     @pytest.mark.slow
     @pytest.mark.integration
@@ -356,14 +364,17 @@ class TestAnthropicStreamingFormat:
 
         original_pool = _server_state.engine_pool
         original_default = _server_state.default_model
+        original_api_key = _server_state.api_key
 
         _server_state.engine_pool = mock_engine_pool
         _server_state.default_model = "test-model"
+        _server_state.api_key = TEST_API_KEY
 
-        yield TestClient(app)
+        yield TestClient(app, headers={"Authorization": f"Bearer {TEST_API_KEY}"})
 
         _server_state.engine_pool = original_pool
         _server_state.default_model = original_default
+        _server_state.api_key = original_api_key
 
     @pytest.mark.slow
     @pytest.mark.integration
@@ -2606,14 +2617,17 @@ class TestStreamingEdgeCases:
 
         original_pool = _server_state.engine_pool
         original_default = _server_state.default_model
+        original_api_key = _server_state.api_key
 
         _server_state.engine_pool = mock_engine_pool
         _server_state.default_model = "test-model"
+        _server_state.api_key = TEST_API_KEY
 
-        yield TestClient(app)
+        yield TestClient(app, headers={"Authorization": f"Bearer {TEST_API_KEY}"})
 
         _server_state.engine_pool = original_pool
         _server_state.default_model = original_default
+        _server_state.api_key = original_api_key
 
     @pytest.mark.slow
     @pytest.mark.integration
