@@ -1030,3 +1030,34 @@ class TestResolveModelId:
         # Exact match should be returned directly
         result = pool.resolve_model_id("model-a", settings_manager=None)
         assert result == "model-a"
+
+
+class TestCrashDiagnosticSnapshot:
+    """Tests for get_crash_diagnostic_snapshot (native crash dumps)."""
+
+    def test_get_crash_diagnostic_snapshot_structure(self, small_mock_model_dir):
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        entry_a = pool.get_entry("model-a")
+        assert entry_a is not None
+        entry_a.active_uses = 2
+
+        snap = pool.get_crash_diagnostic_snapshot()
+
+        assert "debug_pool" in snap
+        assert snap["pending_cleanup_tasks"] == 0
+        assert "models" in snap
+        assert set(snap["models"]) == {"model-a", "model-b"}
+
+        ma = snap["models"]["model-a"]
+        assert ma["active_uses"] == 2
+        assert ma["state"] == EngineState.UNLOADED.value
+        assert ma["engine_loaded"] is False
+        assert ma["is_pinned"] is False
+        assert "engine_type" in ma
+        assert "estimated_size_bytes" in ma
+
+        dbg = snap["debug_pool"]
+        assert "active_models" in dbg
+        assert dbg["unloaded_count"] == 2

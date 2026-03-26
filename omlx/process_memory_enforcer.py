@@ -338,9 +338,13 @@ class ProcessMemoryEnforcer:
                             f"models are pinned ({pinned}) — cannot evict."
                         )
                     else:
+                        snapshot = self._engine_pool.get_crash_diagnostic_snapshot()
                         logger.warning(
-                            "🚨 Memory limit exceeded but no models "
-                            "are loaded to evict."
+                            "🚨 Memory limit exceeded but no models are loaded to evict "
+                            "(metal=%s, limit=%s, snapshot=%s)",
+                            _format_gb(mx.get_active_memory()),
+                            _format_gb(self._max_bytes),
+                            snapshot,
                         )
                 break
 

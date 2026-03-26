@@ -16,7 +16,89 @@ Usage:
 
 import argparse
 import faulthandler
+import os
 import sys
+
+# Kept alive so faulthandler does not close the crash-dump log file (see serve_command).
+_faulthandler_crash_logfp = None
+
+
+def _write_abort_memory_snapshot(fileobj) -> None:
+    """Best-effort RSS, MLX Metal, and psutil memory for native abort diagnostics.
+
+    Avoids the logging module (locks). Safe to call from a Python SIGABRT handler.
+    """
+    import resource
+
+    def _write(s: str) -> None:
+        try:
+            fileobj.write(s)
+            fileobj.flush()
+        except OSError:
+            pass
+
+    _write("\n--- crash memory snapshot (best-effort) ---\n")
+    try:
+        ru = resource.getrusage(resource.RUSAGE_SELF)
+        _write(
+            f"rusage: ru_maxrss={ru.ru_maxrss} "
+            "(units: Linux=KB; macOS=bytes per Python resource docs)\n"
+        )
+    except Exception as exc:
+        _write(f"rusage: unavailable ({exc})\n")
+    try:
+        import mlx.core as mx
+
+        _write(f"mlx.get_active_memory(): {mx.get_active_memory()} bytes\n")
+    except Exception as exc:
+        _write(f"mlx.get_active_memory(): unavailable ({exc})\n")
+    try:
+        import psutil
+
+        p = psutil.Process()
+        mi = p.memory_info()
+        _write(f"psutil process: rss={mi.rss} vms={mi.vms}\n")
+        svm = psutil.virtual_memory()
+        _write(
+            "psutil system memory: "
+            f"total={svm.total} available={svm.available} "
+            f"used_percent={svm.percent}\n"
+        )
+    except Exception as exc:
+        _write(f"psutil: unavailable ({exc})\n")
+
+
+def _write_engine_pool_crash_snapshot(fileobj) -> None:
+    """Best-effort engine pool + process memory enforcer state for native abort dumps."""
+    import json
+
+    try:
+        from .server import get_server_state
+
+        st = get_server_state()
+        pool = st.engine_pool
+        if pool is None:
+            fileobj.write(
+                "\n--- engine pool / server snapshot ---\n"
+                "engine_pool: not initialized\n"
+            )
+            fileobj.flush()
+            return
+        payload: dict = pool.get_crash_diagnostic_snapshot()
+        enf = getattr(st, "process_memory_enforcer", None)
+        if enf is not None and hasattr(enf, "get_status"):
+            payload["process_memory_enforcer"] = enf.get_status()
+        fileobj.write("\n--- engine pool / server snapshot ---\n")
+        fileobj.write(json.dumps(payload, indent=2, default=str) + "\n")
+        fileobj.flush()
+    except Exception as exc:
+        try:
+            fileobj.write(
+                f"\n--- engine pool / server snapshot ---\nunavailable ({exc})\n"
+            )
+            fileobj.flush()
+        except OSError:
+            pass
 
 
 def _has_cli_overrides(args) -> bool:
@@ -79,7 +161,6 @@ def _push_api_key_to_nanobot(api_key: str) -> None:
 def serve_command(args):
     """Start the OpenAI-compatible multi-model server."""
     import logging
-    import os
     import uvicorn
 
     from ._version import __version__
@@ -178,6 +259,62 @@ def serve_command(args):
             if not isinstance(h, logging.StreamHandler)
             or isinstance(h, logging.FileHandler)
         ]
+
+    # Native code (e.g. libmlx on Metal command-buffer failure) may call abort()
+    # (SIGABRT) with no Python exception. faulthandler dumps Python thread stacks;
+    # we replace the SIGABRT handler to prepend a memory snapshot (RSS, MLX, psutil).
+    import faulthandler
+    import signal
+
+    global _faulthandler_crash_logfp
+    crash_log_path = log_dir / "server.log"
+    try:
+        _faulthandler_crash_logfp = open(
+            crash_log_path, "a", encoding="utf-8", buffering=1
+        )
+        fh_for_faulthandler = _faulthandler_crash_logfp
+    except OSError:
+        _faulthandler_crash_logfp = None
+        fh_for_faulthandler = sys.stderr
+
+    try:
+        fh_for_faulthandler.write(
+            "\n--- native crash dumps (memory + thread stacks) append below ---\n"
+        )
+        fh_for_faulthandler.flush()
+    except OSError:
+        pass
+
+    faulthandler.enable(file=fh_for_faulthandler, all_threads=True)
+
+    def _sigabrt_handler(_signum, _frame):
+        try:
+            _write_abort_memory_snapshot(fh_for_faulthandler)
+        except Exception:
+            pass
+        try:
+            _write_engine_pool_crash_snapshot(fh_for_faulthandler)
+        except Exception:
+            pass
+        try:
+            faulthandler.dump_traceback(fh_for_faulthandler, all_threads=True)
+        except Exception:
+            pass
+        try:
+            fh_for_faulthandler.flush()
+        except OSError:
+            pass
+        signal.signal(signal.SIGABRT, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGABRT)
+
+    # enable() registers SIGABRT; replace with our handler (memory + traceback).
+    signal.signal(signal.SIGABRT, _sigabrt_handler)
+
+    logging.getLogger(__name__).info(
+        "faulthandler enabled: SIGABRT dumps memory, engine pool snapshot, "
+        "and Python thread stacks to %s",
+        str(crash_log_path) if _faulthandler_crash_logfp else "stderr",
+    )
 
     # Validate settings
     errors = settings.validate()
