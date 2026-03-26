@@ -1740,6 +1740,7 @@ async def create_embeddings(
     - float or base64 encoding format
     - Optional dimension reduction (with renormalization)
     """
+    req_id = str(uuid.uuid4())
     oq_manager = getattr(_server_state, "oq_manager", None)
     if oq_manager and oq_manager.is_quantizing:
         raise HTTPException(
@@ -1770,7 +1771,7 @@ async def create_embeddings(
 
     elapsed = time.perf_counter() - start_time
     logger.info(
-        f"Embedding: {len(embedding_inputs)} inputs, {output.dimensions} dims, "
+        f"Embedding [{req_id}]: {len(embedding_inputs)} inputs, {output.dimensions} dims, "
         f"{output.total_tokens} tokens in {elapsed:.3f}s"
     )
 
@@ -1851,6 +1852,7 @@ async def create_rerank(
     - Optional top_n to limit results
     - Optional return_documents to include document text in response
     """
+    req_id = str(uuid.uuid4())
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
         raise HTTPException(
             status_code=503,
@@ -1878,7 +1880,7 @@ async def create_rerank(
 
     elapsed = time.perf_counter() - start_time
     logger.info(
-        f"Rerank: {len(documents)} docs, "
+        f"Rerank [{req_id}]: {len(documents)} docs, "
         f"{output.total_tokens} tokens in {elapsed:.3f}s"
     )
 
@@ -1923,6 +1925,7 @@ async def create_transcription(
     """
     import tempfile
 
+    req_id = str(uuid.uuid4())
     form = await http_request.form()
     audio_file = form.get("file")
     model = form.get("model")
@@ -1969,7 +1972,7 @@ async def create_transcription(
         elapsed = time.perf_counter() - start_time
 
         logger.info(
-            f"Transcription: {elapsed:.3f}s, "
+            f"Transcription [{req_id}]: {elapsed:.3f}s, "
             f"language={output.language}, "
             f"duration={output.duration}s"
         )
@@ -2030,6 +2033,7 @@ async def create_speech(
 
     Returns binary WAV audio (24 kHz) or streaming PCM.
     """
+    req_id = str(uuid.uuid4())
     # Apply model settings defaults
     speaker = request.voice if request.voice != "default" else None
     instruct = request.instructions
@@ -2137,7 +2141,7 @@ async def create_speech(
     ext = _FORMAT_EXTENSIONS[fmt]
 
     logger.info(
-        f"Speech: {elapsed:.3f}s, "
+        f"Speech [{req_id}]: {elapsed:.3f}s, "
         f"duration={output.duration:.2f}s, "
         f"sample_rate={output.sample_rate}, "
         f"format={fmt}"
@@ -2225,6 +2229,7 @@ async def create_completion(
     _: bool = Depends(verify_api_key),
 ):
     """Create a text completion."""
+    req_id = str(uuid.uuid4())
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
         raise HTTPException(
             status_code=503,
@@ -2254,7 +2259,7 @@ async def create_completion(
             return StreamingResponse(
                 _with_engine_guard(
                     _with_sse_keepalive(
-                        stream_completion(engine, prompts[0], request, model_load_duration=model_load_duration),
+                        stream_completion(engine, prompts[0], request, model_load_duration=model_load_duration, request_id=req_id),
                         http_request=http_request,
                     ),
                     pool, resolved_model,
@@ -2295,6 +2300,7 @@ async def create_completion(
                     xtc_probability=xtc_probability,
                     xtc_threshold=xtc_threshold,
                     stop=request.stop,
+                    request_id=req_id,
                 ),
             )
             if output is None:
@@ -2314,7 +2320,7 @@ async def create_completion(
 
     elapsed = time.perf_counter() - start_time
     tokens_per_sec = total_completion_tokens / elapsed if elapsed > 0 else 0
-    logger.info(f"Completion: {total_completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)")
+    logger.info(f"Completion [{req_id}]: {total_completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)")
 
     # Record metrics
     get_server_metrics().record_request_complete(
@@ -2361,6 +2367,8 @@ async def create_chat_completion(
     }
     ```
     """
+    req_id = str(uuid.uuid4())
+
     # Test-only request capture (no-op unless OMLX_DEBUG_CAPTURE=1)
     from .debug_capture import capture_request
     capture_request(
@@ -2545,7 +2553,7 @@ async def create_chat_completion(
             return StreamingResponse(
                 _with_engine_guard(
                     _with_sse_keepalive(
-                        stream_chat_completion(engine, messages, request, model_load_duration=model_load_duration, **chat_kwargs),
+                        stream_chat_completion(engine, messages, request, model_load_duration=model_load_duration, request_id=req_id, **chat_kwargs),
                         http_request=http_request,
                     ),
                     pool, resolved_model,
@@ -2558,7 +2566,7 @@ async def create_chat_completion(
 
         output = await _run_with_disconnect_guard(
             http_request,
-            engine.chat(messages=messages, **chat_kwargs),
+            engine.chat(messages=messages, request_id=req_id, **chat_kwargs),
         )
         if output is None:
             return  # Client disconnected
@@ -2568,7 +2576,7 @@ async def create_chat_completion(
 
     elapsed = time.perf_counter() - start_time
     tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
-    logger.info(f"Chat completion: {output.completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)")
+    logger.info(f"Chat completion [{req_id}]: {output.completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)")
 
     # Record metrics
     get_server_metrics().record_request_complete(
@@ -2881,6 +2889,7 @@ async def stream_completion(
     prompt: str,
     request: CompletionRequest,
     model_load_duration: float = 0.0,
+    request_id: str | None = None,
 ) -> AsyncIterator[str]:
     """Stream completion response."""
     start_time = time.perf_counter()
@@ -2910,6 +2919,7 @@ async def stream_completion(
             xtc_probability=xtc_probability,
             xtc_threshold=xtc_threshold,
             stop=request.stop,
+            request_id=request_id,
         ):
             if first_token_time is None and output.new_text:
                 first_token_time = time.perf_counter()
@@ -2985,6 +2995,7 @@ async def stream_chat_completion(
     messages: list,
     request: ChatCompletionRequest,
     model_load_duration: float = 0.0,
+    request_id: str | None = None,
     **kwargs,
 ) -> AsyncIterator[str]:
     """Stream chat completion response.
@@ -3027,7 +3038,7 @@ async def stream_chat_completion(
         else:
             stream_content = False
     try:
-        async for output in engine.stream_chat(messages=messages, **kwargs):
+        async for output in engine.stream_chat(messages=messages, request_id=request_id, **kwargs):
             if first_token_time is None and output.new_text:
                 first_token_time = time.perf_counter()
             last_output = output
@@ -3273,6 +3284,7 @@ async def stream_anthropic_messages(
     engine: BaseEngine,
     messages: list,
     request: AnthropicMessagesRequest,
+    request_id: str | None = None,
     **kwargs,
 ) -> AsyncIterator[str]:
     """
@@ -3345,7 +3357,7 @@ async def stream_anthropic_messages(
 
     # 3. Stream content with thinking/content separation
     try:
-        async for output in engine.stream_chat(messages=messages, **kwargs):
+        async for output in engine.stream_chat(messages=messages, request_id=request_id, **kwargs):
             last_output = output  # Keep reference for tool_calls and token counts
 
             if first_token_time is None and output.new_text:
@@ -3568,6 +3580,7 @@ async def create_anthropic_message(
 
     Streaming is supported with `stream: true`.
     """
+    req_id = str(uuid.uuid4())
     logger.debug(
         f"Anthropic Messages request: model={request.model}, "
         f"messages={len(request.messages)}, stream={request.stream}, "
@@ -3714,7 +3727,7 @@ async def create_anthropic_message(
             return StreamingResponse(
                 _with_engine_guard(
                     _with_sse_keepalive(
-                        stream_anthropic_messages(engine, messages, request, **chat_kwargs),
+                        stream_anthropic_messages(engine, messages, request, request_id=req_id, **chat_kwargs),
                         http_request=http_request,
                     ),
                     pool, resolved_model,
@@ -3727,7 +3740,7 @@ async def create_anthropic_message(
 
         output = await _run_with_disconnect_guard(
             http_request,
-            engine.chat(messages=messages, **chat_kwargs),
+            engine.chat(messages=messages, request_id=req_id, **chat_kwargs),
         )
         if output is None:
             return  # Client disconnected
@@ -3738,7 +3751,7 @@ async def create_anthropic_message(
     elapsed = time.perf_counter() - start_time
     tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
     logger.info(
-        f"Anthropic message: {output.completion_tokens} tokens in {elapsed:.2f}s "
+        f"Anthropic message [{req_id}]: {output.completion_tokens} tokens in {elapsed:.2f}s "
         f"({tokens_per_sec:.1f} tok/s)"
     )
 
@@ -3922,6 +3935,7 @@ async def create_response(
     _: bool = Depends(verify_api_key),
 ):
     """Create a response (OpenAI Responses API)."""
+    req_id = str(uuid.uuid4())
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
         raise HTTPException(
             status_code=503,
@@ -4091,6 +4105,7 @@ async def create_response(
                             input_messages=current_input_messages,
                             store_response=_should_store_response(request.store),
                             model_load_duration=model_load_duration,
+                            request_id=req_id,
                             **chat_kwargs,
                         ),
                         http_request=http_request,
@@ -4104,7 +4119,7 @@ async def create_response(
         start_time = time.perf_counter()
         output = await _run_with_disconnect_guard(
             http_request,
-            engine.chat(messages=messages, **chat_kwargs),
+            engine.chat(messages=messages, request_id=req_id, **chat_kwargs),
         )
         if output is None:
             return
@@ -4115,7 +4130,7 @@ async def create_response(
     elapsed = time.perf_counter() - start_time
     tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
     logger.info(
-        f"Responses API: {output.completion_tokens} tokens in {elapsed:.2f}s "
+        f"Responses API [{req_id}]: {output.completion_tokens} tokens in {elapsed:.2f}s "
         f"({tokens_per_sec:.1f} tok/s)"
     )
 
@@ -4206,6 +4221,7 @@ async def stream_responses_api(
     input_messages: Optional[list[dict]] = None,
     store_response: bool = True,
     model_load_duration: float = 0.0,
+    request_id: str | None = None,
     **kwargs,
 ) -> AsyncIterator[str]:
     """Stream Responses API events (SSE with named event types)."""
@@ -4292,7 +4308,7 @@ async def stream_responses_api(
             stream_content = False
 
     try:
-        async for output in engine.stream_chat(messages=messages, **kwargs):
+        async for output in engine.stream_chat(messages=messages, request_id=request_id, **kwargs):
             if first_token_time is None and output.new_text:
                 first_token_time = time.perf_counter()
             last_output = output

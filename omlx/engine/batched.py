@@ -411,6 +411,7 @@ class BatchedEngine(BaseEngine):
         repetition_penalty: float = 1.0,
         presence_penalty: float = 0.0,
         stop: list[str] | None = None,
+        request_id: str | None = None,
         **kwargs,
     ) -> GenerationOutput:
         """
@@ -457,6 +458,7 @@ class BatchedEngine(BaseEngine):
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
+            request_id=request_id,
         )
 
         text = clean_special_tokens(output.output_text)
@@ -481,6 +483,7 @@ class BatchedEngine(BaseEngine):
         repetition_penalty: float = 1.0,
         presence_penalty: float = 0.0,
         stop: list[str] | None = None,
+        request_id: str | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """
@@ -538,6 +541,7 @@ class BatchedEngine(BaseEngine):
         request_id = await self._engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
+            request_id=request_id,
             **specprefill_kwargs,
         )
 
@@ -587,6 +591,7 @@ class BatchedEngine(BaseEngine):
         repetition_penalty: float = 1.0,
         presence_penalty: float = 0.0,
         tools: list[dict] | None = None,
+        request_id: str | None = None,
         **kwargs,
     ) -> GenerationOutput:
         """
@@ -637,6 +642,7 @@ class BatchedEngine(BaseEngine):
             min_p=min_p,
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
+            request_id=request_id,
             **kwargs,
         )
 
@@ -651,6 +657,7 @@ class BatchedEngine(BaseEngine):
         repetition_penalty: float = 1.0,
         presence_penalty: float = 0.0,
         tools: list[dict] | None = None,
+        request_id: str | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """
@@ -719,6 +726,7 @@ class BatchedEngine(BaseEngine):
             min_p=min_p,
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
+            request_id=request_id,
             **kwargs,
         ):
             yield output

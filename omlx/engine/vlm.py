@@ -1232,6 +1232,7 @@ class VLMBatchedEngine(BaseEngine):
         repetition_penalty: float = 1.0,
         presence_penalty: float = 0.0,
         stop: list[str] | None = None,
+        request_id: str | None = None,
         vlm_inputs_embeds: Any = None,
         vlm_extra_kwargs: dict[str, Any] | None = None,
         vlm_image_hash: str | None = None,
@@ -1272,6 +1273,7 @@ class VLMBatchedEngine(BaseEngine):
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
+            request_id=request_id,
             vlm_inputs_embeds=vlm_inputs_embeds,
             vlm_extra_kwargs=vlm_extra_kwargs,
             vlm_image_hash=vlm_image_hash,
@@ -1299,6 +1301,7 @@ class VLMBatchedEngine(BaseEngine):
         repetition_penalty: float = 1.0,
         presence_penalty: float = 0.0,
         stop: list[str] | None = None,
+        request_id: str | None = None,
         vlm_inputs_embeds: Any = None,
         vlm_extra_kwargs: dict[str, Any] | None = None,
         vlm_image_hash: str | None = None,
@@ -1348,6 +1351,7 @@ class VLMBatchedEngine(BaseEngine):
         request_id = await self._engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
+            request_id=request_id,
             vlm_inputs_embeds=vlm_inputs_embeds,
             vlm_extra_kwargs=vlm_extra_kwargs,
             vlm_image_hash=vlm_image_hash,
@@ -1392,6 +1396,7 @@ class VLMBatchedEngine(BaseEngine):
         repetition_penalty: float = 1.0,
         presence_penalty: float = 0.0,
         tools: list[dict] | None = None,
+        request_id: str | None = None,
         **kwargs,
     ) -> GenerationOutput:
         """Chat completion with vision support (non-streaming)."""
@@ -1424,6 +1429,7 @@ class VLMBatchedEngine(BaseEngine):
             min_p=min_p,
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
+            request_id=request_id,
             vlm_inputs_embeds=vlm_embeds,
             vlm_extra_kwargs=vlm_kwargs,
             vlm_image_hash=image_hash,
@@ -1441,6 +1447,7 @@ class VLMBatchedEngine(BaseEngine):
         repetition_penalty: float = 1.0,
         presence_penalty: float = 0.0,
         tools: list[dict] | None = None,
+        request_id: str | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """Stream chat completion with vision support."""
@@ -1495,6 +1502,7 @@ class VLMBatchedEngine(BaseEngine):
             min_p=min_p,
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
+            request_id=request_id,
             vlm_inputs_embeds=vlm_embeds,
             vlm_extra_kwargs=vlm_kwargs,
             vlm_image_hash=image_hash,

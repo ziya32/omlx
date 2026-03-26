@@ -72,6 +72,7 @@ class BaseEngine(ABC):
         repetition_penalty: float = 1.0,
         presence_penalty: float = 0.0,
         stop: Optional[List[str]] = None,
+        request_id: Optional[str] = None,
         **kwargs,
     ) -> GenerationOutput:
         """
@@ -104,6 +105,7 @@ class BaseEngine(ABC):
         repetition_penalty: float = 1.0,
         presence_penalty: float = 0.0,
         stop: Optional[List[str]] = None,
+        request_id: Optional[str] = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """
@@ -136,6 +138,7 @@ class BaseEngine(ABC):
         repetition_penalty: float = 1.0,
         presence_penalty: float = 0.0,
         tools: Optional[List[dict]] = None,
+        request_id: Optional[str] = None,
         **kwargs,
     ) -> GenerationOutput:
         """
@@ -168,6 +171,7 @@ class BaseEngine(ABC):
         repetition_penalty: float = 1.0,
         presence_penalty: float = 0.0,
         tools: Optional[List[dict]] = None,
+        request_id: Optional[str] = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """
