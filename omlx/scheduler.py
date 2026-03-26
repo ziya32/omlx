@@ -1072,6 +1072,11 @@ class Scheduler:
         input_arr = mx.array(prefill_tokens)[None]  # (1, seq_len)
         processed_tokens = 0
         prefill_step_size = self.config.prefill_step_size
+        # Cap prefill chunk size for VLM requests so abort checks fire
+        # between smaller chunks instead of processing the entire vision
+        # embedding in one shot (which can take minutes for multi-frame video).
+        if vlm_embeds is not None:
+            prefill_step_size = min(prefill_step_size, 4096)
         uid = self.request_id_to_uid.get(request.request_id)
 
         emitted_boundaries: Dict[int, int] = {}
@@ -3551,6 +3556,12 @@ class Scheduler:
             if self.batch_generator is not None and self.running:
                 responses = self.batch_generator.next_generated()
                 output.has_work = True
+
+                # Check for aborts that arrived during the blocking next()
+                # call. Process them now so aborted UIDs are removed before
+                # _process_batch_responses, avoiding wasted post-processing.
+                if self._pending_abort_ids:
+                    self._process_pending_aborts()
 
                 if responses:
                     outputs, finished_ids = self._process_batch_responses(responses)

@@ -1014,6 +1014,9 @@ class TestMemoryAccounting:
         assert committed_with_a > 0
 
         await switching_pool._unload_engine("model-a")
+        # Wait for deferred cleanup to complete (UNLOADING -> UNLOADED)
+        if switching_pool._cleanup_tasks:
+            await asyncio.gather(*switching_pool._cleanup_tasks, return_exceptions=True)
         committed_after = switching_pool._committed_memory()
         assert committed_after < committed_with_a
 

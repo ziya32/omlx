@@ -561,7 +561,16 @@ class TestEngineCoreGenerateCancellation:
                 with pytest.raises(asyncio.CancelledError):
                     await task
 
-                # After cancellation, the request should be cleaned up
+                # After cancellation, the request is in deferred cleanup
+                # (abort_request adds to _pending_cleanups; engine loop cleans up)
+                assert request_id in engine._pending_cleanups
+
+                # Simulate engine loop processing deferred cleanups
+                # (the mock model can't run full generation steps)
+                for rid in list(engine._pending_cleanups):
+                    engine._cleanup_request(rid)
+                engine._pending_cleanups.clear()
+
                 assert request_id not in engine._output_collectors
                 assert request_id not in engine._stream_states
                 assert request_id not in engine._finished_events
@@ -610,7 +619,15 @@ class TestEngineCoreGenerateCancellation:
                 with pytest.raises(asyncio.CancelledError):
                     await task1
 
-                # First request cleaned up, second still active
+                # First request is in deferred cleanup, second still active
+                assert request_ids[0] in engine._pending_cleanups
+                assert request_ids[1] in engine._output_collectors
+
+                # Simulate engine loop processing deferred cleanups
+                for rid in list(engine._pending_cleanups):
+                    engine._cleanup_request(rid)
+                engine._pending_cleanups.clear()
+
                 assert request_ids[0] not in engine._output_collectors
                 assert request_ids[1] in engine._output_collectors
 

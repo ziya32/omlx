@@ -13,10 +13,10 @@ and implicit request queuing. It supports:
 - BatchedEngine for all LLM models (continuous batching)
 
 State machine per model:
-    UNLOADED ──load──► LOADING ──success──► ACTIVE ──evict──► DRAINING ──empty──► UNLOADED
-                          │                                      │
-                          ▼                                      ▼ (timeout)
-                       UNLOADED (fail)                        UNLOADED (force abort)
+    UNLOADED ──load──► LOADING ──success──► ACTIVE ──evict──► DRAINING ──empty──► UNLOADING ──cleanup──► UNLOADED
+                          │                                      │                    ▲
+                          ▼                                      ▼ (timeout)          │
+                       UNLOADED (fail)                        UNLOADING ──────────────┘
 """
 
 from __future__ import annotations
@@ -67,6 +67,7 @@ class EngineState(Enum):
     LOADING = "loading"       # Model being loaded
     ACTIVE = "active"         # Normal operation, accepts requests
     DRAINING = "draining"     # Finishing in-flight, new requests wait
+    UNLOADING = "unloading"   # Engine stopped, Metal cleanup in progress
 
 
 @dataclass
@@ -88,6 +89,7 @@ class EngineEntry:
     state: EngineState = EngineState.UNLOADED
     ready_event: asyncio.Event | None = None     # Set when LOADING → ACTIVE/UNLOADED
     drain_complete: asyncio.Event | None = None   # Set when DRAINING → UNLOADED
+    unload_complete: asyncio.Event | None = None  # Set when UNLOADING → UNLOADED
     drain_started: float = 0.0                    # For timeout tracking
     load_error: Exception | None = None           # Propagated to waiters
     load_started: float = 0.0                     # For diagnostics
@@ -209,11 +211,14 @@ class EnginePool:
     # -------------------------------------------------------------------------
 
     def _committed_memory(self) -> int:
-        """Memory committed by ACTIVE + DRAINING + LOADING models."""
+        """Memory committed by ACTIVE + DRAINING + LOADING + UNLOADING models."""
         return sum(
             e.estimated_size
             for e in self._entries.values()
-            if e.state in (EngineState.ACTIVE, EngineState.DRAINING, EngineState.LOADING)
+            if e.state in (
+                EngineState.ACTIVE, EngineState.DRAINING,
+                EngineState.LOADING, EngineState.UNLOADING,
+            )
         )
 
     @property
@@ -479,6 +484,11 @@ class EnginePool:
                     # need to be reloaded (or another model will free space)
                     event = entry.drain_complete
 
+                elif entry.state == EngineState.UNLOADING:
+                    # Metal cleanup in progress — wait for it to finish,
+                    # then the model will need to be reloaded.
+                    event = entry.unload_complete
+
                 elif entry.state == EngineState.UNLOADED:
                     # Check if model is too large for memory limit
                     if (
@@ -731,6 +741,20 @@ class EnginePool:
             ModelTooLargeError: If model can't fit even with all non-pinned
                 models evicted (permanent failure, not retryable).
         """
+        # Don't load while another model is still cleaning up Metal resources.
+        # UNLOADING means engine.stop() + mx.synchronize() + mx.clear_cache()
+        # is in progress — Metal buffers are still allocated.
+        for mid, e in self._entries.items():
+            if (
+                e.state == EngineState.UNLOADING
+                and e.unload_complete is not None
+            ):
+                logger.debug(
+                    f"Waiting for {mid} to finish unloading "
+                    f"before loading {entry.model_id}"
+                )
+                return e.unload_complete
+
         # Serialize model loading: only one model may be in LOADING state at
         # a time. Concurrent loads can exhaust Metal memory because weight
         # files are read into GPU memory on the MLX executor thread, and if
@@ -769,7 +793,12 @@ class EnginePool:
                     if e.state == EngineState.LOADING and e.ready_event is not None:
                         return e.ready_event  # Wait for loading model to finish
 
-                # Nothing draining or loading.
+                # Nothing draining or loading — check if something is UNLOADING
+                for mid, e in self._entries.items():
+                    if e.state == EngineState.UNLOADING and e.unload_complete is not None:
+                        return e.unload_complete  # Wait for Metal cleanup
+
+                # Nothing draining, loading, or unloading.
                 # Try without KV headroom as a last resort
                 required_no_headroom = entry.estimated_size
                 if self._committed_memory() + required_no_headroom <= self._max_model_memory:
@@ -1059,6 +1088,10 @@ class EnginePool:
             if inner is not None:
                 if len(getattr(inner, "_output_collectors", {})) > 0:
                     return True
+                # Check if a scheduler step is in flight on the GPU.
+                # Prevents drain from unloading while Metal is computing.
+                if getattr(inner, "_step_in_flight", False):
+                    return True
         # Audio engines: check active_operations counter
         active_ops = getattr(engine, "active_operations", 0)
         if isinstance(active_ops, int) and active_ops > 0:
@@ -1072,7 +1105,7 @@ class EnginePool:
     def _find_drain_or_evict_candidate(self) -> str | None:
         """
         Find the least recently used non-pinned loaded model suitable for
-        eviction or draining. Skips models already in DRAINING state.
+        eviction or draining. Skips models already in DRAINING or UNLOADING state.
 
         Prefers idle models over models with active requests or active
         use-count (request handlers that have acquired the engine via
@@ -1089,6 +1122,8 @@ class EnginePool:
                 continue  # Already being drained
             if e.state == EngineState.LOADING:
                 continue  # Don't evict something being loaded
+            if e.state == EngineState.UNLOADING:
+                continue  # Metal cleanup in progress
             has_active = (
                 self._engine_has_active_work(e.engine) or e.active_uses > 0
             )
@@ -1122,22 +1157,28 @@ class EnginePool:
         """
         entry = self._entries.get(model_id)
         if not entry or entry.engine is None:
-            # Still set state for consistency if entry exists
-            if entry is not None and entry.state != EngineState.UNLOADED:
+            # Still set state for consistency if entry exists.
+            # Don't overwrite UNLOADING — deferred cleanup will handle it.
+            if entry is not None and entry.state not in (
+                EngineState.UNLOADED, EngineState.UNLOADING,
+            ):
                 self._set_state(entry, EngineState.UNLOADED, reason)
             return
 
         logger.info(f"Unloading model: {model_id}")
 
-        # Capture engine reference before clearing it from the entry.
-        # State transition is synchronous (no awaits, safe under lock).
+        # Phase 1: Stop accepting new requests (immediate, safe under lock).
+        # Set UNLOADING — not UNLOADED — so memory accounting keeps this
+        # model's memory committed until Metal buffers are actually freed.
         engine_to_stop = entry.engine
-        entry.engine = None
+        entry.engine = None  # prevent new requests
         entry.last_access = 0.0
-        self._set_state(entry, EngineState.UNLOADED, reason)
+        entry.unload_complete = asyncio.Event()
+        self._set_state(entry, EngineState.UNLOADING, reason)
 
-        # Schedule heavy async cleanup as an independent task so the
+        # Phase 2: Schedule heavy async cleanup as an independent task so the
         # pool lock is NOT held during engine.stop() and mx.clear_cache().
+        # _deferred_engine_cleanup will set state to UNLOADED once Metal is done.
         task = asyncio.create_task(
             self._deferred_engine_cleanup(model_id, engine_to_stop)
         )
@@ -1182,11 +1223,21 @@ class EnginePool:
         # Metal operations with running engines. See issue #85.
         # Synchronize before clearing to prevent releasing Metal buffers
         # still referenced by in-flight command buffers. See issue #300.
-        gc.collect()
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
-        )
+        try:
+            gc.collect()
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
+            )
+        finally:
+            # Phase 2 complete: transition from UNLOADING → UNLOADED.
+            # MUST be in finally — if mx.synchronize/clear_cache fails,
+            # we still need to unblock waiters and free memory accounting.
+            entry = self._entries.get(model_id)
+            if entry is not None and entry.state == EngineState.UNLOADING:
+                self._set_state(entry, EngineState.UNLOADED, "cleanup_complete")
+                if entry.unload_complete is not None:
+                    entry.unload_complete.set()
 
         logger.info(
             f"Unloaded model: {model_id}, "
@@ -1471,6 +1522,8 @@ class EnginePool:
                 # Signal all waiters so they unblock
                 if entry.drain_complete and not entry.drain_complete.is_set():
                     entry.drain_complete.set()
+                if entry.unload_complete and not entry.unload_complete.is_set():
+                    entry.unload_complete.set()
                 if entry.ready_event and not entry.ready_event.is_set():
                     entry.ready_event.set()
 
@@ -1560,6 +1613,29 @@ class EnginePool:
             "timeout_counter": self._timeout_counter,
             "active_models": models,
             "unloaded_count": unloaded_count,
+        }
+
+    def get_crash_diagnostic_snapshot(self) -> dict[str, Any]:
+        """Lock-free snapshot for native crash dumps (e.g. SIGABRT from MLX/Metal).
+
+        Includes :meth:`get_debug_status` plus every discovered model (including
+        UNLOADED) with ``active_uses`` and pinning for eviction analysis.
+        """
+        return {
+            "debug_pool": self.get_debug_status(),
+            "models": {
+                mid: {
+                    "state": e.state.value,
+                    "engine_loaded": e.engine is not None,
+                    "active_uses": e.active_uses,
+                    "is_pinned": e.is_pinned,
+                    "engine_type": e.engine_type,
+                    "model_type": e.model_type,
+                    "estimated_size_bytes": e.estimated_size,
+                }
+                for mid, e in sorted(self._entries.items())
+            },
+            "pending_cleanup_tasks": len(self._cleanup_tasks),
         }
 
     async def check_ttl_expirations(

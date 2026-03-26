@@ -122,6 +122,16 @@ class EngineCore:
         self._start_time: Optional[float] = None
         self._steps_executed = 0
 
+        # True while scheduler.step() is running on the MLX executor thread.
+        # Checked by EnginePool._engine_has_active_work() to prevent the
+        # drain monitor from unloading the model while GPU work is in flight.
+        self._step_in_flight = False
+
+        # Deferred cleanup: request IDs whose _cleanup_request() is deferred
+        # until the current engine loop step completes. Keeps _output_collectors
+        # non-empty so the drain monitor sees active work during abort.
+        self._pending_cleanups: Set[str] = set()
+
         # Global single-thread executor shared across ALL engines.
         # mlx-lm uses a module-level Metal stream, so concurrent MLX calls
         # from different engine threads cause segfaults. See issue #85.
@@ -180,9 +190,13 @@ class EngineCore:
         while self._running:
             try:
                 if self.scheduler.has_requests():
-                    output = await loop.run_in_executor(
-                        self._mlx_executor, self.scheduler.step
-                    )
+                    self._step_in_flight = True
+                    try:
+                        output = await loop.run_in_executor(
+                            self._mlx_executor, self.scheduler.step
+                        )
+                    finally:
+                        self._step_in_flight = False
                     self._steps_executed += 1
 
                     # Fast path: distribute outputs to collectors
@@ -221,7 +235,20 @@ class EngineCore:
                         # request still in scheduler) block the entire event loop,
                         # making the server unresponsive to all HTTP requests.
                         await asyncio.sleep(0)
+
+                    # Process deferred cleanups from abort_request() now that
+                    # the step has completed and outputs have been distributed.
+                    if self._pending_cleanups:
+                        for rid in list(self._pending_cleanups):
+                            self._cleanup_request(rid)
+                        self._pending_cleanups.clear()
                 else:
+                    # No work — still process any pending cleanups from aborts
+                    # that arrived while idle.
+                    if self._pending_cleanups:
+                        for rid in list(self._pending_cleanups):
+                            self._cleanup_request(rid)
+                        self._pending_cleanups.clear()
                     # No work, yield control
                     await asyncio.sleep(step_interval)
 
@@ -250,6 +277,12 @@ class EngineCore:
                     if event:
                         event.set()
                 await asyncio.sleep(0.1)
+
+        # Process any remaining deferred cleanups on loop exit.
+        if self._pending_cleanups:
+            for rid in list(self._pending_cleanups):
+                self._cleanup_request(rid)
+            self._pending_cleanups.clear()
 
     async def add_request(
         self,
@@ -342,9 +375,9 @@ class EngineCore:
         the same execution context as generation (no race conditions).
 
         Signals the consumer (stream_outputs/generate) with an abort error
-        so it can exit gracefully. Cleanup is handled by the consumer's
-        finally block, NOT here -- calling _cleanup_request() immediately
-        after put() would clear the output before the consumer can drain it.
+        so it can exit gracefully. Cleanup of _output_collectors is deferred
+        to the engine loop (after the current step completes) so that the
+        drain monitor sees active work while GPU is still computing.
         """
         result = self.scheduler.abort_request(request_id)
 
@@ -364,6 +397,11 @@ class EngineCore:
         event = self._finished_events.get(request_id)
         if event is not None:
             event.set()
+
+        # Defer cleanup to the engine loop — keeps _output_collectors
+        # non-empty so _engine_has_active_work() returns True until the
+        # in-flight step finishes.
+        self._pending_cleanups.add(request_id)
 
         return result
 
@@ -395,6 +433,9 @@ class EngineCore:
             event = self._finished_events.get(rid)
             if event is not None:
                 event.set()
+        # Defer cleanup so _output_collectors stays non-empty until
+        # the engine loop processes it (same pattern as abort_request).
+        self._pending_cleanups.update(request_ids)
         if request_ids:
             logger.warning(
                 f"Aborted {len(request_ids)} requests due to memory pressure"
@@ -519,10 +560,12 @@ class EngineCore:
             await event.wait()
         except asyncio.CancelledError:
             # Client disconnected or task was cancelled - abort the request
-            # to free scheduler/GPU resources (prevents orphaned requests)
+            # to free scheduler/GPU resources (prevents orphaned requests).
+            # Don't call _cleanup_request() here — abort_request() adds to
+            # _pending_cleanups, and the engine loop handles cleanup after
+            # the current step returns (keeps drain monitor accurate).
             logger.info(f"Request {request_id} cancelled, aborting")
             await self.abort_request(request_id)
-            self._cleanup_request(request_id)
             raise
 
         # Get the final output from collector
