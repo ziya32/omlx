@@ -109,6 +109,9 @@ def model_ids():
     return {"asr": asr, "embedding": embedding}
 
 
+TEST_API_KEY = "test-asr-long-audio-key"
+
+
 @pytest.fixture(scope="session")
 def server_app(model_ids):
     """Start a real omlx server with ASR and embedding models."""
@@ -128,6 +131,7 @@ def server_app(model_ids):
         )
 
         init_server(model_dirs=str(MODEL_DIR), max_model_memory=max_mem)
+        _server_state.api_key = TEST_API_KEY
         _server_state.engine_pool.apply_settings_overrides(settings_mgr)
 
         yield app
@@ -141,12 +145,17 @@ def server_app(model_ids):
 
 @pytest_asyncio.fixture(loop_scope="session", scope="session")
 async def client(server_app):
-    """Async HTTP client for the real omlx server."""
+    """Async HTTP client for the real omlx server.
+
+    Uses a 300s timeout — with SSE streaming each chunk resets the read
+    timeout, so no single wait exceeds this even for multi-hour audio.
+    """
     transport = ASGITransport(app=server_app)
     async with httpx.AsyncClient(
         transport=transport,
         base_url="http://test",
-        timeout=httpx.Timeout(7200.0),  # 2 hours for full 7-hour audio
+        timeout=httpx.Timeout(300.0),
+        headers={"Authorization": f"Bearer {TEST_API_KEY}"},
     ) as ac:
         yield ac
 
@@ -168,25 +177,47 @@ class TestASRWithConcurrentEmbedding:
         self, client, model_ids, audio_file
     ):
         """
-        Start a long ASR transcription, then send embedding requests while
-        it's running. Both should succeed — proving executor yielding works.
+        Start a long ASR transcription via SSE streaming, then send embedding
+        requests while it's running. Both should succeed — proving executor
+        yielding works and the streaming keepalive prevents timeout.
         """
         embedding_results: list[dict] = []
+        progress_events: list[dict] = []
         embedding_model = model_ids["embedding"]
         asr_model = model_ids["asr"]
 
         async def _do_transcription():
-            """Send the full 7-hour audio for transcription."""
+            """Send the full 7-hour audio for streaming transcription."""
+            asr_data = None
             with open(audio_file, "rb") as f:
-                resp = await client.post(
+                async with client.stream(
+                    "POST",
                     "/v1/audio/transcriptions",
                     data={
                         "model": asr_model,
                         "response_format": "verbose_json",
+                        "stream": "true",
                     },
                     files={"file": ("speech.wav", f, "audio/wav")},
-                )
-            return resp
+                ) as resp:
+                    assert resp.status_code == 200
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        payload = line[6:]
+                        if payload == "[DONE]":
+                            break
+                        event = json.loads(payload)
+                        if event.get("type") == "progress":
+                            progress_events.append(event)
+                            chunk = event["chunk"]
+                            total = event["total_chunks"]
+                            print(f"  ASR chunk {chunk}/{total}")
+                        elif event.get("type") == "transcription":
+                            asr_data = event
+                        elif event.get("type") == "error":
+                            pytest.fail(f"ASR error: {event.get('error')}")
+            return asr_data
 
         async def _do_embedding(text: str, idx: int):
             """Send an embedding request and record timing."""
@@ -229,11 +260,14 @@ class TestASRWithConcurrentEmbedding:
         embed_task = asyncio.create_task(_fire_embeddings_during_asr())
 
         # Wait for both
-        asr_resp, _ = await asyncio.gather(asr_task, embed_task)
+        asr_data, _ = await asyncio.gather(asr_task, embed_task)
+
+        # ── Verify streaming progress ──
+        assert len(progress_events) > 0, "No progress events received"
+        print(f"\nReceived {len(progress_events)} progress events")
 
         # ── Verify ASR results ──
-        assert asr_resp.status_code == 200, f"ASR failed: {asr_resp.text[:500]}"
-        asr_data = asr_resp.json()
+        assert asr_data is not None, "No transcription result received"
         assert "text" in asr_data
         assert len(asr_data["text"]) > 100, "Transcription too short"
         assert "segments" in asr_data

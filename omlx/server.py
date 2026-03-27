@@ -49,6 +49,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Optional, Union
 
 from fastapi import Depends, FastAPI, HTTPException, Request as FastAPIRequest
@@ -1922,6 +1923,8 @@ async def create_transcription(
     - language: ISO language code or "auto" (default)
     - prompt: optional text to guide transcription (Whisper models)
     - response_format: "json" (default), "verbose_json", or "text"
+    - stream: "true" to get SSE progress events per chunk (keeps connection
+      alive for long audio). The final event contains the full result.
     """
     import tempfile
 
@@ -1932,6 +1935,7 @@ async def create_transcription(
     language = form.get("language")
     prompt = form.get("prompt")
     response_format = str(form.get("response_format", "json"))
+    stream = str(form.get("stream", "false")).lower() == "true"
 
     if audio_file is None:
         raise HTTPException(status_code=400, detail="Audio file is required")
@@ -1956,6 +1960,14 @@ async def create_transcription(
         tmp.write(content)
         tmp_path = tmp.name
 
+    if stream:
+        return StreamingResponse(
+            _stream_transcription(
+                req_id, model_str, tmp_path, language, prompt, response_format,
+            ),
+            media_type="text/event-stream",
+        )
+
     try:
         start_time = time.perf_counter()
         async with use_engine(model_str, EngineType.ASR) as engine:
@@ -1977,33 +1989,128 @@ async def create_transcription(
             f"duration={output.duration}s"
         )
 
-        if response_format == "text":
-            from fastapi.responses import PlainTextResponse
-            return PlainTextResponse(output.text)
+        return _format_transcription_response(output, response_format)
+    finally:
+        import os
+        os.unlink(tmp_path)
 
-        if response_format == "verbose_json":
-            segments = []
-            if output.segments:
-                for i, seg in enumerate(output.segments):
-                    if isinstance(seg, dict):
-                        segments.append(TranscriptionSegment(
-                            id=seg.get("id", i),
-                            start=seg.get("start", 0.0),
-                            end=seg.get("end", 0.0),
-                            text=seg.get("text", ""),
-                        ))
-            return VerboseTranscriptionResponse(
-                text=output.text,
-                language=output.language,
-                duration=output.duration,
-                segments=segments,
-            )
 
-        return TranscriptionResponse(
+def _format_transcription_response(output, response_format: str):
+    """Build the appropriate response object for a completed transcription."""
+    if response_format == "text":
+        from fastapi.responses import PlainTextResponse
+        return PlainTextResponse(output.text)
+
+    if response_format == "verbose_json":
+        segments = []
+        if output.segments:
+            for i, seg in enumerate(output.segments):
+                if isinstance(seg, dict):
+                    segments.append(TranscriptionSegment(
+                        id=seg.get("id", i),
+                        start=seg.get("start", 0.0),
+                        end=seg.get("end", 0.0),
+                        text=seg.get("text", ""),
+                    ))
+        return VerboseTranscriptionResponse(
             text=output.text,
             language=output.language,
             duration=output.duration,
+            segments=segments,
         )
+
+    return TranscriptionResponse(
+        text=output.text,
+        language=output.language,
+        duration=output.duration,
+    )
+
+
+async def _stream_transcription(
+    req_id: str,
+    model_str: str,
+    tmp_path: str,
+    language: str,
+    prompt: str | None,
+    response_format: str,
+):
+    """SSE generator that yields progress events during transcription.
+
+    Each chunk completion sends a progress event so the HTTP connection
+    stays alive — the client's read timeout resets on every received event,
+    allowing transcription of arbitrarily long audio files.
+
+    Events:
+        data: {"type":"progress","chunk":1,"total_chunks":10,"chunk_text":"..."}
+        data: {"type":"transcription","text":"...","language":"en","duration":3600.0}
+        data: [DONE]
+    """
+    progress_queue: asyncio.Queue = asyncio.Queue()
+
+    async def _on_progress(*, chunk: int, total_chunks: int, chunk_text: str):
+        await progress_queue.put({
+            "type": "progress",
+            "chunk": chunk,
+            "total_chunks": total_chunks,
+            "chunk_text": chunk_text,
+        })
+
+    try:
+        start_time = time.perf_counter()
+
+        # Run transcription in a background task so we can yield SSE events
+        # from the progress queue concurrently.
+        async def _run_transcription():
+            async with use_engine(model_str, EngineType.ASR) as engine:
+                return await engine.transcribe(
+                    tmp_path,
+                    language=language,
+                    prompt=str(prompt) if prompt else None,
+                    on_progress=_on_progress,
+                )
+
+        task = asyncio.create_task(_run_transcription())
+
+        # Yield progress events as they arrive. When the task completes,
+        # it stops producing events and we break out.
+        while not task.done():
+            try:
+                event = await asyncio.wait_for(progress_queue.get(), timeout=1.0)
+                yield f"data: {json.dumps(event)}\n\n"
+            except asyncio.TimeoutError:
+                continue
+
+        # Drain any remaining progress events
+        while not progress_queue.empty():
+            event = progress_queue.get_nowait()
+            yield f"data: {json.dumps(event)}\n\n"
+
+        output = await task  # propagate exceptions
+        elapsed = time.perf_counter() - start_time
+
+        logger.info(
+            f"Transcription [{req_id}]: {elapsed:.3f}s, "
+            f"language={output.language}, "
+            f"duration={output.duration}s"
+        )
+
+        # Final result event
+        result = {
+            "type": "transcription",
+            "text": output.text,
+            "language": output.language,
+            "duration": output.duration,
+        }
+        if response_format == "verbose_json" and output.segments:
+            result["segments"] = [
+                {"id": i, "start": s.get("start", 0.0), "end": s.get("end", 0.0), "text": s.get("text", "")}
+                for i, s in enumerate(output.segments) if isinstance(s, dict)
+            ]
+        yield f"data: {json.dumps(result)}\n\n"
+        yield "data: [DONE]\n\n"
+    except Exception as e:
+        yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+        yield "data: [DONE]\n\n"
     finally:
         import os
         os.unlink(tmp_path)
@@ -2156,6 +2263,24 @@ async def create_speech(
     )
 
 
+def _read_speakers_from_config(model_path: str) -> list[str]:
+    """Read TTS speaker list from model config.json without loading the engine."""
+    config_path = Path(model_path) / "config.json"
+    if not config_path.exists():
+        return []
+    try:
+        with open(config_path) as f:
+            config = json.load(f)
+        # VoiceDesign and Base models don't have preset speakers
+        if config.get("tts_model_type") in ("voice_design", "base"):
+            return []
+        talker_config = config.get("talker_config", {})
+        spk_id = talker_config.get("spk_id", {})
+        return list(spk_id.keys())
+    except Exception:
+        return []
+
+
 @app.get("/v1/audio/speakers")
 async def list_speakers(
     model: str | None = None,
@@ -2164,27 +2289,36 @@ async def list_speakers(
     """
     List available TTS speakers for a CustomVoice model.
 
-    Returns an empty list for VoiceDesign models (use instructions instead).
+    Reads the speaker list from the model's config.json on disk — does NOT
+    load the engine, so this endpoint is cheap and won't trigger model swaps.
+
+    Returns an empty list for VoiceDesign/Base models (use instructions instead).
     """
+    pool = get_engine_pool()
+
     if model is None:
-        # Try to find any loaded TTS model
-        pool = get_engine_pool()
+        # Find any TTS model (prefer loaded, fall back to any discovered)
         for mid, entry in pool._entries.items():
             if entry.engine_type == "tts" and entry.engine is not None:
                 model = mid
                 break
         if model is None:
+            for mid, entry in pool._entries.items():
+                if entry.engine_type == "tts":
+                    model = mid
+                    break
+        if model is None:
             raise HTTPException(
                 status_code=400,
-                detail="No TTS model specified and none currently loaded"
+                detail="No TTS model found"
             )
 
-    async with use_engine(model, EngineType.TTS) as engine:
-        speakers = engine.get_speakers()
+    entry = pool._entries.get(model)
+    if entry is None or entry.engine_type != "tts":
+        raise HTTPException(status_code=400, detail=f"Model {model} is not a TTS model")
 
-    return SpeakersResponse(
-        speakers=speakers,
-    )
+    speakers = _read_speakers_from_config(entry.model_path)
+    return SpeakersResponse(speakers=speakers)
 
 
 @app.get("/v1/audio/languages")

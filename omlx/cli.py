@@ -277,17 +277,16 @@ def serve_command(args):
         _faulthandler_crash_logfp = None
         fh_for_faulthandler = sys.stderr
 
-    try:
-        fh_for_faulthandler.write(
-            "\n--- native crash dumps (memory + thread stacks) append below ---\n"
-        )
-        fh_for_faulthandler.flush()
-    except OSError:
-        pass
-
     faulthandler.enable(file=fh_for_faulthandler, all_threads=True)
 
     def _sigabrt_handler(_signum, _frame):
+        try:
+            fh_for_faulthandler.write(
+                "\n--- native crash dumps (memory + thread stacks) append below ---\n"
+            )
+            fh_for_faulthandler.flush()
+        except OSError:
+            pass
         try:
             _write_abort_memory_snapshot(fh_for_faulthandler)
         except Exception:

@@ -84,6 +84,7 @@ class ASREngine(BaseNonStreamingEngine):
         audio_path: str,
         language: str = "auto",
         prompt: str | None = None,
+        on_progress: Any | None = None,
     ) -> TranscriptionOutput:
         """
         Transcribe audio file to text.
@@ -111,7 +112,7 @@ class ASREngine(BaseNonStreamingEngine):
         start_time = time.perf_counter()
 
         try:
-            return await self._do_transcribe(model, audio_path, language, prompt)
+            return await self._do_transcribe(model, audio_path, language, prompt, on_progress)
         finally:
             elapsed = time.perf_counter() - start_time
             self._active_operations -= 1
@@ -124,6 +125,7 @@ class ASREngine(BaseNonStreamingEngine):
         audio_path: str,
         language: str,
         prompt: str | None,
+        on_progress: Any | None = None,
     ) -> TranscriptionOutput:
         loop = asyncio.get_running_loop()
         executor = get_mlx_executor()
@@ -211,6 +213,13 @@ class ASREngine(BaseNonStreamingEngine):
             )
 
             all_texts.append(result.text or "")
+
+            if on_progress is not None:
+                await on_progress(
+                    chunk=len(all_texts),
+                    total_chunks=len(chunks),
+                    chunk_text=result.text or "",
+                )
 
             raw_lang = result.language
             if isinstance(raw_lang, list):

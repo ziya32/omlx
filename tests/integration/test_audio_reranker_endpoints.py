@@ -10,6 +10,7 @@ import io
 import json
 import struct
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -48,7 +49,7 @@ class MockASREngine(ASREngine):
     async def stop(self):
         pass
 
-    async def transcribe(self, audio_path, language="auto", prompt=None):
+    async def transcribe(self, audio_path, language="auto", prompt=None, on_progress=None):
         return TranscriptionOutput(
             text="This is a test transcription.",
             language="en",
@@ -201,7 +202,7 @@ class MockBaseEngine:
 class MockEnginePool:
     """Mock engine pool supporting LLM, ASR, TTS, and LLM reranker engines."""
 
-    def __init__(self):
+    def __init__(self, tts_model_dir: str = ""):
         self._llm_engine = MockBaseEngine()
         self._asr_engine = MockASREngine()
         self._tts_engine = MockTTSEngine()
@@ -209,7 +210,7 @@ class MockEnginePool:
         self._entries = {
             "test-llm-model": MagicMock(engine_type="batched", engine=self._llm_engine),
             "test-asr-model": MagicMock(engine_type="asr", engine=self._asr_engine),
-            "test-tts-model": MagicMock(engine_type="tts", engine=self._tts_engine),
+            "test-tts-model": MagicMock(engine_type="tts", engine=self._tts_engine, model_path=tts_model_dir),
             "test-llm-reranker": MagicMock(engine_type="llm_reranker", engine=self._llm_reranker_engine),
         }
 
@@ -259,11 +260,21 @@ class MockEnginePool:
 
 
 @pytest.fixture
-def client():
+def client(tmp_path):
     """Create a test client with mock engines for audio and reranker endpoints."""
+    import json as _json
     from omlx.server import app, _server_state
 
-    pool = MockEnginePool()
+    # Write a TTS config.json so /v1/audio/speakers can read speakers from disk
+    tts_dir = tmp_path / "test-tts-model"
+    tts_dir.mkdir()
+    (tts_dir / "config.json").write_text(_json.dumps({
+        "talker_config": {
+            "spk_id": {"ryan": 1, "vivian": 2, "emma": 3}
+        }
+    }))
+
+    pool = MockEnginePool(tts_model_dir=str(tts_dir))
 
     original_pool = _server_state.engine_pool
     original_default = _server_state.default_model
@@ -367,6 +378,44 @@ class TestTranscriptionEndpoint:
         buf.write(struct.pack("<I", 0))       # data size
         buf.seek(0)
         return buf
+
+
+class TestStreamingTranscription:
+    """Tests for POST /v1/audio/transcriptions with stream=true."""
+
+    def test_streaming_returns_sse_events(self, client):
+        """Streaming transcription returns SSE progress + result events."""
+        wav = TestTranscriptionEndpoint._make_wav()
+        response = client.post(
+            "/v1/audio/transcriptions",
+            data={"model": "test-asr-model", "language": "en", "stream": "true"},
+            files={"file": ("test.wav", wav, "audio/wav")},
+        )
+
+        assert response.status_code == 200
+        assert "text/event-stream" in response.headers["content-type"]
+
+        events = []
+        for line in response.text.strip().split("\n"):
+            if line.startswith("data: ") and line[6:] != "[DONE]":
+                events.append(json.loads(line[6:]))
+
+        # Must have at least the final transcription event
+        assert any(e["type"] == "transcription" for e in events)
+        result = [e for e in events if e["type"] == "transcription"][0]
+        assert result["text"] == "This is a test transcription."
+
+    def test_streaming_ends_with_done(self, client):
+        """SSE stream must end with [DONE] sentinel."""
+        wav = TestTranscriptionEndpoint._make_wav()
+        response = client.post(
+            "/v1/audio/transcriptions",
+            data={"model": "test-asr-model", "language": "en", "stream": "true"},
+            files={"file": ("test.wav", wav, "audio/wav")},
+        )
+
+        assert response.status_code == 200
+        assert response.text.rstrip().endswith("data: [DONE]")
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -591,6 +640,56 @@ class TestSpeakersEndpoint:
         assert response.status_code == 200
         data = response.json()
         assert "speakers" in data
+
+
+class TestSpeakersFromDisk:
+    """Verify _read_speakers_from_config works for all real TTS models on disk."""
+
+    MODEL_DIRS = ["/Volumes/SD-1TB/hot-models", str(Path.home() / ".myemee/models")]
+
+    @staticmethod
+    def _find_tts_models():
+        """Discover TTS model directories (have config.json with tts-related keys)."""
+        models = []
+        for base in TestSpeakersFromDisk.MODEL_DIRS:
+            base_path = Path(base)
+            if not base_path.is_dir():
+                continue
+            for d in sorted(base_path.iterdir()):
+                cfg = d / "config.json"
+                if not cfg.exists():
+                    continue
+                try:
+                    with open(cfg) as f:
+                        c = json.load(f)
+                    if "talker_config" in c or c.get("tts_model_type"):
+                        models.append(d)
+                except Exception:
+                    continue
+        return models
+
+    def test_all_tts_models_readable(self):
+        """Every TTS model on disk must have a parseable config.json for speakers."""
+        from omlx.server import _read_speakers_from_config
+
+        models = self._find_tts_models()
+        if not models:
+            pytest.skip("No TTS models found on disk")
+
+        for model_dir in models:
+            with open(model_dir / "config.json") as f:
+                config = json.load(f)
+            variant = config.get("tts_model_type", "custom_voice")
+            speakers = _read_speakers_from_config(str(model_dir))
+
+            if variant == "custom_voice":
+                assert len(speakers) > 0, (
+                    f"{model_dir.name}: custom_voice model must have speakers in config.json"
+                )
+            else:
+                assert speakers == [], (
+                    f"{model_dir.name}: {variant} model should return empty speakers"
+                )
 
 
 class TestLanguagesEndpoint:

@@ -215,10 +215,7 @@ class TestCheckAndEnforce:
         enforcer._engine_pool._entries = {}
 
         with patch("omlx.process_memory_enforcer.mx") as mock_mx:
-            mock_mx.get_active_memory.side_effect = [
-                15 * 1024**3,  # Initial check
-                15 * 1024**3,  # Re-check
-            ]
+            mock_mx.get_active_memory.return_value = 15 * 1024**3
             await enforcer._check_and_enforce()
         # Should not raise, just log warning
 
@@ -366,11 +363,11 @@ class TestSingleModelMemoryPressure:
         enforcer._engine_pool._entries = {"big-model": entry}
         enforcer._engine_pool._find_drain_or_evict_candidate.return_value = "big-model"
 
-        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
-            mock_mx.get_active_memory.side_effect = [
-                15 * 1024**3,  # Initial check
-                15 * 1024**3,  # While loop check
-            ]
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch("omlx.settings.get_system_memory", return_value=16 * 1024**3),
+        ):
+            mock_mx.get_active_memory.return_value = 15 * 1024**3
             await enforcer._check_and_enforce()
 
         engine.abort_all_requests.assert_awaited_once()
@@ -386,11 +383,11 @@ class TestSingleModelMemoryPressure:
         enforcer._engine_pool._entries = {"big-model": entry}
         enforcer._engine_pool._find_drain_or_evict_candidate.return_value = "big-model"
 
-        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
-            mock_mx.get_active_memory.side_effect = [
-                15 * 1024**3,
-                15 * 1024**3,
-            ]
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch("omlx.settings.get_system_memory", return_value=16 * 1024**3),
+        ):
+            mock_mx.get_active_memory.return_value = 15 * 1024**3
             await enforcer._check_and_enforce()
 
         engine.abort_all_requests.assert_awaited_once()
@@ -464,7 +461,12 @@ class TestSingleModelMemoryPressure:
 
         enforcer._engine_pool._unload_engine.side_effect = fake_unload
 
-        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            # Mock system memory so hard_limit (16-4=12GB) < 15GB,
+            # triggering abort on the remaining single model.
+            patch("omlx.settings.get_system_memory", return_value=16 * 1024**3),
+        ):
             # Memory stays over limit throughout
             mock_mx.get_active_memory.return_value = 15 * 1024**3
             await enforcer._check_and_enforce()
