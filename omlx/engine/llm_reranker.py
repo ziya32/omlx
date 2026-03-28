@@ -14,12 +14,14 @@ Key advantages over standalone reranker:
 - Shared EnginePool memory management
 """
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Any, Dict
 
 import mlx.core as mx
 
+from ..engine_core import get_mlx_executor
 from ..models.reranker import RerankOutput
 from ..request import SamplingParams
 from .base import BaseNonStreamingEngine
@@ -107,6 +109,7 @@ class LLMRerankerEngine(BaseNonStreamingEngine):
         yes_id = tokenizer.encode("yes", add_special_tokens=False)[0]
         no_id = tokenizer.encode("no", add_special_tokens=False)[0]
 
+        loop = asyncio.get_running_loop()
         total_tokens = 0
         scores = []
 
@@ -128,10 +131,18 @@ class LLMRerankerEngine(BaseNonStreamingEngine):
             total_tokens += output.prompt_tokens + output.completion_tokens
 
             if output.last_logits is not None:
-                logits = mx.array(output.last_logits)
-                probs = mx.softmax(logits[mx.array([yes_id, no_id])])
-                mx.eval(probs)
-                scores.append(float(probs[0].item()))
+                last_logits = output.last_logits
+
+                def _score_logits(logits_data=last_logits):
+                    logits = mx.array(logits_data)
+                    probs = mx.softmax(logits[mx.array([yes_id, no_id])])
+                    mx.eval(probs)
+                    return float(probs[0].item())
+
+                score = await loop.run_in_executor(
+                    get_mlx_executor(), _score_logits,
+                )
+                scores.append(score)
             else:
                 # Fallback: no logits captured, score as 0
                 logger.warning(
