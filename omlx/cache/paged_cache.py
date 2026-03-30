@@ -1134,10 +1134,11 @@ class PagedCacheManager(CacheManager):
 
             self.request_tables[new_request_id] = new_table
 
-            logger.debug(
-                f"Forked block table: {source_table.request_id} -> {new_request_id}, "
-                f"blocks={len(new_table.block_ids)}"
-            )
+            if __debug__:
+                logger.debug(
+                    f"Forked block table: {source_table.request_id} -> {new_request_id}, "
+                    f"blocks={len(new_table.block_ids)}"
+                )
 
             return new_table
 
@@ -1192,9 +1193,10 @@ class PagedCacheManager(CacheManager):
         if source_block.ref_count == 1:
             self.stats.shared_blocks -= 1
 
-        logger.debug(
-            f"COW copy: block {source_block.block_id} -> {new_block.block_id}"
-        )
+        if __debug__:
+            logger.debug(
+                f"COW copy: block {source_block.block_id} -> {new_block.block_id}"
+            )
 
         return new_block
 
@@ -1444,10 +1446,11 @@ class PagedCacheManager(CacheManager):
             # In paged SSD-only mode, data is already on paged SSD
             self.stats.evictions += 1
 
-            logger.debug(
-                f"Marked block {block_id} "
-                f"(hash={block.block_hash.hex()[:16] if block.block_hash else 'None'}...)"
-            )
+            if __debug__:
+                logger.debug(
+                    f"Marked block {block_id} "
+                    f"(hash={block.block_hash.hex()[:16] if block.block_hash else 'None'}...)"
+                )
             return True
 
     def evict_block_permanently(self, block_id: int) -> bool:
@@ -1501,7 +1504,8 @@ class PagedCacheManager(CacheManager):
             self.stats.free_blocks += 1
             self.stats.evictions += 1
 
-            logger.debug(f"Permanently evicted block {block_id}")
+            if __debug__:
+                logger.debug(f"Permanently evicted block {block_id}")
             return True
 
     def restore_block(
@@ -1530,10 +1534,11 @@ class PagedCacheManager(CacheManager):
 
             block.touch()
 
-            logger.debug(
-                f"Block {block_id} touched "
-                f"(hash={block.block_hash.hex()[:16] if block.block_hash else 'None'}...)"
-            )
+            if __debug__:
+                logger.debug(
+                    f"Block {block_id} touched "
+                    f"(hash={block.block_hash.hex()[:16] if block.block_hash else 'None'}...)"
+                )
             return True
 
     def get_cold_blocks(self) -> List[CacheBlock]:

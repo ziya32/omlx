@@ -68,7 +68,8 @@ class AppUpdater:
                 shutil.rmtree(staged)
                 logger.info("Cleaned up leftover staged update")
         except Exception as e:
-            logger.debug(f"Staged app cleanup failed: {e}")
+            if __debug__:
+                logger.debug(f"Staged app cleanup failed: {e}")
 
     def start(self):
         """Start the update process in a background thread."""

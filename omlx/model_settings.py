@@ -148,7 +148,8 @@ class ModelSettingsManager:
         If the file doesn't exist or is invalid, starts with empty settings.
         """
         if not self.settings_file.exists():
-            logger.debug(f"Settings file not found: {self.settings_file}")
+            if __debug__:
+                logger.debug(f"Settings file not found: {self.settings_file}")
             self._settings = {}
             return
 
@@ -204,7 +205,8 @@ class ModelSettingsManager:
                 json.dump(data, f, indent=2, ensure_ascii=False)
 
             temp_file.replace(self.settings_file)
-            logger.debug(f"Saved settings for {len(self._settings)} models")
+            if __debug__:
+                logger.debug(f"Saved settings for {len(self._settings)} models")
 
         except Exception as e:
             logger.error(f"Failed to save settings file: {e}")

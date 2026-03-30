@@ -66,7 +66,8 @@ class CacheTypeRegistry:
             handler: Handler instance to register
         """
         cls._handlers[handler.cache_type] = handler
-        logger.debug(f"Registered handler for {handler.cache_type.value}")
+        if __debug__:
+            logger.debug(f"Registered handler for {handler.cache_type.value}")
 
     @classmethod
     def get_handler(cls, cache_type: CacheType) -> CacheTypeHandler:
@@ -80,7 +81,8 @@ class CacheTypeRegistry:
         """
         handler = cls._handlers.get(cache_type)
         if handler is None:
-            logger.debug(f"No handler for {cache_type}, using default")
+            if __debug__:
+                logger.debug(f"No handler for {cache_type}, using default")
             return cls._default_handler
         return handler
 
@@ -100,7 +102,8 @@ class CacheTypeRegistry:
 
         cache_type = cls._class_name_map.get(class_name)
         if cache_type is None:
-            logger.debug(f"Unknown cache class '{class_name}', using default handler")
+            if __debug__:
+                logger.debug(f"Unknown cache class '{class_name}', using default handler")
             return cls._default_handler
         return cls.get_handler(cache_type)
 
@@ -137,7 +140,8 @@ class CacheTypeRegistry:
             ):
                 return CacheType.ARRAYS_CACHE
 
-            logger.debug(f"Could not detect cache type for {class_name}, assuming KVCache")
+            if __debug__:
+                logger.debug(f"Could not detect cache type for {class_name}, assuming KVCache")
             return CacheType.KVCACHE
 
         return cache_type

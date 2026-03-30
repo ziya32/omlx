@@ -137,7 +137,8 @@ class EngineCore:
         # from different engine threads cause segfaults. See issue #85.
         self._mlx_executor = get_mlx_executor()
 
-        logger.debug(f"Engine {self._engine_id} initialized")
+        if __debug__:
+            logger.debug(f"Engine {self._engine_id} initialized")
 
     async def start(self) -> None:
         """Start the engine loop."""
@@ -438,7 +439,8 @@ class EngineCore:
         self._pending_cleanups.update(request_ids)
         if request_ids:
             logger.warning(
-                f"Aborted {len(request_ids)} requests due to memory pressure"
+                f"Aborted {len(request_ids)} requests due to memory pressure: "
+                f"{list(request_ids)}"
             )
         return len(request_ids)
 
@@ -465,7 +467,8 @@ class EngineCore:
         """
         await asyncio.sleep(delay)
         if request_id in self._output_collectors:
-            logger.debug(f"Delayed cleanup for request {request_id}")
+            if __debug__:
+                logger.debug(f"Delayed cleanup for request {request_id}")
             self._cleanup_request(request_id)
 
     async def stream_outputs(
@@ -542,30 +545,33 @@ class EngineCore:
         Returns:
             Final RequestOutput with complete text
         """
-        request_id = await self.add_request(
-            prompt=prompt,
-            sampling_params=sampling_params,
-            request_id=request_id,
-            **kwargs,
-        )
-
-        # Wait for completion using event instead of streaming
-        # This avoids the waiting_consumer tracking overhead
-        event = self._finished_events.get(request_id)
-        if event is None:
-            raise RuntimeError(f"No event for request {request_id}")
-
+        submitted = False
         try:
+            request_id = await self.add_request(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                request_id=request_id,
+                **kwargs,
+            )
+            submitted = True
+
+            # Wait for completion using event instead of streaming
+            # This avoids the waiting_consumer tracking overhead
+            event = self._finished_events.get(request_id)
+            if event is None:
+                raise RuntimeError(f"No event for request {request_id}")
+
             # Wait for the request to finish
             await event.wait()
         except asyncio.CancelledError:
             # Client disconnected or task was cancelled - abort the request
             # to free scheduler/GPU resources (prevents orphaned requests).
-            # Don't call _cleanup_request() here — abort_request() adds to
-            # _pending_cleanups, and the engine loop handles cleanup after
-            # the current step returns (keeps drain monitor accurate).
-            logger.info(f"Request {request_id} cancelled, aborting")
-            await self.abort_request(request_id)
+            # The cancel can arrive during add_request() (run_in_executor)
+            # after the scheduler has already accepted the request, so we
+            # must abort whenever the request was submitted.
+            if submitted:
+                logger.info(f"Request {request_id} cancelled, aborting")
+                await self.abort_request(request_id)
             raise
 
         # Get the final output from collector
@@ -668,7 +674,8 @@ class EngineCore:
             registry = get_registry()
             registry.release(self.model, self._engine_id)
             self._owns_model = False
-            logger.debug(f"Engine {self._engine_id} released model ownership")
+            if __debug__:
+                logger.debug(f"Engine {self._engine_id} released model ownership")
 
     def close(self) -> None:
         """
@@ -686,7 +693,8 @@ class EngineCore:
             registry = get_registry()
             registry.release(self.model, self._engine_id)
             self._owns_model = False
-            logger.debug(f"Engine {self._engine_id} released model ownership")
+            if __debug__:
+                logger.debug(f"Engine {self._engine_id} released model ownership")
 
         self._closed = True
 
@@ -707,7 +715,8 @@ class EngineCore:
         self.tokenizer = None
         self.scheduler = None
 
-        logger.debug(f"Engine {self._engine_id} closed")
+        if __debug__:
+            logger.debug(f"Engine {self._engine_id} closed")
 
     def __del__(self):
         """Cleanup on destruction."""

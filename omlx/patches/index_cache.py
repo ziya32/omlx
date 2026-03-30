@@ -213,9 +213,10 @@ def apply_index_cache(model: Any, index_cache_freq: int) -> bool:
 
     model_type = _get_model_type(model)
     if model_type not in _SUPPORTED_MODEL_TYPES:
-        logger.debug(
-            f"IndexCache: model_type '{model_type}' not supported, skipping"
-        )
+        if __debug__:
+            logger.debug(
+                f"IndexCache: model_type '{model_type}' not supported, skipping"
+            )
         return False
 
     if index_cache_freq < 2:

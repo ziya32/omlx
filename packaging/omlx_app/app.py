@@ -306,7 +306,8 @@ class OMLXAppDelegate(NSObject):
 
             self._last_update_check = now
         except Exception as e:
-            logger.debug(f"Update check failed: {e}")
+            if __debug__:
+                logger.debug(f"Update check failed: {e}")
             self._update_info = None
 
     def _is_newer_version(self, latest: str, current: str) -> bool:
@@ -493,7 +494,8 @@ class OMLXAppDelegate(NSObject):
                 icon.setSize_((16, 16))
                 return icon
         except Exception as e:
-            logger.debug(f"Failed to load SF Symbol {sf_symbol}: {e}")
+            if __debug__:
+                logger.debug(f"Failed to load SF Symbol {sf_symbol}: {e}")
         return None
 
     def _get_status_display(self):

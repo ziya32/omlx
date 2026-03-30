@@ -130,7 +130,8 @@ class BatchedEngine(BaseEngine):
                     model_type = args.model_type
                     return model_type if isinstance(model_type, str) else None
         except Exception as e:
-            logger.debug(f"Error getting model_type: {e}")
+            if __debug__:
+                logger.debug(f"Error getting model_type: {e}")
         return None
 
     @property
@@ -538,15 +539,17 @@ class BatchedEngine(BaseEngine):
         if kwargs.get("specprefill_system_end") is not None:
             specprefill_kwargs["specprefill_system_end"] = kwargs.pop("specprefill_system_end")
 
-        request_id = await self._engine.add_request(
-            prompt=prompt,
-            sampling_params=sampling_params,
-            request_id=request_id,
-            **specprefill_kwargs,
-        )
-
+        submitted = False
         finished_normally = False
         try:
+            request_id = await self._engine.add_request(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                request_id=request_id,
+                **specprefill_kwargs,
+            )
+            submitted = True
+
             async for output in self._engine.stream_outputs(request_id):
                 text = clean_special_tokens(output.output_text)
 
@@ -574,11 +577,12 @@ class BatchedEngine(BaseEngine):
             logger.info(f"[stream_generate] CancelledError for request {request_id}")
         finally:
             # Abort the request if client disconnected before completion
-            if not finished_normally:
+            if submitted and not finished_normally:
                 logger.info(f"[stream_generate] Aborting request {request_id} (finished_normally={finished_normally})")
                 await self._engine.abort_request(request_id)
-            else:
-                logger.debug(f"[stream_generate] Request {request_id} finished normally")
+            elif submitted:
+                if __debug__:
+                    logger.debug(f"[stream_generate] Request {request_id} finished normally")
 
     async def chat(
         self,

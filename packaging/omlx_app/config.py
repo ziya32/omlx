@@ -153,7 +153,8 @@ class ServerConfig:
             return resp.status_code == 200
 
         except requests.RequestException as e:
-            logger.debug(f"Failed to update API key on running server: {e}")
+            if __debug__:
+                logger.debug(f"Failed to update API key on running server: {e}")
             return False
 
     def load_server_settings(self) -> dict:

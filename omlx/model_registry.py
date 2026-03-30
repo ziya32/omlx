@@ -97,7 +97,8 @@ class ModelRegistry:
 
             # Register new owner
             self._owners[model_id] = (weakref.ref(engine), engine_id)
-            logger.debug(f"Engine {engine_id} acquired model {model_id}")
+            if __debug__:
+                logger.debug(f"Engine {engine_id} acquired model {model_id}")
             return True
 
     def release(self, model: Any, engine_id: str) -> bool:
@@ -118,7 +119,8 @@ class ModelRegistry:
                 _, owner_id = self._owners[model_id]
                 if owner_id == engine_id:
                     del self._owners[model_id]
-                    logger.debug(f"Engine {engine_id} released model {model_id}")
+                    if __debug__:
+                        logger.debug(f"Engine {engine_id} released model {model_id}")
                     return True
         return False
 
@@ -166,7 +168,8 @@ class ModelRegistry:
                 del self._owners[model_id]
                 cleaned += 1
         if cleaned:
-            logger.debug(f"Cleaned up {cleaned} stale registry entries")
+            if __debug__:
+                logger.debug(f"Cleaned up {cleaned} stale registry entries")
         return cleaned
 
     def get_stats(self) -> Dict[str, Any]:

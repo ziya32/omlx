@@ -94,7 +94,7 @@ class TestDetectModelType:
             "architectures": ["Qwen3ForCausalLM"],
         }
         (reranker_dir / "config.json").write_text(json.dumps(config))
-        assert detect_model_type(reranker_dir) == "llm_reranker"
+        assert detect_model_type(reranker_dir) == "reranker"
 
     def test_detect_causal_lm_embedding(self, tmp_path):
         """Test detection of CausalLM-based embedding (e.g., Qwen3-Embedding)."""
@@ -205,15 +205,6 @@ class TestDetectModelType:
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "llm"
-
-    def test_detect_qwen3_embedding_by_architecture(self, tmp_path):
-        """Qwen3 with TextEmbedding architecture should be embedding."""
-        config = {
-            "model_type": "qwen3",
-            "architectures": ["Qwen3ForTextEmbedding"],
-        }
-        (tmp_path / "config.json").write_text(json.dumps(config))
-        assert detect_model_type(tmp_path) == "embedding"
 
     def test_detect_qwen3_no_architecture_defaults_to_llm(self, tmp_path):
         """Qwen3 without architectures field should default to LLM."""

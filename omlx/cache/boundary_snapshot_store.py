@@ -170,7 +170,8 @@ class BoundarySnapshotSSDStore:
             return True
 
         except Exception as e:
-            logger.debug("Failed to save boundary snapshot: %s", e)
+            if __debug__:
+                logger.debug("Failed to save boundary snapshot: %s", e)
             return False
 
     def load(
@@ -218,10 +219,11 @@ class BoundarySnapshotSSDStore:
                 return None
             return self._reconstruct_from_safetensors(arrays, metadata)
         except Exception as e:
-            logger.debug(
-                "Failed to load boundary snapshot %s/%d: %s",
-                request_id, token_count, e,
-            )
+            if __debug__:
+                logger.debug(
+                    "Failed to load boundary snapshot %s/%d: %s",
+                    request_id, token_count, e,
+                )
             return None
 
     def has(self, request_id: str, token_count: int) -> bool:
@@ -260,7 +262,8 @@ class BoundarySnapshotSSDStore:
             try:
                 shutil.rmtree(req_dir)
             except Exception as e:
-                logger.debug("Failed to clean up snapshots for %s: %s", request_id, e)
+                if __debug__:
+                    logger.debug("Failed to clean up snapshots for %s: %s", request_id, e)
 
     def cleanup_all(self) -> None:
         """Delete all snapshot files (for reset/startup)."""
@@ -285,7 +288,8 @@ class BoundarySnapshotSSDStore:
             try:
                 shutil.rmtree(self._snapshot_dir)
             except Exception as e:
-                logger.debug("Failed to clean up all boundary snapshots: %s", e)
+                if __debug__:
+                    logger.debug("Failed to clean up all boundary snapshots: %s", e)
         self._snapshot_dir.mkdir(parents=True, exist_ok=True)
 
     def shutdown(self) -> None:
@@ -331,7 +335,8 @@ class BoundarySnapshotSSDStore:
                 _write_safetensors_no_mx(str(temp_path), tensors_raw, metadata)
                 os.rename(str(temp_path), str(file_path))
             except Exception as e:
-                logger.debug("Background snapshot write failed: %s", e)
+                if __debug__:
+                    logger.debug("Background snapshot write failed: %s", e)
                 for p in (temp_path, file_path):
                     try:
                         if p is not None and p.exists():

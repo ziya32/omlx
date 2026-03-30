@@ -620,11 +620,12 @@ def _extract_tool_result_content(
     if max_tokens and tokenizer and result_text:
         result_text = truncate_tool_result(result_text, max_tokens, tokenizer)
     elif max_tokens is not None:
-        logger.debug(
-            f"Tool result skip truncation: max_tokens={max_tokens}, "
-            f"has_tokenizer={tokenizer is not None}, "
-            f"result_len={len(result_text) if result_text else 0}"
-        )
+        if __debug__:
+            logger.debug(
+                f"Tool result skip truncation: max_tokens={max_tokens}, "
+                f"has_tokenizer={tokenizer is not None}, "
+                f"result_len={len(result_text) if result_text else 0}"
+            )
 
     return result_text
 

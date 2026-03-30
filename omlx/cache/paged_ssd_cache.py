@@ -671,10 +671,11 @@ class PagedSSDCacheManager(CacheManager):
             self._write_queue.put_nowait(
                 (block_hash, tensors_raw, metadata, file_path)
             )
-            logger.debug(
-                f"Evicted hot cache block to SSD write queue: "
-                f"{block_hash.hex()[:16]}..."
-            )
+            if __debug__:
+                logger.debug(
+                    f"Evicted hot cache block to SSD write queue: "
+                    f"{block_hash.hex()[:16]}..."
+                )
             return True
         except queue.Full:
             logger.warning(
@@ -835,7 +836,8 @@ class PagedSSDCacheManager(CacheManager):
                 layer_meta_states=layer_meta_states,
             )
         except Exception as e:
-            logger.debug(f"Failed to read metadata from {file_path}: {e}")
+            if __debug__:
+                logger.debug(f"Failed to read metadata from {file_path}: {e}")
             return None
 
     def _writer_loop(self) -> None:
@@ -882,10 +884,11 @@ class PagedSSDCacheManager(CacheManager):
 
                 # Check if block was evicted while write was pending
                 if not self._index.contains(block_hash):
-                    logger.debug(
-                        f"Block {block_hash.hex()[:16]} evicted during write, "
-                        f"cleaning up file"
-                    )
+                    if __debug__:
+                        logger.debug(
+                            f"Block {block_hash.hex()[:16]} evicted during write, "
+                            f"cleaning up file"
+                        )
                     try:
                         file_path.unlink()
                     except Exception:
@@ -1146,10 +1149,11 @@ class PagedSSDCacheManager(CacheManager):
                 return False
 
             self._stats["saves"] += 1
-            logger.debug(
-                f"Enqueued block for SSD cache write: {block_hash.hex()[:16]}..., "
-                f"size={format_bytes(estimated_size)}"
-            )
+            if __debug__:
+                logger.debug(
+                    f"Enqueued block for SSD cache write: {block_hash.hex()[:16]}..., "
+                    f"size={format_bytes(estimated_size)}"
+                )
             return True
 
         except Exception as e:
@@ -1321,9 +1325,10 @@ class PagedSSDCacheManager(CacheManager):
                 self._stats["loads"] += 1
                 self._stats["hits"] += 1
                 self._stats["hot_cache_hits"] += 1
-                logger.debug(
-                    f"Loaded block from hot cache: {block_hash.hex()[:16]}..."
-                )
+                if __debug__:
+                    logger.debug(
+                        f"Loaded block from hot cache: {block_hash.hex()[:16]}..."
+                    )
             return cache_data
 
         # Check index
@@ -1371,7 +1376,8 @@ class PagedSSDCacheManager(CacheManager):
             if self._hot_cache_enabled:
                 self._promote_to_hot_cache(block_hash, arrays, file_metadata, metadata)
 
-            logger.debug(f"Loaded block from SSD cache: {block_hash.hex()[:16]}...")
+            if __debug__:
+                logger.debug(f"Loaded block from SSD cache: {block_hash.hex()[:16]}...")
             return cache_data
 
         except Exception as e:
@@ -1439,10 +1445,11 @@ class PagedSSDCacheManager(CacheManager):
             self._stats["loads"] += 1
             self._stats["hits"] += 1
             self._stats["hot_cache_hits"] += 1
-            logger.debug(
-                f"Loaded block with metadata from hot cache: "
-                f"{block_hash.hex()[:16]}..."
-            )
+            if __debug__:
+                logger.debug(
+                    f"Loaded block with metadata from hot cache: "
+                    f"{block_hash.hex()[:16]}..."
+                )
             return cache_data, metadata_dict
 
         # Check index
@@ -1510,9 +1517,10 @@ class PagedSSDCacheManager(CacheManager):
                     block_hash, arrays, file_metadata, block_metadata
                 )
 
-            logger.debug(
-                f"Loaded block with metadata from SSD cache: {block_hash.hex()[:16]}..."
-            )
+            if __debug__:
+                logger.debug(
+                    f"Loaded block with metadata from SSD cache: {block_hash.hex()[:16]}..."
+                )
             return cache_data, metadata_dict
 
         except Exception as e:
@@ -1575,7 +1583,8 @@ class PagedSSDCacheManager(CacheManager):
             try:
                 if metadata.file_path.exists():
                     metadata.file_path.unlink()
-                    logger.debug(f"Deleted SSD cache file: {metadata.file_path}")
+                    if __debug__:
+                        logger.debug(f"Deleted SSD cache file: {metadata.file_path}")
                 return True
             except Exception as e:
                 logger.error(f"Failed to delete SSD cache file: {e}")
@@ -1647,7 +1656,8 @@ class PagedSSDCacheManager(CacheManager):
                     if metadata.file_path.exists():
                         metadata.file_path.unlink()
                         self._stats["evictions"] += 1
-                        logger.debug(f"Evicted SSD cache file: {metadata.file_path}")
+                        if __debug__:
+                            logger.debug(f"Evicted SSD cache file: {metadata.file_path}")
                 except Exception as e:
                     logger.warning(f"Failed to delete evicted file: {e}")
 
@@ -1809,7 +1819,8 @@ class PagedSSDCacheManager(CacheManager):
             self._hot_cache.clear()
             self._hot_cache_total_bytes = 0
 
-        logger.debug("PagedSSDCacheManager closed")
+        if __debug__:
+            logger.debug("PagedSSDCacheManager closed")
 
     def __repr__(self) -> str:
         return (

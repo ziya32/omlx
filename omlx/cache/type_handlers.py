@@ -854,7 +854,8 @@ class CacheListHandler(CacheTypeHandler):
 
             return CacheList.from_state(sub_states, (class_names, sanitized_sub_meta_states))
         except (ImportError, AttributeError, TypeError, KeyError, Exception) as e:
-            logger.debug(f"CacheList.from_state() unavailable or failed: {e}")
+            if __debug__:
+                logger.debug(f"CacheList.from_state() unavailable or failed: {e}")
 
         # Fallback: manually reconstruct sub-caches
         # NOTE: CacheTypeRegistry must be imported locally to avoid circular import

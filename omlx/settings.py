@@ -688,7 +688,8 @@ class GlobalSettings:
         settings_file = resolved_base / "settings.json"
         if settings_file.exists():
             settings._load_from_file(settings_file)
-            logger.debug(f"Loaded settings from {settings_file}")
+            if __debug__:
+                logger.debug(f"Loaded settings from {settings_file}")
 
         # Apply environment variable overrides
         settings._apply_env_overrides()
@@ -959,7 +960,8 @@ class GlobalSettings:
             if not directory.exists():
                 try:
                     directory.mkdir(parents=True, exist_ok=True)
-                    logger.debug(f"Created directory: {directory}")
+                    if __debug__:
+                        logger.debug(f"Created directory: {directory}")
                 except OSError as e:
                     logger.error(f"Failed to create directory {directory}: {e}")
                     raise
@@ -972,7 +974,8 @@ class GlobalSettings:
                 continue
             try:
                 directory.mkdir(parents=True, exist_ok=True)
-                logger.debug(f"Created directory: {directory}")
+                if __debug__:
+                    logger.debug(f"Created directory: {directory}")
                 valid_dirs.append(str(directory))
             except OSError as e:
                 logger.warning(

@@ -251,7 +251,8 @@ class ServerManager:
             if result.returncode == 0 and result.stdout.strip():
                 return int(result.stdout.strip().splitlines()[0])
         except Exception as e:
-            logger.debug(f"lsof failed: {e}")
+            if __debug__:
+                logger.debug(f"lsof failed: {e}")
         return None
 
     def _kill_external_server(self, pid: int) -> bool:

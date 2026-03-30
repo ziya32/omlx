@@ -115,7 +115,8 @@ def _patch_video_processor_bug():
         mapping = MODALITY_TO_AUTOPROCESSOR_MAPPING._MAPPING_NAMES
         if "video_processor" in mapping:
             del mapping["video_processor"]
-            logger.debug("Removed video_processor from MODALITY_TO_AUTOPROCESSOR_MAPPING")
+            if __debug__:
+                logger.debug("Removed video_processor from MODALITY_TO_AUTOPROCESSOR_MAPPING")
 
         _video_processor_patched = True
     except (ImportError, AttributeError):
@@ -594,7 +595,8 @@ class VLMBatchedEngine(BaseEngine):
 
         self._ocr_stop_ids_cache = ids
         if ids:
-            logger.debug(f"OCR stop token IDs resolved: {ids}")
+            if __debug__:
+                logger.debug(f"OCR stop token IDs resolved: {ids}")
         return ids
 
     async def start(self) -> None:
@@ -1026,10 +1028,11 @@ class VLMBatchedEngine(BaseEngine):
                 messages, num_images=num_images
             )
         except Exception as e:
-            logger.debug(
-                "Falling back to mlx-vlm apply_chat_template for VLM formatting: %s",
-                e,
-            )
+            if __debug__:
+                logger.debug(
+                    "Falling back to mlx-vlm apply_chat_template for VLM formatting: %s",
+                    e,
+                )
             # Fallback to upstream formatter for unknown model/format edge cases.
             formatted_messages = apply_chat_template(
                 self._processor,
@@ -1348,18 +1351,20 @@ class VLMBatchedEngine(BaseEngine):
         if kwargs.get("specprefill_system_end") is not None:
             specprefill_kwargs["specprefill_system_end"] = kwargs.pop("specprefill_system_end")
 
-        request_id = await self._engine.add_request(
-            prompt=prompt,
-            sampling_params=sampling_params,
-            request_id=request_id,
-            vlm_inputs_embeds=vlm_inputs_embeds,
-            vlm_extra_kwargs=vlm_extra_kwargs,
-            vlm_image_hash=vlm_image_hash,
-            **specprefill_kwargs,
-        )
-
+        submitted = False
         finished_normally = False
         try:
+            request_id = await self._engine.add_request(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                request_id=request_id,
+                vlm_inputs_embeds=vlm_inputs_embeds,
+                vlm_extra_kwargs=vlm_extra_kwargs,
+                vlm_image_hash=vlm_image_hash,
+                **specprefill_kwargs,
+            )
+            submitted = True
+
             async for output in self._engine.stream_outputs(request_id):
                 text = clean_special_tokens(output.output_text)
 
@@ -1381,7 +1386,7 @@ class VLMBatchedEngine(BaseEngine):
         except asyncio.CancelledError:
             logger.info(f"[vlm_stream_generate] CancelledError for request {request_id}")
         finally:
-            if not finished_normally:
+            if submitted and not finished_normally:
                 logger.info(f"[vlm_stream_generate] Aborting request {request_id}")
                 await self._engine.abort_request(request_id)
 

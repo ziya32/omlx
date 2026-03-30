@@ -22,8 +22,8 @@ from typing import Literal
 
 logger = logging.getLogger(__name__)
 
-ModelType = Literal["llm", "vlm", "embedding", "reranker", "llm_reranker", "audio_stt", "audio_tts", "audio_sts"]
-EngineType = Literal["batched", "vlm", "embedding", "reranker", "llm_reranker", "audio_stt", "audio_tts", "audio_sts"]
+ModelType = Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
+EngineType = Literal["batched", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]
 
 # Known VLM (Vision-Language Model) types from mlx-vlm
 VLM_MODEL_TYPES = {
@@ -103,7 +103,6 @@ EMBEDDING_ARCHITECTURES = {
     "XLMRobertaForMaskedLM",
     "ModernBertModel",
     "ModernBertForMaskedLM",
-    "Qwen3ForTextEmbedding",
     "SiglipModel",
     "SiglipVisionModel",
     "SiglipTextModel",
@@ -348,12 +347,10 @@ def detect_model_type(model_path: Path) -> ModelType:
     # Check for CausalLM-based rerankers (e.g., Qwen3-Reranker).
     # These use a standard CausalLM architecture but are fine-tuned for reranking
     # via yes/no logit scoring. Detected by architecture + model directory name hint.
-    # Returns "llm_reranker" (not "reranker") so they route to LLMRerankerEngine,
-    # which wraps BatchedEngine for continuous batching and prefix caching.
     for arch in architectures:
         if arch in CAUSAL_LM_RERANKER_ARCHITECTURES:
             if _is_causal_lm_reranker(model_path):
-                return "llm_reranker"
+                return "reranker"
 
     # Check for CausalLM-based embeddings (e.g., Qwen3-Embedding).
     # These use a standard CausalLM architecture but are fine-tuned for embeddings
@@ -388,14 +385,6 @@ def detect_model_type(model_path: Path) -> ModelType:
             f"but architecture {architectures} is not an embedding architecture "
             "— treating as LLM"
         )
-
-    # Check model_type for TTS
-    if normalized_type in TTS_MODEL_TYPES or model_type in TTS_MODEL_TYPES:
-        return "tts"
-
-    # Check model_type for ASR
-    if normalized_type in ASR_MODEL_TYPES or model_type in ASR_MODEL_TYPES:
-        return "asr"
 
     # Check for VLM: architectures field
     for arch in architectures:
@@ -519,8 +508,6 @@ def _register_model(
             engine_type = "reranker"
         elif model_type == "vlm":
             engine_type = "vlm"
-        elif model_type == "llm_reranker":
-            engine_type = "llm_reranker"
         elif model_type == "audio_stt":
             engine_type = "audio_stt"
         elif model_type == "audio_tts":
@@ -624,10 +611,11 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
                     _register_model(models, child, child.name)
 
             if not has_children:
-                logger.debug(
-                    f"Skipping {subdir.name}: no config.json found "
-                    f"(not a model or organization folder)"
-                )
+                if __debug__:
+                    logger.debug(
+                        f"Skipping {subdir.name}: no config.json found "
+                        f"(not a model or organization folder)"
+                    )
 
     # Fallback: if no models found and the directory itself is a model, register it.
     # This supports pointing directly at a single model folder, e.g.:

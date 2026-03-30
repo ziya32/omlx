@@ -18,7 +18,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 from omlx.engine.asr import ASREngine, TranscriptionOutput
-from omlx.engine.llm_reranker import LLMRerankerEngine
 
 TEST_API_KEY = "test-api-key"
 from omlx.engine.reranker import RerankerEngine
@@ -114,12 +113,12 @@ class MockTTSEngine(TTSEngine):
         return ["ryan", "vivian", "emma"]
 
 
-class MockLLMRerankerEngine(LLMRerankerEngine):
-    """Mock LLM reranker engine with canned scores."""
+class MockRerankerEngine(RerankerEngine):
+    """Mock reranker engine with canned scores."""
 
-    def __init__(self, model_name: str = "test-llm-reranker"):
+    def __init__(self, model_name: str = "test-reranker"):
         self._model_name = model_name
-        self._batched = MagicMock()  # Mark as "loaded"
+        self._model = None  # satisfy RerankerEngine attributes
 
     async def start(self):
         pass
@@ -141,7 +140,7 @@ class MockLLMRerankerEngine(LLMRerankerEngine):
         )
 
     def get_stats(self):
-        return {"model_name": self._model_name, "loaded": True, "engine_type": "llm_reranker"}
+        return {"model_name": self._model_name, "loaded": True, "engine_type": "reranker"}
 
 
 class MockBaseEngine:
@@ -206,12 +205,12 @@ class MockEnginePool:
         self._llm_engine = MockBaseEngine()
         self._asr_engine = MockASREngine()
         self._tts_engine = MockTTSEngine()
-        self._llm_reranker_engine = MockLLMRerankerEngine()
+        self._reranker_engine = MockRerankerEngine()
         self._entries = {
             "test-llm-model": MagicMock(engine_type="batched", engine=self._llm_engine),
             "test-asr-model": MagicMock(engine_type="asr", engine=self._asr_engine),
             "test-tts-model": MagicMock(engine_type="tts", engine=self._tts_engine, model_path=tts_model_dir),
-            "test-llm-reranker": MagicMock(engine_type="llm_reranker", engine=self._llm_reranker_engine),
+            "test-reranker": MagicMock(engine_type="reranker", engine=self._reranker_engine),
         }
 
     @property
@@ -254,8 +253,8 @@ class MockEnginePool:
             return self._asr_engine
         if model_id == "test-tts-model":
             return self._tts_engine
-        if model_id == "test-llm-reranker":
-            return self._llm_reranker_engine
+        if model_id == "test-reranker":
+            return self._reranker_engine
         return self._llm_engine
 
 
@@ -724,15 +723,15 @@ class TestLanguagesEndpoint:
 # ──────────────────────────────────────────────────────────────────────
 
 
-class TestLLMRerankerEndpoint:
-    """Tests for POST /v1/rerank with LLMRerankerEngine."""
+class TestRerankerEndpoint:
+    """Tests for POST /v1/rerank with RerankerEngine."""
 
     def test_rerank_basic(self, client):
         """Test basic rerank via LLM reranker engine."""
         response = client.post(
             "/v1/rerank",
             json={
-                "model": "test-llm-reranker",
+                "model": "test-reranker",
                 "query": "What is machine learning?",
                 "documents": [
                     "ML is a subset of AI.",
@@ -751,7 +750,7 @@ class TestLLMRerankerEndpoint:
         response = client.post(
             "/v1/rerank",
             json={
-                "model": "test-llm-reranker",
+                "model": "test-reranker",
                 "query": "Test query",
                 "documents": ["Doc 1", "Doc 2", "Doc 3", "Doc 4"],
                 "top_n": 2,
@@ -767,7 +766,7 @@ class TestLLMRerankerEndpoint:
         response = client.post(
             "/v1/rerank",
             json={
-                "model": "test-llm-reranker",
+                "model": "test-reranker",
                 "query": "Test",
                 "documents": ["Document 1"],
                 "return_documents": True,
@@ -788,7 +787,7 @@ class TestLLMRerankerEndpoint:
         response = client.post(
             "/v1/rerank",
             json={
-                "model": "test-llm-reranker",
+                "model": "test-reranker",
                 "query": "relevant query",
                 "documents": ["doc A", "doc B", "doc C"],
             },
@@ -805,7 +804,7 @@ class TestLLMRerankerEndpoint:
         response = client.post(
             "/v1/rerank",
             json={
-                "model": "test-llm-reranker",
+                "model": "test-reranker",
                 "query": "",
                 "documents": ["doc"],
             },
@@ -818,7 +817,7 @@ class TestLLMRerankerEndpoint:
         response = client.post(
             "/v1/rerank",
             json={
-                "model": "test-llm-reranker",
+                "model": "test-reranker",
                 "query": "test",
                 "documents": [],
             },
@@ -873,7 +872,7 @@ class TestEngineTypeRouting:
         model_ids = [m["id"] for m in data["data"]]
         assert "test-asr-model" in model_ids
         assert "test-tts-model" in model_ids
-        assert "test-llm-reranker" in model_ids
+        assert "test-reranker" in model_ids
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -934,11 +933,11 @@ class TestPrefillOnlyIntegration:
         assert request.sampling_params.prefill_only is True
         assert request.sampling_params.prefill_output == "logits"
 
-    def test_prefill_only_with_llm_reranker_scoring(self):
+    def test_prefill_only_with_reranker_scoring(self):
         """Test the full scoring pipeline: logits -> softmax -> P(yes)."""
         import mlx.core as mx
 
-        # Simulate what LLMRerankerEngine does after getting logprobs
+        # Simulate what RerankerEngine does after getting logprobs
         vocab_size = 10000
         yes_id = 42
         no_id = 99
@@ -1012,7 +1011,7 @@ class TestModelDiscoveryIntegration:
         assert entry.model_type == "tts"
         assert entry.engine_type == "tts"
 
-    def test_llm_reranker_auto_detected_from_name(self, tmp_path):
+    def test_causal_lm_reranker_auto_detected_from_name(self, tmp_path):
         """Test CausalLM reranker is auto-detected from model directory name."""
         model_dir = tmp_path / "Qwen3-Reranker-0.6B"
         model_dir.mkdir()
@@ -1025,16 +1024,16 @@ class TestModelDiscoveryIntegration:
         from omlx.model_discovery import detect_model_type
         from omlx.engine_pool import EnginePool
 
-        assert detect_model_type(model_dir) == "llm_reranker"
+        assert detect_model_type(model_dir) == "reranker"
 
         pool = EnginePool(max_model_memory=None)
         pool.discover_models(str(tmp_path))
         entry = pool.get_entry("Qwen3-Reranker-0.6B")
-        assert entry.model_type == "llm_reranker"
-        assert entry.engine_type == "llm_reranker"
+        assert entry.model_type == "reranker"
+        assert entry.engine_type == "reranker"
 
-    def test_llm_reranker_via_model_type_override(self, tmp_path):
-        """Test LLM reranker configured via model_type_override for a model
+    def test_reranker_via_model_type_override(self, tmp_path):
+        """Test reranker configured via model_type_override for a model
         that isn't auto-detected (no 'reranker' in name)."""
         model_dir = tmp_path / "Qwen3-Custom-0.6B"
         model_dir.mkdir()
@@ -1062,13 +1061,13 @@ class TestModelDiscoveryIntegration:
         settings_dir.mkdir()
         sm = ModelSettingsManager(str(settings_dir))
         settings = sm.get_settings("Qwen3-Custom-0.6B")
-        settings.model_type_override = "llm_reranker"
+        settings.model_type_override = "reranker"
         sm.set_settings("Qwen3-Custom-0.6B", settings)
 
         pool.apply_settings_overrides(sm)
         entry = pool.get_entry("Qwen3-Custom-0.6B")
-        assert entry.model_type == "llm_reranker"
-        assert entry.engine_type == "llm_reranker"
+        assert entry.model_type == "reranker"
+        assert entry.engine_type == "reranker"
 
     def test_engine_pool_all_type_mappings(self):
         """Verify all model type -> engine type mappings exist."""
@@ -1080,14 +1079,8 @@ class TestModelDiscoveryIntegration:
             "vlm": "vlm",
             "embedding": "embedding",
             "reranker": "reranker",
-            "llm_reranker": "llm_reranker",
             "asr": "asr",
             "tts": "tts",
         }
         for model_type, engine_type in expected.items():
             assert pool._MODEL_TYPE_TO_ENGINE[model_type] == engine_type
-
-    def test_admin_accepts_llm_reranker_override(self):
-        """Test that admin routes accept llm_reranker as valid override."""
-        valid_types = {"llm", "vlm", "embedding", "reranker", "llm_reranker", "asr", "tts"}
-        assert "llm_reranker" in valid_types

@@ -89,16 +89,18 @@ def apply_gated_delta_advance_patch(model: Any) -> bool:
     try:
         from mlx_lm.models.qwen3_5 import GatedDeltaNet
     except ImportError:
-        logger.debug("GatedDeltaNet advance patch: qwen3_5 module not found")
+        if __debug__:
+            logger.debug("GatedDeltaNet advance patch: qwen3_5 module not found")
         return False
 
     # Forward compatibility: skip if mlx-lm already added advance()
     try:
         source = inspect.getsource(GatedDeltaNet.__call__)
         if ".advance(" in source:
-            logger.debug(
-                "GatedDeltaNet advance patch: upstream already has advance(), skipping"
-            )
+            if __debug__:
+                logger.debug(
+                    "GatedDeltaNet advance patch: upstream already has advance(), skipping"
+                )
             _class_patch_applied = True
             return False
     except (OSError, TypeError):

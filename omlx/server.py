@@ -40,6 +40,7 @@ The server provides:
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -163,7 +164,6 @@ from .api.utils import clean_output_text, clean_special_tokens, extract_multimod
 from .engine import BaseEngine, BatchedEngine, VLMBatchedEngine
 from .engine.asr import ASREngine
 from .engine.embedding import EmbeddingEngine
-from .engine.llm_reranker import LLMRerankerEngine
 from .engine.reranker import RerankerEngine
 from .engine.tts import TTSEngine
 from .engine_pool import EnginePool
@@ -762,7 +762,7 @@ async def get_engine(
                 f"Use /v1/chat/completions for LLM models."
             )
     elif engine_type == EngineType.RERANKER:
-        if not isinstance(engine, (RerankerEngine, LLMRerankerEngine)):
+        if not isinstance(engine, RerankerEngine):
             raise HTTPException(
                 status_code=400,
                 detail=f"Model '{model_id}' is not a reranker model. "
@@ -878,13 +878,11 @@ async def get_embedding_engine(model: str) -> EmbeddingEngine:
     return await get_engine(model, EngineType.EMBEDDING)
 
 
-async def get_reranker_engine(model: str) -> RerankerEngine | LLMRerankerEngine:
+async def get_reranker_engine(model: str) -> RerankerEngine:
     """
     Get reranker engine for the specified model.
 
     This is a convenience wrapper around get_engine() for reranker models.
-    Returns either a RerankerEngine (classification-based) or LLMRerankerEngine
-    (generative, prefill_only logits mode).
 
     Args:
         model: Model ID to get engine for
@@ -1046,14 +1044,15 @@ def get_sampling_params(
     # XTC threshold: request > default (0.1 = safe default when probability is set)
     xtc_threshold = req_xtc_threshold if req_xtc_threshold is not None else 0.1
 
-    logger.debug(
-        f"Sampling params: temperature={temperature}, top_p={top_p}, top_k={top_k}, "
-        f"repetition_penalty={repetition_penalty}, min_p={min_p}, presence_penalty={presence_penalty}, "
-        f"frequency_penalty={frequency_penalty}, max_tokens={max_tokens}, "
-        f"xtc_probability={xtc_probability}, xtc_threshold={xtc_threshold}"
-        f"{' (forced)' if force else ''}"
-        f"{f' (model: {model_id})' if model_id else ''}"
-    )
+    if __debug__:
+        logger.debug(
+            f"Sampling params: temperature={temperature}, top_p={top_p}, top_k={top_k}, "
+            f"repetition_penalty={repetition_penalty}, min_p={min_p}, presence_penalty={presence_penalty}, "
+            f"frequency_penalty={frequency_penalty}, max_tokens={max_tokens}, "
+            f"xtc_probability={xtc_probability}, xtc_threshold={xtc_threshold}"
+            f"{' (forced)' if force else ''}"
+            f"{f' (model: {model_id})' if model_id else ''}"
+        )
     return temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold
 
 
@@ -1478,7 +1477,8 @@ async def _with_sse_keepalive(
                                 pass
                             return
                     except Exception as e:
-                        logger.debug(f"is_disconnected() check failed: {e}")
+                        if __debug__:
+                            logger.debug(f"is_disconnected() check failed: {e}")
                         pass  # is_disconnected() can fail if scope is already closed
                 # Send keepalive at the configured interval
                 keepalive_elapsed += wait_time
@@ -1764,7 +1764,7 @@ async def create_embeddings(
     # Generate embeddings
     start_time = time.perf_counter()
     try:
-        output = await engine.embed(embedding_inputs)
+        output = await engine.embed(embedding_inputs, instruction=request.instruction)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except TypeError as e:
@@ -1877,6 +1877,7 @@ async def create_rerank(
             query=request.query,
             documents=documents,
             top_n=request.top_n,
+            instruction=request.instruction,
         )
 
     elapsed = time.perf_counter() - start_time
@@ -2512,10 +2513,16 @@ async def create_chat_completion(
         tool_choice=request.tool_choice,
     )
 
-    # Log incoming request summary at debug, message content at trace
-    logger.debug(f"Chat completion request received: model={request.model}, "
-                 f"messages={len(request.messages)}, stream={request.stream}, "
-                 f"max_tokens={request.max_tokens}, temp={request.temperature}")
+    # Log incoming request summary, message content at trace
+    # Content hash to detect retries (same content = same hash)
+    _h = hashlib.sha256()
+    for _m in request.messages:
+        _h.update(_m.model_dump_json().encode())
+    content_hash = _h.hexdigest()[:12]
+    logger.info(f"Chat completion [{req_id}] received: model={request.model}, "
+                f"messages={len(request.messages)}, content_hash={content_hash}, "
+                f"stream={request.stream}, "
+                f"max_tokens={request.max_tokens}, temp={request.temperature}")
     if logger.isEnabledFor(5):
         for i, msg in enumerate(request.messages):
             content_preview = str(msg.content)[:200] if msg.content else "(empty)"
@@ -3480,7 +3487,8 @@ async def stream_anthropic_messages(
             tokens = engine.tokenizer.encode(prompt)
             estimated_input_tokens = len(tokens)
     except Exception as e:
-        logger.debug(f"Could not estimate input tokens: {e}")
+        if __debug__:
+            logger.debug(f"Could not estimate input tokens: {e}")
 
     # 1. Send message_start with estimated input tokens
     yield create_message_start_event(
@@ -3715,11 +3723,12 @@ async def create_anthropic_message(
     Streaming is supported with `stream: true`.
     """
     req_id = str(uuid.uuid4())
-    logger.debug(
-        f"Anthropic Messages request: model={request.model}, "
-        f"messages={len(request.messages)}, stream={request.stream}, "
-        f"max_tokens={request.max_tokens}"
-    )
+    if __debug__:
+        logger.debug(
+            f"Anthropic Messages request: model={request.model}, "
+            f"messages={len(request.messages)}, stream={request.stream}, "
+            f"max_tokens={request.max_tokens}"
+        )
 
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
         raise HTTPException(
@@ -3761,10 +3770,11 @@ async def create_anthropic_message(
                 elif thinking_type == "disabled":
                     merged_ct_kwargs["enable_thinking"] = False
 
-        logger.debug(
-            f"Tool result truncation config: max_tokens={max_tool_result_tokens}, "
-            f"has_tokenizer={engine.tokenizer is not None}"
-        )
+        if __debug__:
+            logger.debug(
+                f"Tool result truncation config: max_tokens={max_tool_result_tokens}, "
+                f"has_tokenizer={engine.tokenizer is not None}"
+            )
 
         # Convert Anthropic format to internal format
         # Harmony models need special handling to preserve tool format
@@ -4009,7 +4019,8 @@ async def count_anthropic_tokens(
             token_ids = prompt  # Already tokenized
 
     input_tokens = scale_anthropic_tokens(len(token_ids), request.model)
-    logger.debug(f"Token count: {input_tokens} tokens for {len(messages)} messages")
+    if __debug__:
+        logger.debug(f"Token count: {input_tokens} tokens for {len(messages)} messages")
 
     return TokenCountResponse(input_tokens=input_tokens)
 
@@ -4076,9 +4087,10 @@ async def create_response(
             detail="Server is busy with oQ quantization. Please try again after quantization completes.",
         )
 
-    logger.debug(
-        f"Responses API request: model={request.model}, stream={request.stream}"
-    )
+    if __debug__:
+        logger.debug(
+            f"Responses API request: model={request.model}, stream={request.stream}"
+        )
 
     resolved_model = resolve_model_id(request.model) or request.model
     pool = get_engine_pool()

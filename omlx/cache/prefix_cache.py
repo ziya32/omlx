@@ -138,7 +138,8 @@ class BlockAwarePrefixCache(CacheManager):
                 if isinstance(cache_list, list) and len(cache_list) > 0:
                     return len(cache_list)
             except Exception as e:
-                logger.debug(f"Could not determine cache layer count via make_cache(): {e}")
+                if __debug__:
+                    logger.debug(f"Could not determine cache layer count via make_cache(): {e}")
 
         # Fallback to architectural layer count for non-hybrid models.
         if hasattr(model, 'layers'):
@@ -149,7 +150,8 @@ class BlockAwarePrefixCache(CacheManager):
             return model.config.num_hidden_layers
 
         # Cannot determine, return 0 to skip validation
-        logger.debug("Cannot determine model/cache num_layers, cache layer validation disabled")
+        if __debug__:
+            logger.debug("Cannot determine model/cache num_layers, cache layer validation disabled")
         return 0
 
     def set_paged_ssd_cache_manager(self, paged_ssd_cache_manager: Optional[PagedSSDCacheManager]) -> None:
@@ -266,10 +268,11 @@ class BlockAwarePrefixCache(CacheManager):
             self._hits += 1
             self._tokens_saved += num_prefix_tokens
 
-            logger.debug(
-                f"Cache hit for {request_id}: "
-                f"{len(shared_block_ids)} blocks, {num_prefix_tokens} tokens"
-            )
+            if __debug__:
+                logger.debug(
+                    f"Cache hit for {request_id}: "
+                    f"{len(shared_block_ids)} blocks, {num_prefix_tokens} tokens"
+                )
 
             return block_table, remaining
 
@@ -291,16 +294,18 @@ class BlockAwarePrefixCache(CacheManager):
             self._hits += 1
             self._tokens_saved += prefix_len
 
-            logger.debug(
-                f"Prefix index hit for {request_id}: "
-                f"{prefix_len} tokens matched"
-            )
+            if __debug__:
+                logger.debug(
+                    f"Prefix index hit for {request_id}: "
+                    f"{prefix_len} tokens matched"
+                )
 
             return block_table, remaining
 
         # No cache hit
         self._misses += 1
-        logger.debug(f"Cache miss for {request_id}")
+        if __debug__:
+            logger.debug(f"Cache miss for {request_id}")
         return None, tokens
 
     def store_cache(
@@ -405,14 +410,15 @@ class BlockAwarePrefixCache(CacheManager):
         if trailing_partial_tokens > 0:
             self._partial_block_skips += 1
             self._partial_tokens_skipped += trailing_partial_tokens
-            logger.debug(
-                "Skipping trailing partial block for %s: %s token(s) not persisted "
-                "(block_size=%s, needs +%s token(s) to fill next block)",
-                request_id,
-                trailing_partial_tokens,
-                self.block_size,
-                self._last_tokens_to_next_block,
-            )
+            if __debug__:
+                logger.debug(
+                    "Skipping trailing partial block for %s: %s token(s) not persisted "
+                    "(block_size=%s, needs +%s token(s) to fill next block)",
+                    request_id,
+                    trailing_partial_tokens,
+                    self.block_size,
+                    self._last_tokens_to_next_block,
+                )
 
         blocks_saved_to_ssd = 0
 
@@ -494,11 +500,12 @@ class BlockAwarePrefixCache(CacheManager):
 
                 # Check cache continuity for the selected slice mode.
                 if cache_seq_len > 0 and cache_start >= cache_seq_len:
-                    logger.debug(
-                        f"Cache continuity broken: cache only has {cache_seq_len} tokens, "
-                        f"cannot store block at cache indices [{cache_start}:{cache_end}] "
-                        f"(global [{global_start}:{global_end}]). Stopping block allocation."
-                    )
+                    if __debug__:
+                        logger.debug(
+                            f"Cache continuity broken: cache only has {cache_seq_len} tokens, "
+                            f"cannot store block at cache indices [{cache_start}:{cache_end}] "
+                            f"(global [{global_start}:{global_end}]). Stopping block allocation."
+                        )
                     # Free the block we just allocated (it has no data)
                     self.paged_cache.free_block(block.block_id)
                     block_table.block_ids.pop()
@@ -533,10 +540,11 @@ class BlockAwarePrefixCache(CacheManager):
                     )
                     if saved:
                         blocks_saved_to_ssd += 1
-                        logger.debug(
-                            f"Saved block {block.block_id} to tiered cache: "
-                            f"tokens [{global_start}:{global_end}], {len(block_kv_data)} layers"
-                        )
+                        if __debug__:
+                            logger.debug(
+                                f"Saved block {block.block_id} to tiered cache: "
+                                f"tokens [{global_start}:{global_end}], {len(block_kv_data)} layers"
+                            )
                     else:
                         logger.warning(
                             f"Failed to save block {block.block_id} to tiered cache"
@@ -549,10 +557,11 @@ class BlockAwarePrefixCache(CacheManager):
                         break
                 else:
                     # Failed to extract tensor data - free block and stop
-                    logger.debug(
-                        f"Failed to extract tensor slice [{global_start}:{global_end}], "
-                        f"freeing block {block.block_id} and stopping."
-                    )
+                    if __debug__:
+                        logger.debug(
+                            f"Failed to extract tensor slice [{global_start}:{global_end}], "
+                            f"freeing block {block.block_id} and stopping."
+                        )
                     self.paged_cache.free_block(block.block_id)
                     block_table.block_ids.pop()
                     block_table.num_tokens -= len(block_tokens)
@@ -567,11 +576,12 @@ class BlockAwarePrefixCache(CacheManager):
             last_access=time.time(),
         )
 
-        logger.debug(
-            f"Stored cache for {request_id}: "
-            f"{len(block_table.block_ids)} blocks ({blocks_saved_to_ssd} saved to tiered cache), "
-            f"{block_table.num_tokens} tokens"
-        )
+        if __debug__:
+            logger.debug(
+                f"Stored cache for {request_id}: "
+                f"{len(block_table.block_ids)} blocks ({blocks_saved_to_ssd} saved to tiered cache), "
+                f"{block_table.num_tokens} tokens"
+            )
 
         return block_table
 
@@ -632,9 +642,10 @@ class BlockAwarePrefixCache(CacheManager):
                 # KVCache: shape (batch, n_kv_heads, seq_len, head_dim) - 4D
                 if len(keys.shape) == 4:
                     seq_len = keys.shape[2]
-                    logger.debug(
-                        f"Found KVCache at layer {layer_idx} with seq_len={seq_len}"
-                    )
+                    if __debug__:
+                        logger.debug(
+                            f"Found KVCache at layer {layer_idx} with seq_len={seq_len}"
+                        )
                     return seq_len
 
             except Exception:
@@ -662,7 +673,8 @@ class BlockAwarePrefixCache(CacheManager):
                 continue
 
         if max_seq_len > 0:
-            logger.debug(f"Using fallback max seq_len={max_seq_len}")
+            if __debug__:
+                logger.debug(f"Using fallback max seq_len={max_seq_len}")
             return max_seq_len
 
         # Step 3: CacheList fallback — check sub-states for seq_len
@@ -676,9 +688,10 @@ class BlockAwarePrefixCache(CacheManager):
                         sub_keys = sub_state[0]
                         if hasattr(sub_keys, 'shape') and len(sub_keys.shape) == 4:
                             seq_len = sub_keys.shape[2]
-                            logger.debug(
-                                f"Using CacheList sub-cache seq_len={seq_len}"
-                            )
+                            if __debug__:
+                                logger.debug(
+                                    f"Using CacheList sub-cache seq_len={seq_len}"
+                                )
                             return seq_len
 
         return 0
@@ -786,16 +799,18 @@ class BlockAwarePrefixCache(CacheManager):
                             keys_slice = keys[:, start_idx:actual_end, :]
                             values_slice = values[:, start_idx:actual_end, :]
                         else:
-                            logger.debug(
-                                f"Layer {layer_idx}: unexpected tensor shape for {cache_type_name}"
-                            )
+                            if __debug__:
+                                logger.debug(
+                                    f"Layer {layer_idx}: unexpected tensor shape for {cache_type_name}"
+                                )
                             continue
                     else:
                         seq_len = keys.shape[2]
                         if end_idx > seq_len:
-                            logger.debug(
-                                f"Block slice [{start_idx}:{end_idx}] exceeds seq_len {seq_len}"
-                            )
+                            if __debug__:
+                                logger.debug(
+                                    f"Block slice [{start_idx}:{end_idx}] exceeds seq_len {seq_len}"
+                                )
                             actual_end = min(end_idx, seq_len)
                             if start_idx >= actual_end:
                                 continue
@@ -832,9 +847,10 @@ class BlockAwarePrefixCache(CacheManager):
                                 (self._clone_tensor(keys), self._clone_tensor(values))
                             )
                         else:
-                            logger.debug(
-                                f"Layer {layer_idx}: RotatingKVCache unexpected state format"
-                            )
+                            if __debug__:
+                                logger.debug(
+                                    f"Layer {layer_idx}: RotatingKVCache unexpected state format"
+                                )
                             block_slices.append((mx.zeros((1,)), mx.zeros((1,))))
                     else:
                         # Non-last block without snapshot: store placeholder
@@ -927,9 +943,10 @@ class BlockAwarePrefixCache(CacheManager):
                                 (self._clone_tensor(conv_state), self._clone_tensor(ssm_state))
                             )
                         else:
-                            logger.debug(
-                                f"Layer {layer_idx}: {cache_type_name} unexpected state format"
-                            )
+                            if __debug__:
+                                logger.debug(
+                                    f"Layer {layer_idx}: {cache_type_name} unexpected state format"
+                                )
                             block_slices.append((mx.zeros((1,)), mx.zeros((1,))))
                     else:
                         # Non-last block without snapshot: store placeholder
@@ -1070,11 +1087,12 @@ class BlockAwarePrefixCache(CacheManager):
         blocks_to_restore = max(0, matched_blocks - padding_blocks)
 
         if blocks_to_restore < matched_blocks:
-            logger.debug(
-                f"Window padding: {matched_blocks} blocks matched, "
-                f"restoring {blocks_to_restore} blocks "
-                f"(padding {padding_blocks} blocks for window_size={window_size})"
-            )
+            if __debug__:
+                logger.debug(
+                    f"Window padding: {matched_blocks} blocks matched, "
+                    f"restoring {blocks_to_restore} blocks "
+                    f"(padding {padding_blocks} blocks for window_size={window_size})"
+                )
 
         return blocks_to_restore
 
@@ -1119,7 +1137,8 @@ class BlockAwarePrefixCache(CacheManager):
         entry = self._request_tables.pop(request_id, None)
         if entry:
             self.paged_cache.delete_block_table(request_id)
-            logger.debug(f"Released cache for {request_id}")
+            if __debug__:
+                logger.debug(f"Released cache for {request_id}")
 
     def clear_request_entry(self, request_id: str) -> None:
         """
@@ -1134,7 +1153,8 @@ class BlockAwarePrefixCache(CacheManager):
         """
         entry = self._request_tables.pop(request_id, None)
         if entry:
-            logger.debug(f"Cleared request entry for {request_id} (blocks retained)")
+            if __debug__:
+                logger.debug(f"Cleared request entry for {request_id} (blocks retained)")
 
     def fork_cache(
         self,
@@ -1170,9 +1190,10 @@ class BlockAwarePrefixCache(CacheManager):
             last_access=time.time(),
         )
 
-        logger.debug(
-            f"Forked cache: {source_request_id} -> {new_request_id}"
-        )
+        if __debug__:
+            logger.debug(
+                f"Forked cache: {source_request_id} -> {new_request_id}"
+            )
 
         return forked_table
 
@@ -1229,18 +1250,20 @@ class BlockAwarePrefixCache(CacheManager):
             for idx, block_id in enumerate(block_table.block_ids):
                 block = self.paged_cache.allocated_blocks.get(block_id)
                 if not block:
-                    logger.debug(
-                        f"Block {block_id} not found, using {valid_block_count} "
-                        f"valid blocks ({valid_token_count} tokens)"
-                    )
+                    if __debug__:
+                        logger.debug(
+                            f"Block {block_id} not found, using {valid_block_count} "
+                            f"valid blocks ({valid_token_count} tokens)"
+                        )
                     break  # Stop at first missing block, use valid prefix
 
                 # Load block data from paged SSD
                 if block.block_hash is None:
-                    logger.debug(
-                        f"Block {block_id} has no block_hash, "
-                        f"using {valid_block_count} valid blocks"
-                    )
+                    if __debug__:
+                        logger.debug(
+                            f"Block {block_id} has no block_hash, "
+                            f"using {valid_block_count} valid blocks"
+                        )
                     break  # Stop here, use valid prefix
 
                 # Load with metadata for type information
@@ -1248,18 +1271,20 @@ class BlockAwarePrefixCache(CacheManager):
                     block.block_hash
                 )
                 if block_data is None:
-                    logger.debug(
-                        f"Failed to load block {block_id} from tiered cache, "
-                        f"using {valid_block_count} valid blocks"
-                    )
+                    if __debug__:
+                        logger.debug(
+                            f"Failed to load block {block_id} from tiered cache, "
+                            f"using {valid_block_count} valid blocks"
+                        )
                     # Remove failed block from hash cache to prevent future false hits
                     if block.block_hash is not None:
                         self.paged_cache.cached_block_hash_to_block.pop(
                             block.block_hash, block.block_id
                         )
-                        logger.debug(
-                            f"Removed missing block {block_id} from hash cache"
-                        )
+                        if __debug__:
+                            logger.debug(
+                                f"Removed missing block {block_id} from hash cache"
+                            )
                     break  # Stop here, use valid prefix
 
                 # Validate model_name to prevent cross-model cache contamination
@@ -1310,10 +1335,11 @@ class BlockAwarePrefixCache(CacheManager):
 
                 # Validate loaded data (pass cache types for hybrid models)
                 if not self._validate_block_cache_data(block_data, layer_cache_types):
-                    logger.debug(
-                        f"Block {block_id} has invalid layer data from tiered cache, "
-                        f"using {valid_block_count} valid blocks"
-                    )
+                    if __debug__:
+                        logger.debug(
+                            f"Block {block_id} has invalid layer data from tiered cache, "
+                            f"using {valid_block_count} valid blocks"
+                        )
                     break  # Stop here, use valid prefix
 
                 all_block_data.append(block_data)
@@ -1565,9 +1591,10 @@ class BlockAwarePrefixCache(CacheManager):
                             })
 
                 if not layer_states:
-                    logger.debug(
-                        f"Layer {layer_idx} has no data, cannot reconstruct cache"
-                    )
+                    if __debug__:
+                        logger.debug(
+                            f"Layer {layer_idx} has no data, cannot reconstruct cache"
+                        )
                     return None
 
                 # Get meta_state for this layer based on cache type
@@ -1649,9 +1676,10 @@ class BlockAwarePrefixCache(CacheManager):
                     )
 
                 if cache is None:
-                    logger.debug(
-                        f"Layer {layer_idx}: failed to reconstruct {cache_type_name}"
-                    )
+                    if __debug__:
+                        logger.debug(
+                            f"Layer {layer_idx}: failed to reconstruct {cache_type_name}"
+                        )
                     return None
 
                 reconstructed_caches.append(cache)
@@ -1692,17 +1720,19 @@ class BlockAwarePrefixCache(CacheManager):
                     )
                     return None
 
-            logger.debug(
-                f"Reconstructed cache from tiered cache: {len(reconstructed_caches)} layers, "
-                f"{block_table.num_tokens} tokens from {len(block_table.block_ids)} blocks"
-            )
+            if __debug__:
+                logger.debug(
+                    f"Reconstructed cache from tiered cache: {len(reconstructed_caches)} layers, "
+                    f"{block_table.num_tokens} tokens from {len(block_table.block_ids)} blocks"
+                )
 
             return reconstructed_caches
 
         except Exception as e:
             logger.warning(f"Failed to reconstruct cache: {e}")
             import traceback
-            logger.debug(traceback.format_exc())
+            if __debug__:
+                logger.debug(traceback.format_exc())
             return None
 
     def _fallback_reconstruct_layer(
@@ -1768,7 +1798,8 @@ class BlockAwarePrefixCache(CacheManager):
                 return SimpleKVCache(concat_keys, concat_values)
 
         except Exception as e:
-            logger.debug(f"Fallback reconstruction failed: {e}")
+            if __debug__:
+                logger.debug(f"Fallback reconstruction failed: {e}")
             return None
 
     def _find_kv_shape_ref(
@@ -1874,15 +1905,17 @@ class BlockAwarePrefixCache(CacheManager):
             cache.keys = mx.zeros((1, kv_heads, 0, head_dim))
             cache.values = mx.zeros((1, kv_heads, 0, head_dim))
             cache._idx = 0
-            logger.debug(
-                f"Created empty RotatingKVCache: max_size={max_size}, keep={keep}, "
-                f"offset={kvcache_offset}, kv_heads={kv_heads}, head_dim={head_dim}"
-            )
+            if __debug__:
+                logger.debug(
+                    f"Created empty RotatingKVCache: max_size={max_size}, keep={keep}, "
+                    f"offset={kvcache_offset}, kv_heads={kv_heads}, head_dim={head_dim}"
+                )
         else:
-            logger.debug(
-                f"Created empty RotatingKVCache: max_size={max_size}, keep={keep} "
-                f"(no shape ref, keys=None)"
-            )
+            if __debug__:
+                logger.debug(
+                    f"Created empty RotatingKVCache: max_size={max_size}, keep={keep} "
+                    f"(no shape ref, keys=None)"
+                )
 
         return cache
 
@@ -1937,9 +1970,10 @@ class BlockAwarePrefixCache(CacheManager):
 
                 # Check for None
                 if keys is None or values is None:
-                    logger.debug(
-                        f"Block validation failed: layer {layer_idx} has None keys/values"
-                    )
+                    if __debug__:
+                        logger.debug(
+                            f"Block validation failed: layer {layer_idx} has None keys/values"
+                        )
                     return False
 
                 # Skip seq_len check for non-sliceable types (e.g., ArraysCache, RotatingKVCache)
@@ -1954,13 +1988,15 @@ class BlockAwarePrefixCache(CacheManager):
                     if expected_seq_len is None:
                         expected_seq_len = seq_len
                     elif seq_len != expected_seq_len:
-                        logger.debug(
-                            f"Block validation failed: layer {layer_idx} has "
-                            f"seq_len {seq_len}, expected {expected_seq_len}"
-                        )
+                        if __debug__:
+                            logger.debug(
+                                f"Block validation failed: layer {layer_idx} has "
+                                f"seq_len {seq_len}, expected {expected_seq_len}"
+                            )
                         return False
             except (TypeError, ValueError) as e:
-                logger.debug(f"Block validation failed: layer {layer_idx} error: {e}")
+                if __debug__:
+                    logger.debug(f"Block validation failed: layer {layer_idx} error: {e}")
                 return False
 
         return True

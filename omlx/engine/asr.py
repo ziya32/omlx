@@ -61,7 +61,8 @@ class ASREngine(BaseNonStreamingEngine):
         from mlx_audio import stt
 
         def _load_asr_sync():
-            logger.debug(f"[ASR] Loading model on MLX executor thread: {self._model_name}")
+            if __debug__:
+                logger.debug(f"[ASR] Loading model on MLX executor thread: {self._model_name}")
             return stt.load(self._model_name)
 
         loop = asyncio.get_running_loop()
@@ -140,7 +141,8 @@ class ASREngine(BaseNonStreamingEngine):
                 split_audio_into_chunks,
             )
 
-            logger.debug(f"[ASR] Loading audio: {audio_path}")
+            if __debug__:
+                logger.debug(f"[ASR] Loading audio: {audio_path}")
             try:
                 audio = load_audio(audio_path)
             except (OSError, IOError) as e:
@@ -262,7 +264,8 @@ class ASREngine(BaseNonStreamingEngine):
         def _transcribe_sync() -> TranscriptionOutput:
             from mlx_audio.stt.generate import generate_transcription
 
-            logger.debug(f"[ASR] Transcribing on MLX executor thread: {audio_path}")
+            if __debug__:
+                logger.debug(f"[ASR] Transcribing on MLX executor thread: {audio_path}")
 
             kw: dict[str, Any] = {}
             if language and language != "auto":

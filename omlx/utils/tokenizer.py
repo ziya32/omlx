@@ -91,14 +91,16 @@ def is_harmony_model(model_name: str, config: dict[str, Any] | None = None) -> b
     if config is not None:
         model_type = config.get("model_type", "")
         if model_type == "gpt_oss":
-            logger.debug(f"Harmony model detected via config.model_type: {model_name}")
+            if __debug__:
+                logger.debug(f"Harmony model detected via config.model_type: {model_name}")
             return True
 
     # Fallback detection: model name pattern
     if model_name:
         name_lower = model_name.lower()
         if "gpt-oss" in name_lower or "gptoss" in name_lower:
-            logger.debug(f"Harmony model detected via model name pattern: {model_name}")
+            if __debug__:
+                logger.debug(f"Harmony model detected via model name pattern: {model_name}")
             return True
 
     return False
@@ -163,7 +165,8 @@ def get_tokenizer_config(
     # Apply Qwen3 fix if needed
     if is_qwen3_model(model_name):
         config["eos_token"] = "<|im_end|>"
-        logger.debug("Qwen3 detected: setting eos_token to <|im_end|>")
+        if __debug__:
+            logger.debug("Qwen3 detected: setting eos_token to <|im_end|>")
 
     return config
 
@@ -188,6 +191,7 @@ def apply_qwen3_fix(
     """
     if is_qwen3_model(model_name):
         tokenizer_config["eos_token"] = "<|im_end|>"
-        logger.debug("Qwen3 detected: setting eos_token to <|im_end|>")
+        if __debug__:
+            logger.debug("Qwen3 detected: setting eos_token to <|im_end|>")
 
     return tokenizer_config

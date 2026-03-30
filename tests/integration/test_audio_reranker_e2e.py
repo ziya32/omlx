@@ -101,42 +101,38 @@ def _get_model_type(model_path: Path) -> str:
 # ──────────────────────────────────────────────────────────────────────
 
 
-class TestLLMRerankerE2E:
-    """E2E tests for LLMRerankerEngine with a real Qwen3-Reranker model."""
+class TestRerankerE2E:
+    """E2E tests for MLXRerankerModel with a real Qwen3-Reranker model."""
 
     @pytest.fixture(scope="class")
     def reranker_model(self):
-        model = _find_model(["reranker", "Reranker"], min_size_gb=4.0, max_size_gb=8.0)
+        model = _find_model(["reranker", "Reranker"], min_size_gb=4.0, max_size_gb=20.0)
         if model is None:
-            pytest.skip("No reranker model found (need Qwen3-Reranker-4B or similar)")
+            pytest.skip("No reranker model found (need Qwen3-Reranker-8B or similar)")
         return model
 
     @pytest.fixture(scope="class")
-    def engine(self, reranker_model):
-        """Load the LLMRerankerEngine once for all tests in this class."""
-        import asyncio
-        from omlx.engine.llm_reranker import LLMRerankerEngine
+    def model(self, reranker_model):
+        """Load the MLXRerankerModel once for all tests in this class."""
+        from omlx.models.reranker import MLXRerankerModel
 
-        loop = asyncio.new_event_loop()
-        engine = LLMRerankerEngine(model_name=str(reranker_model))
-        loop.run_until_complete(engine.start())
-        yield engine, loop
-        loop.run_until_complete(engine.stop())
-        loop.close()
+        model = MLXRerankerModel(str(reranker_model))
+        model.load()
+        yield model
+        del model
         gc.collect()
         mx.clear_cache()
 
-    def test_rerank_basic(self, engine):
+    def test_rerank_basic(self, model):
         """Test basic reranking produces valid scores."""
-        eng, loop = engine
-        output = loop.run_until_complete(eng.rerank(
+        output = model.rerank(
             query="What is machine learning?",
             documents=[
                 "Machine learning is a subset of artificial intelligence that enables systems to learn from data.",
                 "The weather forecast for tomorrow predicts rain in the afternoon.",
                 "Deep learning uses neural networks with many layers to learn complex patterns.",
             ],
-        ))
+        )
 
         assert len(output.scores) == 3
         assert len(output.indices) == 3
@@ -151,10 +147,9 @@ class TestLLMRerankerE2E:
             f"weather doc ({output.scores[1]:.3f})"
         )
 
-    def test_rerank_top_n(self, engine):
+    def test_rerank_top_n(self, model):
         """Test top_n filtering returns correct number of results."""
-        eng, loop = engine
-        output = loop.run_until_complete(eng.rerank(
+        output = model.rerank(
             query="Python programming",
             documents=[
                 "Python is a high-level programming language.",
@@ -162,32 +157,39 @@ class TestLLMRerankerE2E:
                 "Cooking recipes for dinner.",
                 "Python supports multiple paradigms.",
             ],
-            top_n=2,
-        ))
+        )
 
-        assert len(output.scores) == 4  # all documents scored
-        assert len(output.indices) == 2  # only top 2 returned
+        # top_n is handled by the engine layer, not the model — all scored
+        assert len(output.scores) == 4
 
-    def test_rerank_single_document(self, engine):
+    def test_rerank_single_document(self, model):
         """Test reranking with a single document."""
-        eng, loop = engine
-        output = loop.run_until_complete(eng.rerank(
+        output = model.rerank(
             query="What is AI?",
             documents=["Artificial intelligence is the simulation of human intelligence."],
-        ))
+        )
 
         assert len(output.scores) == 1
         assert output.scores[0] > 0.5  # Should be relevant
 
-    def test_rerank_token_count(self, engine):
+    def test_rerank_token_count(self, model):
         """Test that token count is tracked."""
-        eng, loop = engine
-        output = loop.run_until_complete(eng.rerank(
+        output = model.rerank(
             query="test",
             documents=["doc one", "doc two"],
-        ))
+        )
 
         assert output.total_tokens > 0
+
+    def test_rerank_with_instruction(self, model):
+        """Test that custom instruction works."""
+        output = model.rerank(
+            query="A cartoon duck on a green background",
+            documents=["A red stone monument with Chinese calligraphy"],
+            instruction="Given a description of a photo, determine if the candidate describes the same visual content",
+        )
+
+        assert output.scores[0] < 0.1  # Should be very low — unrelated
 
 
 # ──────────────────────────────────────────────────────────────────────

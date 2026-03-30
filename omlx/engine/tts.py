@@ -213,6 +213,8 @@ class TTSEngine(BaseNonStreamingEngine):
         model_name = self._model_name
 
         def _load_sync():
+            if __debug__:
+                logger.debug(f"[TTS] Loading model on MLX executor thread: {model_name}")
             try:
                 return _load_model(model_name, strict=True)
             except ValueError as exc:
@@ -347,7 +349,8 @@ class TTSEngine(BaseNonStreamingEngine):
         try:
             # Step 1: Create generator on executor (quick)
             def _create_gen():
-                logger.debug(f"[TTS] Synthesizing: variant={self._variant}")
+                if __debug__:
+                    logger.debug(f"[TTS] Synthesizing: variant={self._variant}")
                 try:
                     return model.generate(**gen_kwargs)
                 except Exception as e:

@@ -36,9 +36,7 @@ if TYPE_CHECKING:
 import mlx.core as mx
 
 from .engine import BaseEngine, BatchedEngine
-from .engine.asr import ASREngine
 from .engine.embedding import EmbeddingEngine
-from .engine.llm_reranker import LLMRerankerEngine
 from .engine.reranker import RerankerEngine
 from .engine.stt import STTEngine
 from .engine.sts import STSEngine
@@ -76,11 +74,11 @@ class EngineEntry:
 
     model_id: str  # Directory name (e.g., "llama-3b")
     model_path: str  # Full path to model directory
-    model_type: Literal["llm", "vlm", "embedding", "reranker", "llm_reranker", "audio_stt", "audio_tts", "audio_sts"]  # Model type
-    engine_type: Literal["batched", "simple", "embedding", "reranker", "llm_reranker", "vlm", "audio_stt", "audio_tts", "audio_sts"]  # Engine type to use
+    model_type: Literal["llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"]  # Model type
+    engine_type: Literal["batched", "simple", "embedding", "reranker", "vlm", "audio_stt", "audio_tts", "audio_sts"]  # Engine type to use
     estimated_size: int  # Pre-calculated from safetensors (bytes)
     config_model_type: str = ""  # Raw model_type from config.json (e.g., "deepseekocr_2")
-    engine: BaseEngine | EmbeddingEngine | RerankerEngine | LLMRerankerEngine | STTEngine | STSEngine | TTSEngine | None = None  # Loaded engine instance
+    engine: BaseEngine | EmbeddingEngine | RerankerEngine | STTEngine | STSEngine | TTSEngine | None = None  # Loaded engine instance
     last_access: float = 0.0  # Timestamp for LRU (0 if never loaded)
     is_pinned: bool = False  # Never evict if True
     abort_loading: bool = False  # Deprecated: kept for backward compat only
@@ -324,7 +322,6 @@ class EnginePool:
         "vlm": "vlm",
         "embedding": "embedding",
         "reranker": "reranker",
-        "llm_reranker": "llm_reranker",
         "audio_stt": "audio_stt",
         "audio_tts": "audio_tts",
         "audio_sts": "audio_sts",
@@ -430,7 +427,7 @@ class EnginePool:
 
     async def get_engine(
         self, model_id: str, force_lm: bool = False,
-    ) -> BaseEngine | EmbeddingEngine | RerankerEngine | LLMRerankerEngine | STTEngine | STSEngine | TTSEngine:
+    ) -> BaseEngine | EmbeddingEngine | RerankerEngine | STTEngine | STSEngine | TTSEngine:
         """
         Get or load engine for the specified model.
 
@@ -587,11 +584,12 @@ class EnginePool:
                 # CancelledError propagates here if client disconnects.
                 # Bounded by max_wait_timeout to prevent infinite waits.
                 wait_target = "ready_event" if event is entry.ready_event else "drain_complete"
-                logger.debug(
-                    f"get_engine({model_id}) waiting on {wait_target}, "
-                    f"iteration={iterations}, "
-                    f"elapsed={time.monotonic() - start_time:.1f}s"
-                )
+                if __debug__:
+                    logger.debug(
+                        f"get_engine({model_id}) waiting on {wait_target}, "
+                        f"iteration={iterations}, "
+                        f"elapsed={time.monotonic() - start_time:.1f}s"
+                    )
 
                 try:
                     await asyncio.wait_for(
@@ -628,10 +626,11 @@ class EnginePool:
                         model_id=model_id,
                     )
 
-                logger.debug(
-                    f"get_engine({model_id}) model named {entry.model_path} woke from {wait_target}, "
-                    f"state={entry.state.value}"
-                )
+                if __debug__:
+                    logger.debug(
+                        f"get_engine({model_id}) model named {entry.model_path} woke from {wait_target}, "
+                        f"state={entry.state.value}"
+                    )
 
                 # If we were waiting on a ready_event that fired due to load
                 # failure, propagate the original error immediately instead of
@@ -749,10 +748,11 @@ class EnginePool:
                 e.state == EngineState.UNLOADING
                 and e.unload_complete is not None
             ):
-                logger.debug(
-                    f"Waiting for {mid} to finish unloading "
-                    f"before loading {entry.model_id}"
-                )
+                if __debug__:
+                    logger.debug(
+                        f"Waiting for {mid} to finish unloading "
+                        f"before loading {entry.model_id}"
+                    )
                 return e.unload_complete
 
         # Serialize model loading: only one model may be in LOADING state at
@@ -766,10 +766,11 @@ class EnginePool:
                 and e.state == EngineState.LOADING
                 and e.ready_event is not None
             ):
-                logger.debug(
-                    f"Serializing load: waiting for {mid} to finish "
-                    f"loading before starting {entry.model_id}"
-                )
+                if __debug__:
+                    logger.debug(
+                        f"Serializing load: waiting for {mid} to finish "
+                        f"loading before starting {entry.model_id}"
+                    )
                 return e.ready_event
 
         if self._max_model_memory is None:
@@ -777,7 +778,7 @@ class EnginePool:
             return await self._check_process_memory(entry)
 
         required = entry.estimated_size
-        if entry.model_type not in ("audio_stt", "audio_tts", "audio_sts", "embedding", "reranker", "llm_reranker"):
+        if entry.model_type not in ("audio_stt", "audio_tts", "audio_sts", "embedding", "reranker"):
             required += int(entry.estimated_size * 0.25)  # KV headroom
 
         while self._committed_memory() + required > self._max_model_memory:
@@ -1079,7 +1080,7 @@ class EnginePool:
 
         Works for all engine types:
         - BatchedEngine / VLMBatchedEngine: checks _output_collectors
-        - ASREngine / TTSEngine: checks active_operations counter
+        - STTEngine / TTSEngine: checks active_operations counter
         """
         # BatchedEngine / VLMBatchedEngine: check output collectors
         engine_core = getattr(engine, "_engine", None)
@@ -1282,11 +1283,6 @@ class EnginePool:
             engine = EmbeddingEngine(model_name=entry.model_path)
         elif effective_type == "reranker":
             engine = RerankerEngine(model_name=entry.model_path)
-        elif effective_type == "llm_reranker":
-            engine = LLMRerankerEngine(
-                model_name=entry.model_path,
-                scheduler_config=self._scheduler_config,
-            )
         elif effective_type == "vlm":
             engine = VLMBatchedEngine(
                 model_name=entry.model_path,

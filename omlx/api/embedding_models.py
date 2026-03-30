@@ -58,6 +58,13 @@ class EmbeddingRequest(BaseModel):
     Only supported by some models. If not supported, returns full dimensions.
     """
 
+    instruction: Optional[str] = None
+    """
+    Task instruction for instruction-aware embedding models (e.g. Qwen3-Embedding).
+    When provided, inputs are formatted as 'Instruct: {instruction}\\nQuery:{text}'.
+    Use for queries only — documents should be embedded without instruction.
+    """
+
     @model_validator(mode="after")
     def validate_input_source(self) -> "EmbeddingRequest":
         """Require exactly one input source."""

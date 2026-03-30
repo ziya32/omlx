@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//tmp/**)",
+      "Bash(git checkout:*)",
+      "Bash(git add:*)",
+      "Bash(git rebase:*)",
+      "Bash(xxd /Volumes/BeiFen/twin-repos/moa/omlx/omlx/engine_pool.py)",
+      "Bash(python3:*)"
+    ]
+  }
+}

@@ -198,11 +198,7 @@ def server_app(model_dir, model_ids):
             model_ids["embedding"],
             ModelSettings(model_type_override="embedding"),
         )
-        # Qwen3-Reranker is CausalLM — override to llm_reranker
-        settings_mgr.set_settings(
-            model_ids["reranker"],
-            ModelSettings(model_type_override="llm_reranker"),
-        )
+        # Qwen3-Reranker is auto-detected via CausalLM arch + directory name
 
         init_server(
             model_dirs=str(model_dir),

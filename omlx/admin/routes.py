@@ -1462,7 +1462,7 @@ async def update_model_settings(
                         )
         current_settings.aliases = alias_values
     if "model_type_override" in sent:
-        valid_types = {"llm", "vlm", "embedding", "reranker", "llm_reranker", "audio_stt", "audio_tts", "audio_sts"}
+        valid_types = {"llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"}
         # Treat empty string as None (auto-detect)
         override_value = request.model_type_override or None
         if override_value is not None and override_value not in valid_types:
@@ -1477,7 +1477,6 @@ async def update_model_settings(
             "vlm": "vlm",
             "embedding": "embedding",
             "reranker": "reranker",
-            "llm_reranker": "llm_reranker",
             "audio_stt": "audio_stt",
             "audio_tts": "audio_tts",
             "audio_sts": "audio_sts",
@@ -3079,13 +3078,15 @@ async def delete_hf_model(
     # DeprecationWarning, with onerror fallback for older versions.
     def _handle_onexc(func, path, exc):
         if isinstance(exc, FileNotFoundError) and Path(path).name.startswith("._"):
-            logger.debug(f"Ignoring missing resource fork file: {path}")
+            if __debug__:
+                logger.debug(f"Ignoring missing resource fork file: {path}")
             return
         raise exc
 
     def _handle_onerror(func, path, exc_info):
         if exc_info[0] == FileNotFoundError and Path(path).name.startswith("._"):
-            logger.debug(f"Ignoring missing resource fork file: {path}")
+            if __debug__:
+                logger.debug(f"Ignoring missing resource fork file: {path}")
             return
         raise exc_info[1].with_traceback(exc_info[2])
 
