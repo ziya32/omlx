@@ -26,6 +26,7 @@ Usage:
 import asyncio
 import copy
 import logging
+import math
 from collections.abc import AsyncIterator
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -454,6 +455,7 @@ class VLMBatchedEngine(BaseEngine):
         stream_interval: int = 1,
         enable_thinking: bool | None = None,
         model_settings: Any | None = None,
+        process_memory_max_bytes: int = 0,
     ):
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
@@ -461,6 +463,7 @@ class VLMBatchedEngine(BaseEngine):
         self._stream_interval = stream_interval
         self._enable_thinking = enable_thinking
         self._model_settings = model_settings
+        self._process_memory_max_bytes = process_memory_max_bytes
 
         self._vlm_model = None
         self._processor = None
@@ -746,7 +749,49 @@ class VLMBatchedEngine(BaseEngine):
         self._inject_tool_calling(self._tokenizer)
 
         self._loaded = True
+
+        # Compute vision encoding limits from memory headroom.
+        # These are set once at load time and used per-request.
+        self._init_vision_limits()
+
         logger.info(f"VLMBatchedEngine loaded: {self._model_name}")
+
+    def _init_vision_limits(self) -> None:
+        """Compute vision chunk budget and token limit from real memory state.
+
+        Called once after the VLM model finishes loading, when
+        ``mx.get_active_memory()`` reflects the actual committed state.
+        """
+        from ..engine_pool import EnginePool
+        ctx = self.max_context_window or 0
+        self.max_vision_tokens: int = int(ctx * EnginePool._VISION_MAX_CONTEXT_FRACTION) if ctx else 0
+
+        # Derive chunk budget from actual Metal memory headroom.
+        # Clear cache first so active_mem reflects real committed memory,
+        # not stale allocations from recently-unloaded models.
+        try:
+            mx.clear_cache()
+            active_mem = mx.get_active_memory()
+        except Exception:
+            active_mem = 0
+
+        max_bytes = self._process_memory_max_bytes
+        headroom = max(0, max_bytes - active_mem) if max_bytes else 0
+
+        self.vision_chunk_budget_pixels: int = int(
+            headroom * EnginePool._VISION_SAFETY_FACTOR
+            / EnginePool._VISION_BYTES_PER_PIXEL
+        ) if headroom > 0 else 0
+
+        logger.info(
+            "Vision limits: max_vision_tokens=%d, chunk_budget_pixels=%d "
+            "(headroom=%.1fGB, active=%.1fGB, limit=%.1fGB)",
+            self.max_vision_tokens,
+            self.vision_chunk_budget_pixels,
+            headroom / 1e9,
+            active_mem / 1e9,
+            max_bytes / 1e9,
+        )
 
     async def stop(self) -> None:
         """Stop the engine and cleanup resources.
@@ -1095,6 +1140,18 @@ class VLMBatchedEngine(BaseEngine):
             else:
                 raise
 
+        # Pre-encoding resize: cap individual images to the chunk budget
+        # so no single image can exceed the vision encoder's memory limit.
+        budget = getattr(self, "vision_chunk_budget_pixels", 0)
+        if budget > 0:
+            for i, img in enumerate(images):
+                px = img.width * img.height
+                if px > budget:
+                    scale = math.sqrt(budget / px)
+                    images[i] = img.resize(
+                        (int(img.width * scale), int(img.height * scale)),
+                    )
+
         # Tokenize text and preprocess images
         inputs = prepare_inputs(
             self._processor,
@@ -1116,75 +1173,202 @@ class VLMBatchedEngine(BaseEngine):
         }
 
         if pixel_values is not None and num_images > 0:
-            # Compute image hash FIRST for vision feature cache lookup
-            image_hash = compute_image_hash(images)
+            grid_thw = extra_model_inputs.get("image_grid_thw")
+            if grid_thw is None:
+                grid_thw = extra_model_inputs.get("video_grid_thw")
 
-            # Build call kwargs from extra_model_inputs
-            call_kwargs = dict(extra_model_inputs)
-
-            # Try vision feature cache
-            if self._vision_cache is not None and self._vision_cache_enabled and image_hash:
-                cached_features = self._vision_cache.get(image_hash, self._model_name)
-                if cached_features is not None:
-                    call_kwargs["cached_image_features"] = cached_features
-                    logger.debug("Vision feature cache hit: %s", image_hash[:16])
-                else:
-                    try:
-                        features = self._compute_vision_features(
-                            pixel_values, extra_model_inputs
-                        )
-                        if features is not None:
-                            mx.eval(features)
-                            self._vision_cache.put(
-                                image_hash, self._model_name, features
-                            )
-                            call_kwargs["cached_image_features"] = features
-                            logger.debug(
-                                "Vision feature cache miss, stored: %s",
-                                image_hash[:16],
-                            )
-                    except Exception:
-                        logger.debug(
-                            "Vision feature computation failed, using full pipeline",
-                            exc_info=True,
-                        )
-
-            # Run vision encoder + embedding merge.
-            # Pass attention_mask as 'mask' — mlx-vlm models (e.g. Gemma 3)
-            # expect it as a positional/keyword arg named 'mask'.
-            try:
-                embed_features = self._vlm_model.get_input_embeddings(
-                    input_ids, pixel_values, mask=attention_mask, **call_kwargs
-                )
-            except TypeError:
-                # cached_image_features kwarg not supported — disable and retry
-                if "cached_image_features" in call_kwargs:
-                    logger.warning(
-                        "cached_image_features not supported by %s, "
-                        "disabling vision feature cache",
-                        self.model_type,
+            # ── Context window guard ──────────────────────────────────
+            if grid_thw is not None and self.max_vision_tokens > 0:
+                vision_tokens = sum(
+                    int(grid_thw[i, 0]) * int(grid_thw[i, 1]) * int(grid_thw[i, 2])
+                    for i in range(grid_thw.shape[0])
+                ) // 4  # spatial_merge_size=2 → merge by 4
+                if vision_tokens > self.max_vision_tokens:
+                    ctx = self.max_context_window or 0
+                    safe = int(self.max_vision_tokens / (vision_tokens / num_images))
+                    from fastapi import HTTPException
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"vision_token_limit_exceeded: "
+                            f"~{vision_tokens} vision tokens, limit is "
+                            f"{self.max_vision_tokens} (80% of {ctx} context). "
+                            f"Reduce frame count to ~{safe}."
+                        ),
                     )
-                    self._vision_cache_enabled = False
-                    call_kwargs.pop("cached_image_features")
+
+            # ── Decide: fast path vs chunked path ─────────────────────
+            budget = getattr(self, "vision_chunk_budget_pixels", 0)
+            total_pixels = sum(img.width * img.height for img in images)
+            needs_chunking = budget > 0 and total_pixels > budget
+
+            if not needs_chunking:
+                # Fast path — single pass through get_input_embeddings,
+                # optionally reusing cached vision features for repeated images.
+                image_hash = compute_image_hash(images)
+                call_kwargs = dict(extra_model_inputs)
+
+                # Try vision feature cache
+                if self._vision_cache is not None and self._vision_cache_enabled and image_hash:
+                    cached_features = self._vision_cache.get(image_hash, self._model_name)
+                    if cached_features is not None:
+                        call_kwargs["cached_image_features"] = cached_features
+                        logger.debug("Vision feature cache hit: %s", image_hash[:16])
+                    else:
+                        try:
+                            features = self._compute_vision_features(
+                                pixel_values, extra_model_inputs
+                            )
+                            if features is not None:
+                                mx.eval(features)
+                                self._vision_cache.put(
+                                    image_hash, self._model_name, features
+                                )
+                                call_kwargs["cached_image_features"] = features
+                                logger.debug(
+                                    "Vision feature cache miss, stored: %s",
+                                    image_hash[:16],
+                                )
+                        except Exception:
+                            logger.debug(
+                                "Vision feature computation failed, using full pipeline",
+                                exc_info=True,
+                            )
+
+                # Run vision encoder + embedding merge.
+                # Pass attention_mask as 'mask' — mlx-vlm models (e.g. Gemma 3)
+                # expect it as a positional/keyword arg named 'mask'.
+                try:
                     embed_features = self._vlm_model.get_input_embeddings(
                         input_ids, pixel_values, mask=attention_mask, **call_kwargs
                     )
-                else:
-                    raise
-            mx.eval(embed_features.inputs_embeds)
+                except TypeError:
+                    # cached_image_features kwarg not supported — disable and retry
+                    if "cached_image_features" in call_kwargs:
+                        logger.warning(
+                            "cached_image_features not supported by %s, "
+                            "disabling vision feature cache",
+                            self.model_type,
+                        )
+                        self._vision_cache_enabled = False
+                        call_kwargs.pop("cached_image_features")
+                        embed_features = self._vlm_model.get_input_embeddings(
+                            input_ids, pixel_values, mask=attention_mask, **call_kwargs
+                        )
+                    else:
+                        raise
+                mx.eval(embed_features.inputs_embeds)
 
-            # Convert InputEmbeddingsFeatures to dict for extra kwargs
-            extra_kwargs = {}
-            if hasattr(embed_features, "to_dict"):
-                feat_dict = embed_features.to_dict()
-                for k, v in feat_dict.items():
-                    if k != "inputs_embeds" and v is not None:
-                        extra_kwargs[k] = v
+                extra_kwargs = {}
+                if hasattr(embed_features, "to_dict"):
+                    feat_dict = embed_features.to_dict()
+                    for k, v in feat_dict.items():
+                        if k != "inputs_embeds" and v is not None:
+                            extra_kwargs[k] = v
 
-            # Extract token IDs as list
+                token_ids = input_ids[0].tolist() if input_ids.ndim > 1 else input_ids.tolist()
+                return token_ids, embed_features.inputs_embeds, extra_kwargs, image_hash
+
+            # ── Chunked vision encoding ───────────────────────────────
+            # Bypass get_input_embeddings and call vision_tower + merge
+            # directly so we can mx.eval per chunk.
+            logger.info(
+                "Chunked vision encoding: %d images, %dM total pixels, "
+                "%dM budget → splitting",
+                num_images,
+                total_pixels // 1_000_000,
+                budget // 1_000_000,
+            )
+
+            vision_tower = self._vlm_model.vision_tower
+            merge_fn = self._vlm_model.merge_input_ids_with_image_features
+            embed_tokens = self._vlm_model.language_model.model.embed_tokens
+            get_rope = self._vlm_model.language_model.get_rope_index
+
+            dtype = vision_tower.patch_embed.proj.weight.dtype
+            pixel_values = pixel_values.astype(dtype)
+
+            # Compute per-image patch counts from grid_thw
+            patches_per_image = [
+                int(grid_thw[i, 0]) * int(grid_thw[i, 1]) * int(grid_thw[i, 2])
+                for i in range(grid_thw.shape[0])
+            ]
+
+            # Group images into chunks respecting pixel budget
+            chunks: list[list[int]] = []
+            cur_indices: list[int] = []
+            cur_pixels = 0
+            for i in range(num_images):
+                px = images[i].width * images[i].height
+                if cur_indices and cur_pixels + px > budget:
+                    chunks.append(cur_indices)
+                    cur_indices, cur_pixels = [], 0
+                cur_indices.append(i)
+                cur_pixels += px
+            if cur_indices:
+                chunks.append(cur_indices)
+
+            # Run vision encoder per chunk
+            all_hidden: list[mx.array] = []
+            patch_offset = 0
+            for chunk_idx, chunk_indices in enumerate(chunks):
+                chunk_grid = grid_thw[chunk_indices]
+                n_patches = sum(patches_per_image[i] for i in chunk_indices)
+                chunk_pv = pixel_values[patch_offset : patch_offset + n_patches]
+                patch_offset += n_patches
+
+                hidden, deepstack_features = vision_tower(chunk_pv, chunk_grid)
+                # Chunked path only supports models without deepstack
+                # (Qwen3.5).  Qwen3-VL deepstack would need concatenation.
+                if deepstack_features:
+                    raise RuntimeError(
+                        f"Chunked vision encoding does not support deepstack "
+                        f"(got {len(deepstack_features)} features)"
+                    )
+                mx.eval(hidden)
+                mx.clear_cache()
+                all_hidden.append(hidden)
+                if __debug__:
+                    logger.debug(
+                        "Vision chunk %d/%d: %d images, %d patches",
+                        chunk_idx + 1, len(chunks),
+                        len(chunk_indices), n_patches,
+                    )
+
+            hidden_states = (
+                mx.concatenate(all_hidden, axis=0)
+                if len(all_hidden) > 1
+                else all_hidden[0]
+            )
+
+            # Merge vision features into text embeddings
+            inputs_embeds = embed_tokens(input_ids)
+            inputs_embeds, _ = merge_fn(
+                hidden_states,
+                inputs_embeds,
+                input_ids,
+                self._vlm_model.config.image_token_index,
+                self._vlm_model.config.video_token_index,
+            )
+
+            # Position IDs for RoPE
+            image_grid_thw = extra_model_inputs.get("image_grid_thw")
+            video_grid_thw = extra_model_inputs.get("video_grid_thw")
+            position_ids, rope_deltas = get_rope(
+                input_ids, image_grid_thw, video_grid_thw, attention_mask,
+            )
+            self._vlm_model.language_model._position_ids = position_ids
+            self._vlm_model.language_model._rope_deltas = rope_deltas
+
+            mx.eval(inputs_embeds)
+
             token_ids = input_ids[0].tolist() if input_ids.ndim > 1 else input_ids.tolist()
-
-            return token_ids, embed_features.inputs_embeds, extra_kwargs, image_hash
+            image_hash = compute_image_hash(images)
+            # extra_kwargs is empty: Qwen3.5 get_input_embeddings returns
+            # InputEmbeddingsFeatures(inputs_embeds=...) with no other fields.
+            # Other VLM models (e.g., Gemma 3) may need extra_kwargs — the
+            # chunked path must be extended if those models are supported.
+            return token_ids, inputs_embeds, {}, image_hash
         else:
             # Text-only (no images in this message)
             token_ids = input_ids[0].tolist() if input_ids.ndim > 1 else input_ids.tolist()

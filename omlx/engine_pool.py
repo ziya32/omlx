@@ -82,6 +82,7 @@ class EngineEntry:
     last_access: float = 0.0  # Timestamp for LRU (0 if never loaded)
     is_pinned: bool = False  # Never evict if True
     abort_loading: bool = False  # Deprecated: kept for backward compat only
+    _vision_limits_cache: dict | None = None  # Cached compute_vision_limits result
 
     # State machine fields
     state: EngineState = EngineState.UNLOADED
@@ -241,6 +242,77 @@ class EnginePool:
     def loaded_model_count(self) -> int:
         """Number of currently loaded models."""
         return sum(1 for e in self._entries.values() if e.engine is not None)
+
+    # -------------------------------------------------------------------------
+    # Vision limits (memory-aware, pre-load)
+    # -------------------------------------------------------------------------
+
+    # Peak GPU activation bytes per input pixel for Qwen3-VL/3.5 (32-layer ViT).
+    # Empirically: 50M pixels OOM'd with 21.5 GB headroom (>430 B/px), while
+    # ~5M pixels succeeded with 7 GB headroom (<1400 B/px).  700 B/px provides
+    # a safe margin across different memory configurations.
+    _VISION_BYTES_PER_PIXEL = 700
+    _VISION_SAFETY_FACTOR = 0.7  # leave 30% headroom for KV growth / allocator
+    _VISION_MAX_CONTEXT_FRACTION = 0.8  # max share of context window for vision tokens
+
+    def compute_vision_limits(self, vlm_entry: EngineEntry) -> dict[str, Any]:
+        """Compute vision processing limits for a VLM model.
+
+        Uses the model's ``estimated_size`` from safetensors metadata and
+        ``max_position_embeddings`` from config.json — does NOT require the
+        model to be loaded.  Only pinned models count toward committed
+        memory because unpinned models are evicted when the VLM loads.
+        """
+        enforcer = self._process_memory_enforcer
+        max_bytes = getattr(enforcer, "max_bytes", 0) if enforcer else 0
+        if not max_bytes:
+            return {}
+
+        # Project memory when VLM is loaded
+        pinned_other = sum(
+            e.estimated_size for e in self._entries.values()
+            if e.is_pinned and e is not vlm_entry
+        )
+        vlm_loaded_size = int(vlm_entry.estimated_size * 1.25)  # 25% KV headroom
+        headroom = max(0, max_bytes - pinned_other - vlm_loaded_size)
+
+        chunk_budget = int(
+            headroom * self._VISION_SAFETY_FACTOR / self._VISION_BYTES_PER_PIXEL
+        )
+
+        ctx = self._read_context_window(vlm_entry)
+        max_vision_tokens = int(ctx * self._VISION_MAX_CONTEXT_FRACTION) if ctx else 0
+
+        return {
+            "chunk_budget_pixels": chunk_budget,
+            "max_context_fraction": self._VISION_MAX_CONTEXT_FRACTION,
+            "max_vision_tokens": max_vision_tokens,
+            "memory_headroom_bytes": headroom,
+        }
+
+    @staticmethod
+    def _read_context_window(entry: EngineEntry) -> int:
+        """Read max_position_embeddings from config.json without loading."""
+        import json as _json
+        from pathlib import Path
+
+        cfg_path = Path(entry.model_path) / "config.json"
+        try:
+            with open(cfg_path) as f:
+                cfg = _json.load(f)
+            # VLMs: check text_config first, then root
+            tc = cfg.get("text_config", {})
+            for key in ("max_position_embeddings", "max_seq_len"):
+                val = tc.get(key) if isinstance(tc, dict) else None
+                if isinstance(val, int) and val > 0:
+                    return val
+            for key in ("max_position_embeddings", "max_seq_len"):
+                val = cfg.get(key)
+                if isinstance(val, int) and val > 0:
+                    return val
+        except Exception:
+            pass
+        return 0
 
     # -------------------------------------------------------------------------
     # Model discovery and settings
@@ -1284,10 +1356,14 @@ class EnginePool:
         elif effective_type == "reranker":
             engine = RerankerEngine(model_name=entry.model_path)
         elif effective_type == "vlm":
+            enforcer = self._process_memory_enforcer
             engine = VLMBatchedEngine(
                 model_name=entry.model_path,
                 scheduler_config=self._scheduler_config,
                 model_settings=model_settings,
+                process_memory_max_bytes=(
+                    getattr(enforcer, "max_bytes", 0) if enforcer else 0
+                ),
             )
         elif entry.engine_type == "audio_stt":
             engine = STTEngine(model_name=entry.model_path)
@@ -1534,6 +1610,27 @@ class EnginePool:
 
         logger.info("Engine pool shutdown complete")
 
+    def _model_status_entry(self, mid: str, e: EngineEntry) -> dict:
+        """Build a single model entry for get_status()."""
+        info: dict[str, Any] = {
+            "id": mid,
+            "loaded": e.engine is not None,
+            "state": e.state.value,
+            "is_loading": e.state == EngineState.LOADING,
+            "estimated_size": e.estimated_size,
+            "pinned": e.is_pinned,
+            "engine_type": e.engine_type,
+            "model_type": e.model_type,
+            "config_model_type": e.config_model_type,
+            "last_access": e.last_access if e.last_access > 0 else None,
+        }
+        if e.model_type == "vlm":
+            if e._vision_limits_cache is None:
+                e._vision_limits_cache = self.compute_vision_limits(e)
+            if e._vision_limits_cache:
+                info["vision_limits"] = e._vision_limits_cache
+        return info
+
     def get_status(self) -> dict:
         """
         Get pool status for monitoring endpoints.
@@ -1549,19 +1646,7 @@ class EnginePool:
                 1 for e in self._entries.values() if e.engine is not None
             ),
             "models": [
-                {
-                    "id": mid,
-                    "model_path": e.model_path,
-                    "loaded": e.engine is not None,
-                    "state": e.state.value,
-                    "is_loading": e.state == EngineState.LOADING,
-                    "estimated_size": e.estimated_size,
-                    "pinned": e.is_pinned,
-                    "engine_type": e.engine_type,
-                    "model_type": e.model_type,
-                    "config_model_type": e.config_model_type,
-                    "last_access": e.last_access if e.last_access > 0 else None,
-                }
+                self._model_status_entry(mid, e)
                 for mid, e in sorted(self._entries.items())
             ],
         }

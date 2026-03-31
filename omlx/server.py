@@ -565,7 +565,13 @@ async def http_exception_handler(request: FastAPIRequest, exc: HTTPException):
             exc.detail,
         )
     if _is_api_route(request):
-        content = _openai_error_body(exc.detail, exc.status_code)
+        detail = exc.detail or ""
+        code = None
+        # Structured error codes embedded in the detail prefix
+        if isinstance(detail, str) and detail.startswith("vision_token_limit_exceeded:"):
+            code = "vision_token_limit_exceeded"
+            detail = detail[len("vision_token_limit_exceeded:"):].strip()
+        content = _openai_error_body(detail, exc.status_code, code=code)
     else:
         content = {"detail": exc.detail}
     return JSONResponse(status_code=exc.status_code, content=content)
