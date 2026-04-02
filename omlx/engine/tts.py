@@ -13,6 +13,7 @@ executor submission so LLM token generation can interleave between segments.
 
 import asyncio
 import gc
+import inspect
 import json
 import logging
 import time
@@ -268,8 +269,6 @@ class TTSEngine(BaseNonStreamingEngine):
         Uses inspect.signature to route voice/instruct to the correct parameter
         name, ensuring compatibility across Qwen3-TTS, Kokoro, VibeVoice, etc.
         """
-        import inspect
-
         model = self._model
         gen_params = inspect.signature(model.generate).parameters
 

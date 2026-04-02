@@ -29,7 +29,7 @@ class TestVerifyApiKey:
 
         try:
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(verify_api_key(credentials=None))
+                asyncio.run(verify_api_key(request=_mock_request(), credentials=None))
             assert exc_info.value.status_code == 401
             assert "not configured" in exc_info.value.detail.lower()
         finally:

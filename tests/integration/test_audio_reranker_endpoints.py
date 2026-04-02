@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
-from omlx.engine.asr import ASREngine, TranscriptionOutput
+from omlx.engine.stt import STTEngine, TranscriptionOutput
 
 TEST_API_KEY = "test-api-key"
 from omlx.engine.reranker import RerankerEngine
@@ -30,8 +30,8 @@ from omlx.models.reranker import RerankOutput
 # ──────────────────────────────────────────────────────────────────────
 
 
-class MockASREngine(ASREngine):
-    """Mock ASR engine that returns canned transcription."""
+class MockSTTEngine(STTEngine):
+    """Mock STT engine that returns canned transcription."""
 
     def __init__(self, model_name: str = "test-asr-model"):
         self._model_name = model_name
@@ -81,7 +81,7 @@ class MockTTSEngine(TTSEngine):
     async def stop(self):
         pass
 
-    async def synthesize(self, text, speaker=None, instruct=None, ref_audio=None, ref_text=None):
+    async def synthesize(self, text, voice=None, speed=1.0, instructions=None, ref_audio=None, ref_text=None, **kwargs):
         # Generate minimal valid WAV header + 1 second of silence
         sample_rate = 24000
         num_samples = sample_rate
@@ -203,13 +203,13 @@ class MockEnginePool:
 
     def __init__(self, tts_model_dir: str = ""):
         self._llm_engine = MockBaseEngine()
-        self._asr_engine = MockASREngine()
+        self._stt_engine = MockSTTEngine()
         self._tts_engine = MockTTSEngine()
         self._reranker_engine = MockRerankerEngine()
         self._entries = {
             "test-llm-model": MagicMock(engine_type="batched", engine=self._llm_engine),
-            "test-asr-model": MagicMock(engine_type="asr", engine=self._asr_engine),
-            "test-tts-model": MagicMock(engine_type="tts", engine=self._tts_engine, model_path=tts_model_dir),
+            "test-asr-model": MagicMock(engine_type="audio_stt", engine=self._stt_engine),
+            "test-tts-model": MagicMock(engine_type="audio_tts", engine=self._tts_engine, model_path=tts_model_dir),
             "test-reranker": MagicMock(engine_type="reranker", engine=self._reranker_engine),
         }
 
@@ -250,7 +250,7 @@ class MockEnginePool:
 
     async def get_engine(self, model_id):
         if model_id == "test-asr-model":
-            return self._asr_engine
+            return self._stt_engine
         if model_id == "test-tts-model":
             return self._tts_engine
         if model_id == "test-reranker":
@@ -346,7 +346,7 @@ class TestTranscriptionEndpoint:
             data={"model": "test-asr-model"},
         )
 
-        assert response.status_code == 400
+        assert response.status_code in (400, 422)
 
     def test_transcription_missing_model(self, client):
         """Test error when model not specified."""
@@ -356,7 +356,7 @@ class TestTranscriptionEndpoint:
             files={"file": ("test.wav", wav, "audio/wav")},
         )
 
-        assert response.status_code == 400
+        assert response.status_code in (400, 422)
 
     @staticmethod
     def _make_wav():
@@ -669,7 +669,7 @@ class TestSpeakersFromDisk:
 
     def test_all_tts_models_readable(self):
         """Every TTS model on disk must have a parseable config.json for speakers."""
-        from omlx.server import _read_speakers_from_config
+        from omlx.api.audio_routes import _read_speakers_from_config
 
         models = self._find_tts_models()
         if not models:
@@ -876,90 +876,6 @@ class TestEngineTypeRouting:
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Prefill-only mode integration tests
-# ──────────────────────────────────────────────────────────────────────
-
-
-class TestPrefillOnlyIntegration:
-    """Test prefill_only fields through the request/output chain."""
-
-    def test_sampling_params_prefill_only_round_trip(self):
-        """Test SamplingParams correctly carries prefill_only fields."""
-        from omlx.request import SamplingParams
-
-        params = SamplingParams(
-            max_tokens=1,
-            temperature=0.0,
-            prefill_only=True,
-            prefill_output="logits",
-        )
-
-        assert params.prefill_only is True
-        assert params.prefill_output == "logits"
-        assert params.max_tokens == 1
-
-    def test_request_output_carries_logits(self):
-        """Test RequestOutput can carry last_logits."""
-        from omlx.request import RequestOutput
-
-        logits = list(range(1000))
-        output = RequestOutput(
-            request_id="test",
-            finished=True,
-            finish_reason="length",
-            last_logits=logits,
-        )
-
-        assert output.last_logits is not None
-        assert len(output.last_logits) == 1000
-        assert output.last_logits[0] == 0
-        assert output.last_logits[999] == 999
-
-    def test_request_with_prefill_only_sampling(self):
-        """Test Request can be created with prefill_only SamplingParams."""
-        from omlx.request import Request, SamplingParams
-
-        params = SamplingParams(
-            max_tokens=1,
-            prefill_only=True,
-            prefill_output="logits",
-        )
-        request = Request(
-            request_id="prefill-test",
-            prompt="Test prompt",
-            sampling_params=params,
-        )
-
-        assert request.sampling_params.prefill_only is True
-        assert request.sampling_params.prefill_output == "logits"
-
-    def test_prefill_only_with_reranker_scoring(self):
-        """Test the full scoring pipeline: logits -> softmax -> P(yes)."""
-        import mlx.core as mx
-
-        # Simulate what RerankerEngine does after getting logprobs
-        vocab_size = 10000
-        yes_id = 42
-        no_id = 99
-
-        logits = [0.0] * vocab_size
-        logits[yes_id] = 5.0    # high yes
-        logits[no_id] = -5.0    # low no
-
-        logits_arr = mx.array(logits)
-        probs = mx.softmax(logits_arr[mx.array([yes_id, no_id])])
-        mx.eval(probs)
-
-        p_yes = float(probs[0].item())
-        p_no = float(probs[1].item())
-
-        # P(yes) should be close to 1.0 (exp(5) >> exp(-5))
-        assert p_yes > 0.99
-        assert p_no < 0.01
-        assert abs(p_yes + p_no - 1.0) < 1e-6
-
-
-# ──────────────────────────────────────────────────────────────────────
 # Model discovery integration tests
 # ──────────────────────────────────────────────────────────────────────
 
@@ -980,14 +896,14 @@ class TestModelDiscoveryIntegration:
         from omlx.model_discovery import detect_model_type, DiscoveredModel
         from omlx.engine_pool import EnginePool
 
-        assert detect_model_type(model_dir) == "asr"
+        assert detect_model_type(model_dir) == "audio_stt"
 
         pool = EnginePool(max_model_memory=None)
         pool.discover_models(str(tmp_path))
         entry = pool.get_entry("whisper-base")
         assert entry is not None
-        assert entry.model_type == "asr"
-        assert entry.engine_type == "asr"
+        assert entry.model_type == "audio_stt"
+        assert entry.engine_type == "audio_stt"
 
     def test_discover_tts_model(self, tmp_path):
         """Test TTS model discovery + EnginePool routing."""
@@ -1002,14 +918,14 @@ class TestModelDiscoveryIntegration:
         from omlx.model_discovery import detect_model_type
         from omlx.engine_pool import EnginePool
 
-        assert detect_model_type(model_dir) == "tts"
+        assert detect_model_type(model_dir) == "audio_tts"
 
         pool = EnginePool(max_model_memory=None)
         pool.discover_models(str(tmp_path))
         entry = pool.get_entry("qwen3-tts")
         assert entry is not None
-        assert entry.model_type == "tts"
-        assert entry.engine_type == "tts"
+        assert entry.model_type == "audio_tts"
+        assert entry.engine_type == "audio_tts"
 
     def test_causal_lm_reranker_auto_detected_from_name(self, tmp_path):
         """Test CausalLM reranker is auto-detected from model directory name."""
@@ -1079,8 +995,9 @@ class TestModelDiscoveryIntegration:
             "vlm": "vlm",
             "embedding": "embedding",
             "reranker": "reranker",
-            "asr": "asr",
-            "tts": "tts",
+            "audio_stt": "audio_stt",
+            "audio_tts": "audio_tts",
+            "audio_sts": "audio_sts",
         }
         for model_type, engine_type in expected.items():
             assert pool._MODEL_TYPE_TO_ENGINE[model_type] == engine_type

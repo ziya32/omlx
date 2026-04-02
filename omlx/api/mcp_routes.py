@@ -8,7 +8,7 @@ This module provides FastAPI routes for MCP tool management:
 - POST /v1/mcp/execute - Execute an MCP tool
 """
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from .openai_models import (
@@ -33,11 +33,14 @@ def set_auth_dependency(dep):
     _auth_dependency = dep
 
 
-async def _verify_auth(credentials: HTTPAuthorizationCredentials = Depends(_security)) -> bool:
+async def _verify_auth(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials = Depends(_security),
+) -> bool:
     """Forward to server's verify_api_key if wired, otherwise reject."""
     if _auth_dependency is None:
         raise HTTPException(status_code=401, detail="Auth not configured")
-    return await _auth_dependency(credentials)
+    return await _auth_dependency(request=request, credentials=credentials)
 
 
 # Callback function to get MCP manager (set by server.py)

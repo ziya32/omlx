@@ -3108,16 +3108,6 @@ class Scheduler:
                     new_text = think_tag + "\n" + new_text
                     request.think_prefix_sent = True
 
-            # Capture last-token logprobs for prefill_only requests
-            prefill_logits = None
-            if (
-                request.sampling_params.prefill_only
-                and request.sampling_params.prefill_output == "logits"
-                and hasattr(response, 'logprobs')
-                and response.logprobs is not None
-            ):
-                prefill_logits = response.logprobs.tolist()
-
             # Immediately discard logprobs if not requested to free memory (~800KB per response)
             # This prevents accumulation of large MLX arrays during streaming
             if (
@@ -3136,7 +3126,6 @@ class Scheduler:
                 prompt_tokens=request.num_prompt_tokens,
                 completion_tokens=request.num_output_tokens,
                 cached_tokens=request.cached_tokens,
-                last_logits=prefill_logits,
             )
 
             if not is_finished:

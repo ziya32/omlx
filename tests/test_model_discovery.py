@@ -240,7 +240,7 @@ class TestDetectModelType:
             "architectures": ["Qwen3TTSForConditionalGeneration"],
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
-        assert detect_model_type(tmp_path) == "tts"
+        assert detect_model_type(tmp_path) == "audio_tts"
 
     def test_detect_tts_by_model_type(self, tmp_path):
         """Test detection of TTS model by model_type only."""
@@ -249,7 +249,7 @@ class TestDetectModelType:
             "architectures": ["SomeUnknownArch"],
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
-        assert detect_model_type(tmp_path) == "tts"
+        assert detect_model_type(tmp_path) == "audio_tts"
 
     def test_detect_asr_by_model_type_whisper(self, tmp_path):
         """Test detection of ASR model (whisper)."""
@@ -258,7 +258,7 @@ class TestDetectModelType:
             "architectures": ["WhisperForConditionalGeneration"],
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
-        assert detect_model_type(tmp_path) == "asr"
+        assert detect_model_type(tmp_path) == "audio_stt"
 
     def test_detect_asr_by_model_type_qwen3(self, tmp_path):
         """Test detection of ASR model (qwen3_asr)."""
@@ -267,7 +267,7 @@ class TestDetectModelType:
             "architectures": ["Qwen3ASRForConditionalGeneration"],
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
-        assert detect_model_type(tmp_path) == "asr"
+        assert detect_model_type(tmp_path) == "audio_stt"
 
 
 class TestEstimateModelSize:

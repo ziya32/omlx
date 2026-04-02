@@ -101,7 +101,7 @@ def _patch_load_engine(pool: EnginePool, load_delay: float = 0.05) -> None:
     """Replace ``_load_engine`` with a MockEngine-based version."""
     pool._mock_engines: dict[str, MockEngine] = {}
 
-    async def _mock_load(model_id: str) -> None:
+    async def _mock_load(model_id: str, force_lm: bool = False) -> None:
         engine = MockEngine(model_id, load_delay=load_delay)
         await engine.start()
         entry = pool._entries[model_id]
@@ -179,7 +179,7 @@ class TestStateMachineTransitions:
         load_started = asyncio.Event()
         original_load = switching_pool._load_engine
 
-        async def slow_load(model_id):
+        async def slow_load(model_id, **kwargs):
             load_started.set()
             await asyncio.sleep(0.2)
             await original_load(model_id)
@@ -210,7 +210,7 @@ class TestStateMachineTransitions:
         """LOADING -> UNLOADED on load failure: load_error set, ready_event fired."""
         load_error = RuntimeError("corrupt weights")
 
-        async def failing_load(model_id):
+        async def failing_load(model_id, **kwargs):
             raise load_error
 
         switching_pool._load_engine = failing_load
@@ -363,7 +363,7 @@ class TestLoadingCoalescing:
         load_count = 0
         original_load = switching_pool._load_engine
 
-        async def counting_load(model_id):
+        async def counting_load(model_id, **kwargs):
             nonlocal load_count
             load_count += 1
             await asyncio.sleep(0.1)  # Simulate load time
@@ -386,7 +386,7 @@ class TestLoadingCoalescing:
 
         original_load = switching_pool._load_engine
 
-        async def slow_load(model_id):
+        async def slow_load(model_id, **kwargs):
             await asyncio.sleep(0.1)
             await original_load(model_id)
 
@@ -408,7 +408,7 @@ class TestLoadingCoalescing:
 
     async def test_coalesced_waiters_see_error(self, switching_pool):
         """All coalesced waiters see the load error when loading fails."""
-        async def failing_load(model_id):
+        async def failing_load(model_id, **kwargs):
             await asyncio.sleep(0.1)
             raise RuntimeError("kaboom")
 
@@ -432,7 +432,7 @@ class TestLoadingCoalescing:
         call_count = 0
         original_load = switching_pool._load_engine
 
-        async def sometimes_failing_load(model_id):
+        async def sometimes_failing_load(model_id, **kwargs):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -671,7 +671,7 @@ class TestImplicitQueue:
         original_load = switching_pool._load_engine
         load_started = asyncio.Event()
 
-        async def slow_load(model_id):
+        async def slow_load(model_id, **kwargs):
             load_started.set()
             await asyncio.sleep(0.2)
             await original_load(model_id)
@@ -751,7 +751,7 @@ class TestClientCancellation:
         original_load = switching_pool._load_engine
         load_started = asyncio.Event()
 
-        async def slow_load(model_id):
+        async def slow_load(model_id, **kwargs):
             load_started.set()
             await asyncio.sleep(10)  # Very slow load
             await original_load(model_id)
@@ -813,7 +813,7 @@ class TestClientCancellation:
         """If the loader task is cancelled, waiters must not be stuck forever."""
         load_started = asyncio.Event()
 
-        async def slow_load(model_id):
+        async def slow_load(model_id, **kwargs):
             load_started.set()
             await asyncio.sleep(100)
 
@@ -841,7 +841,7 @@ class TestClientCancellation:
         original_load = switching_pool._load_engine
         load_started = asyncio.Event()
 
-        async def slow_load(model_id):
+        async def slow_load(model_id, **kwargs):
             load_started.set()
             await asyncio.sleep(0.3)
             await original_load(model_id)
@@ -885,7 +885,7 @@ class TestAtomicityTOCTOU:
 
         original_load = switching_pool._load_engine
 
-        async def slow_load(model_id):
+        async def slow_load(model_id, **kwargs):
             await asyncio.sleep(0.1)
             await original_load(model_id)
 
@@ -907,7 +907,7 @@ class TestAtomicityTOCTOU:
 
     async def test_load_error_visible_to_waiters(self, switching_pool):
         """When load fails, load_error is set before ready_event fires."""
-        async def failing_load(model_id):
+        async def failing_load(model_id, **kwargs):
             await asyncio.sleep(0.1)
             raise RuntimeError("load failed")
 
@@ -1114,7 +1114,7 @@ class TestInvariants:
         original_load = switching_pool._load_engine
         load_started = asyncio.Event()
 
-        async def slow_load(model_id):
+        async def slow_load(model_id, **kwargs):
             load_started.set()
             await asyncio.sleep(0.3)
             await original_load(model_id)
@@ -1148,7 +1148,7 @@ class TestInvariants:
         """
         load_started = asyncio.Event()
 
-        async def slow_load(model_id):
+        async def slow_load(model_id, **kwargs):
             load_started.set()
             await asyncio.sleep(100)
 
@@ -1279,7 +1279,7 @@ class TestInvariants:
         load_count = 0
         original_load = switching_pool._load_engine
 
-        async def counting_load(model_id):
+        async def counting_load(model_id, **kwargs):
             nonlocal load_count
             load_count += 1
             await asyncio.sleep(0.1)
@@ -1574,7 +1574,7 @@ class TestLoadErrorPropagation:
         blocked on ready_event see the original exception message, not
         'failed to load N s ago, retrying in M s'.
         """
-        async def failing_load(model_id):
+        async def failing_load(model_id, **kwargs):
             await asyncio.sleep(0.1)
             raise RuntimeError("GPU memory corrupted")
 
@@ -1609,7 +1609,7 @@ class TestLoadCooldown:
 
         Verifies that the cooldown mechanism prevents rapid retry storms.
         """
-        async def failing_load(model_id):
+        async def failing_load(model_id, **kwargs):
             raise RuntimeError("download error")
 
         switching_pool._load_engine = failing_load
@@ -1632,7 +1632,7 @@ class TestLoadCooldown:
         call_count = 0
         original_load = switching_pool._load_engine
 
-        async def sometimes_failing_load(model_id):
+        async def sometimes_failing_load(model_id, **kwargs):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -1813,7 +1813,7 @@ class TestDiscoverModelsDuringLoading:
         original_load = switching_pool._load_engine
         load_started = asyncio.Event()
 
-        async def slow_load(model_id):
+        async def slow_load(model_id, **kwargs):
             load_started.set()
             await asyncio.sleep(0.3)
             await original_load(model_id)

@@ -97,12 +97,14 @@ def server_sts_client():
         mock_state.hf_downloader = None
         mock_state.ms_downloader = None
         mock_state.mcp_manager = None
-        mock_state.api_key = None
+        mock_state.api_key = "test-key"
+        mock_state.sub_keys = {}
         mock_state.settings_manager = MagicMock()
         mock_state.settings_manager.resolve_model_id = MagicMock(
             side_effect=lambda m, _: m
         )
         with TestClient(app, raise_server_exceptions=False) as client:
+            client.headers["Authorization"] = "Bearer test-key"
             yield client, mock_pool
 
 
@@ -117,7 +119,13 @@ def audio_sts_client():
 
     mock_pool = _make_mock_pool()
 
-    with patch("omlx.api.audio_routes._get_engine_pool", return_value=mock_pool):
+    async def _noop_auth(credentials=None):
+        return True
+
+    with (
+        patch("omlx.api.audio_routes._get_engine_pool", return_value=mock_pool),
+        patch("omlx.api.audio_routes._auth_dependency", _noop_auth),
+    ):
         with TestClient(app, raise_server_exceptions=False) as client:
             yield client, mock_pool
 

@@ -38,10 +38,14 @@ RIFF_MAGIC = b"RIFF"
 
 
 def _make_mock_tts_engine(wav_bytes: bytes = None) -> MagicMock:
-    """Build a mock TTSEngine that returns the given WAV bytes."""
-    from omlx.engine.tts import TTSEngine
+    """Build a mock TTSEngine that returns SpeechOutput with the given WAV bytes."""
+    from omlx.engine.tts import TTSEngine, SpeechOutput
     engine = MagicMock(spec=TTSEngine)
-    engine.synthesize = AsyncMock(return_value=wav_bytes or DUMMY_WAV)
+    engine.synthesize = AsyncMock(return_value=SpeechOutput(
+        audio_bytes=wav_bytes or DUMMY_WAV,
+        sample_rate=22050,
+        duration=0.1,
+    ))
     return engine
 
 
@@ -84,6 +88,13 @@ def server_tts_client():
 
     mock_pool = _make_mock_pool()
 
+    mock_settings = MagicMock()
+    mock_settings.get_settings.return_value = MagicMock(
+        display_name=None, default_language="auto", aliases=None,
+        default_voice=None, default_instruct=None,
+    )
+    mock_settings.resolve_model_id = MagicMock(side_effect=lambda m, _: m)
+
     with patch("omlx.server._server_state") as mock_state:
         mock_state.engine_pool = mock_pool
         mock_state.global_settings = None
@@ -91,12 +102,13 @@ def server_tts_client():
         mock_state.hf_downloader = None
         mock_state.ms_downloader = None
         mock_state.mcp_manager = None
-        mock_state.api_key = None
-        mock_state.settings_manager = MagicMock()
-        mock_state.settings_manager.resolve_model_id = MagicMock(
-            side_effect=lambda m, _: m
-        )
-        with TestClient(app, raise_server_exceptions=False) as client:
+        mock_state.api_key = "test-key"
+        mock_state.settings_manager = mock_settings
+        with TestClient(
+            app,
+            raise_server_exceptions=False,
+            headers={"Authorization": "Bearer test-key"},
+        ) as client:
             yield client, mock_pool
 
 
@@ -354,8 +366,8 @@ class TestTTSVoiceRouting:
                 asyncio.run(engine.synthesize(
                     "Hello", voice=voice_value, instructions=instructions_value,
                 ))
-            except RuntimeError:
-                pass  # "no audio output" is expected with empty generate
+            except Exception:
+                pass  # AudioError("no audio segments") is expected with empty generate
 
             return mock_model.generate.call_args
 

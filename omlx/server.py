@@ -63,8 +63,6 @@ from omlx._version import __version__
 
 from .api.anthropic_models import (
     MessagesRequest as AnthropicMessagesRequest,
-)
-from .api.anthropic_models import (
     TokenCountRequest,
     TokenCountResponse,
 )
@@ -113,14 +111,6 @@ from .api.embedding_utils import (
     truncate_embedding,
     normalize_input,
 )
-from .api.audio_models import (
-    SpeakersResponse,
-    SpeechRequest,
-    TranscriptionResponse,
-    LanguagesResponse,
-    TranscriptionSegment,
-    VerboseTranscriptionResponse,
-)
 from .api.rerank_models import (
     RerankRequest,
     RerankResponse,
@@ -128,13 +118,9 @@ from .api.rerank_models import (
     RerankUsage,
 )
 from .api.responses_models import (
-    OutputContent,
     OutputItem,
     ResponseObject,
     ResponsesRequest,
-    ResponsesTool,
-    ResponseUsage,
-    TextConfig,
 )
 from .api.responses_utils import (
     ResponseStore,
@@ -155,27 +141,22 @@ from .api.tool_calling import (
     convert_tools_for_template,
     extract_tool_calls_with_thinking,
     parse_json_output,
-    parse_tool_calls,
-    parse_tool_calls_with_thinking_fallback,
     sanitize_tool_call_markup,
 )
 from .api.thinking import ThinkingParser, extract_thinking
 from .api.utils import clean_output_text, clean_special_tokens, extract_multimodal_content, extract_text_content
 from .engine import BaseEngine, BatchedEngine, VLMBatchedEngine
-from .engine.asr import ASREngine
+from .engine.stt import STTEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
 from .engine.tts import TTSEngine
 from .engine_pool import EnginePool
 from .exceptions import (
-    AudioError,
     EnginePoolError,
     InsufficientMemoryError,
-    InvalidAudioFormatError,
     ModelLoadingError,
     ModelNotFoundError,
     ModelTooLargeError,
-    VoiceCloningError,
 )
 from .model_discovery import format_size
 from .server_metrics import get_server_metrics, reset_server_metrics
@@ -197,10 +178,12 @@ class EngineType(Enum):
     """Type of engine to retrieve."""
 
     LLM = "llm"
+    VLM = "vlm"
     EMBEDDING = "embedding"
     RERANKER = "reranker"
-    ASR = "asr"
-    TTS = "tts"
+    STT = "audio_stt"
+    TTS = "audio_tts"
+    STS = "audio_sts"
 
 
 @dataclass
@@ -487,16 +470,7 @@ set_mcp_manager_getter(get_mcp_manager)
 set_auth_dependency(verify_api_key)
 app.include_router(mcp_router)
 
-# Include audio routes only when mlx-audio is installed.
-# audio_routes.py itself only imports fastapi/stdlib at module level, so it
-# would always import successfully — we need an explicit mlx-audio check.
-try:
-    import mlx_audio as _  # noqa: F401
-    from .api.audio_routes import router as audio_router
-    app.include_router(audio_router)
-    del _
-except ImportError:
-    pass
+# Audio routes are included at the end of this file (after app is fully set up)
 
 # Include admin routes
 from .admin.routes import router as admin_router, set_admin_getters
@@ -774,8 +748,8 @@ async def get_engine(
                 detail=f"Model '{model_id}' is not a reranker model. "
                 f"Use a SequenceClassification or LLM reranker model."
             )
-    elif engine_type == EngineType.ASR:
-        if not isinstance(engine, ASREngine):
+    elif engine_type == EngineType.STT:
+        if not isinstance(engine, STTEngine):
             raise HTTPException(
                 status_code=400,
                 detail=f"Model '{model_id}' is not an ASR model."
@@ -902,9 +876,9 @@ async def get_reranker_engine(model: str) -> RerankerEngine:
     return await get_engine(model, EngineType.RERANKER)
 
 
-async def get_asr_engine(model: str) -> ASREngine:
+async def get_asr_engine(model: str) -> STTEngine:
     """Get ASR engine for the specified model."""
-    return await get_engine(model, EngineType.ASR)
+    return await get_engine(model, EngineType.STT)
 
 
 async def get_tts_engine(model: str) -> TTSEngine:
@@ -1906,456 +1880,6 @@ async def create_rerank(
         results=results,
         model=request.model,
         usage=RerankUsage(total_tokens=output.total_tokens),
-    )
-
-
-# =============================================================================
-# Audio Endpoints (ASR + TTS)
-# =============================================================================
-
-
-@app.post("/v1/audio/transcriptions")
-async def create_transcription(
-    http_request: FastAPIRequest,
-    _: bool = Depends(verify_api_key),
-):
-    """
-    Transcribe audio to text.
-
-    OpenAI-compatible endpoint for audio transcription (ASR).
-
-    Accepts multipart/form-data with:
-    - file: audio file (wav, mp3, m4a, etc.)
-    - model: model ID (e.g., "Qwen3-ASR-1.7B-bf16")
-    - language: ISO language code or "auto" (default)
-    - prompt: optional text to guide transcription (Whisper models)
-    - response_format: "json" (default), "verbose_json", or "text"
-    - stream: "true" to get SSE progress events per chunk (keeps connection
-      alive for long audio). The final event contains the full result.
-    """
-    import tempfile
-
-    req_id = str(uuid.uuid4())
-    form = await http_request.form()
-    audio_file = form.get("file")
-    model = form.get("model")
-    language = form.get("language")
-    prompt = form.get("prompt")
-    response_format = str(form.get("response_format", "json"))
-    stream = str(form.get("stream", "false")).lower() == "true"
-
-    if audio_file is None:
-        raise HTTPException(status_code=400, detail="Audio file is required")
-    if model is None:
-        raise HTTPException(status_code=400, detail="Model is required")
-
-    model_str = str(model)
-
-    # Apply model settings defaults
-    if language is None:
-        sm = _server_state.settings_manager
-        if sm:
-            ms = sm.get_settings(model_str)
-            language = ms.default_language or "auto"
-        else:
-            language = "auto"
-    language = str(language)
-
-    # Write uploaded file to temp path for mlx_audio
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        content = await audio_file.read()
-        tmp.write(content)
-        tmp_path = tmp.name
-
-    if stream:
-        return StreamingResponse(
-            _stream_transcription(
-                req_id, model_str, tmp_path, language, prompt, response_format,
-            ),
-            media_type="text/event-stream",
-        )
-
-    try:
-        start_time = time.perf_counter()
-        async with use_engine(model_str, EngineType.ASR) as engine:
-            try:
-                output = await engine.transcribe(
-                    tmp_path,
-                    language=language,
-                    prompt=str(prompt) if prompt else None,
-                )
-            except InvalidAudioFormatError as e:
-                raise HTTPException(status_code=400, detail=str(e))
-            except AudioError as e:
-                raise HTTPException(status_code=422, detail=str(e))
-        elapsed = time.perf_counter() - start_time
-
-        logger.info(
-            f"Transcription [{req_id}]: {elapsed:.3f}s, "
-            f"language={output.language}, "
-            f"duration={output.duration}s"
-        )
-
-        return _format_transcription_response(output, response_format)
-    finally:
-        import os
-        os.unlink(tmp_path)
-
-
-def _format_transcription_response(output, response_format: str):
-    """Build the appropriate response object for a completed transcription."""
-    if response_format == "text":
-        from fastapi.responses import PlainTextResponse
-        return PlainTextResponse(output.text)
-
-    if response_format == "verbose_json":
-        segments = []
-        if output.segments:
-            for i, seg in enumerate(output.segments):
-                if isinstance(seg, dict):
-                    segments.append(TranscriptionSegment(
-                        id=seg.get("id", i),
-                        start=seg.get("start", 0.0),
-                        end=seg.get("end", 0.0),
-                        text=seg.get("text", ""),
-                    ))
-        return VerboseTranscriptionResponse(
-            text=output.text,
-            language=output.language,
-            duration=output.duration,
-            segments=segments,
-        )
-
-    return TranscriptionResponse(
-        text=output.text,
-        language=output.language,
-        duration=output.duration,
-    )
-
-
-async def _stream_transcription(
-    req_id: str,
-    model_str: str,
-    tmp_path: str,
-    language: str,
-    prompt: str | None,
-    response_format: str,
-):
-    """SSE generator that yields progress events during transcription.
-
-    Each chunk completion sends a progress event so the HTTP connection
-    stays alive — the client's read timeout resets on every received event,
-    allowing transcription of arbitrarily long audio files.
-
-    Events:
-        data: {"type":"progress","chunk":1,"total_chunks":10,"chunk_text":"..."}
-        data: {"type":"transcription","text":"...","language":"en","duration":3600.0}
-        data: [DONE]
-    """
-    progress_queue: asyncio.Queue = asyncio.Queue()
-
-    async def _on_progress(*, chunk: int, total_chunks: int, chunk_text: str):
-        await progress_queue.put({
-            "type": "progress",
-            "chunk": chunk,
-            "total_chunks": total_chunks,
-            "chunk_text": chunk_text,
-        })
-
-    try:
-        start_time = time.perf_counter()
-
-        # Run transcription in a background task so we can yield SSE events
-        # from the progress queue concurrently.
-        async def _run_transcription():
-            async with use_engine(model_str, EngineType.ASR) as engine:
-                return await engine.transcribe(
-                    tmp_path,
-                    language=language,
-                    prompt=str(prompt) if prompt else None,
-                    on_progress=_on_progress,
-                )
-
-        task = asyncio.create_task(_run_transcription())
-
-        # Yield progress events as they arrive. When the task completes,
-        # it stops producing events and we break out.
-        while not task.done():
-            try:
-                event = await asyncio.wait_for(progress_queue.get(), timeout=1.0)
-                yield f"data: {json.dumps(event)}\n\n"
-            except asyncio.TimeoutError:
-                continue
-
-        # Drain any remaining progress events
-        while not progress_queue.empty():
-            event = progress_queue.get_nowait()
-            yield f"data: {json.dumps(event)}\n\n"
-
-        output = await task  # propagate exceptions
-        elapsed = time.perf_counter() - start_time
-
-        logger.info(
-            f"Transcription [{req_id}]: {elapsed:.3f}s, "
-            f"language={output.language}, "
-            f"duration={output.duration}s"
-        )
-
-        # Final result event
-        result = {
-            "type": "transcription",
-            "text": output.text,
-            "language": output.language,
-            "duration": output.duration,
-        }
-        if response_format == "verbose_json" and output.segments:
-            result["segments"] = [
-                {"id": i, "start": s.get("start", 0.0), "end": s.get("end", 0.0), "text": s.get("text", "")}
-                for i, s in enumerate(output.segments) if isinstance(s, dict)
-            ]
-        yield f"data: {json.dumps(result)}\n\n"
-        yield "data: [DONE]\n\n"
-    except Exception as e:
-        yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
-        yield "data: [DONE]\n\n"
-    finally:
-        import os
-        os.unlink(tmp_path)
-
-
-@app.post("/v1/audio/speech")
-async def create_speech(
-    request: SpeechRequest,
-    stream: bool = False,
-    _: bool = Depends(verify_api_key),
-):
-    """
-    Generate speech from text.
-
-    OpenAI-compatible endpoint for text-to-speech (TTS).
-
-    For CustomVoice models:
-    - voice: preset speaker name (e.g., "ryan", "vivian")
-    - instructions: emotional/tonal control (e.g., "Speak warmly")
-
-    For VoiceDesign models:
-    - voice: ignored
-    - instructions: voice description (e.g., "A warm female narrator")
-
-    Query params:
-    - stream: if true, stream raw PCM chunks as they're generated
-
-    Returns binary WAV audio (24 kHz) or streaming PCM.
-    """
-    req_id = str(uuid.uuid4())
-    # Apply model settings defaults
-    speaker = request.voice if request.voice != "default" else None
-    instruct = request.instructions
-    if speaker is None or instruct is None:
-        sm = _server_state.settings_manager
-        if sm:
-            ms = sm.get_settings(request.model)
-            if speaker is None and ms.default_voice:
-                speaker = ms.default_voice
-            if instruct is None and ms.default_instruct:
-                instruct = ms.default_instruct
-
-    from .engine.tts import (
-        _SUPPORTED_FORMATS,
-        _FORMAT_MEDIA_TYPES,
-        _FORMAT_EXTENSIONS,
-        _convert_wav,
-    )
-
-    fmt = request.response_format
-    if fmt not in _SUPPORTED_FORMATS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported format: {fmt}. Supported: {', '.join(sorted(_SUPPORTED_FORMATS))}",
-        )
-
-    speed = request.speed
-    if not (0.25 <= speed <= 4.0):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Speed must be between 0.25 and 4.0, got {speed}",
-        )
-
-    if stream:
-        if speed != 1.0:
-            raise HTTPException(
-                status_code=400,
-                detail="Speed adjustment is not supported in streaming mode",
-            )
-        if fmt not in ("wav", "pcm"):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Streaming only supports wav/pcm format, got {fmt}",
-            )
-
-        # For streaming TTS, acquire the engine for the entire stream
-        pool = get_engine_pool()
-        resolved = pool.resolve_model_id(
-            request.model, _server_state.settings_manager
-        )
-        engine = await get_tts_engine(request.model)
-        pool.acquire_engine(resolved)
-
-        async def _stream_pcm():
-            try:
-                async for chunk in engine.stream_synthesize(
-                    text=request.input,
-                    speaker=speaker,
-                    instruct=instruct,
-                    ref_audio=request.ref_audio,
-                    ref_text=request.ref_text,
-                ):
-                    yield chunk.audio_bytes
-            finally:
-                pool.release_engine(resolved)
-
-        return StreamingResponse(
-            _stream_pcm(),
-            media_type="audio/pcm",
-            headers={
-                "X-Sample-Rate": "24000",
-                "X-Channels": "1",
-                "X-Bits-Per-Sample": "16",
-            },
-        )
-
-    start_time = time.perf_counter()
-
-    async with use_engine(request.model, EngineType.TTS) as engine:
-        try:
-            output = await engine.synthesize(
-                text=request.input,
-                speaker=speaker,
-                instruct=instruct,
-                ref_audio=request.ref_audio,
-                ref_text=request.ref_text,
-            )
-        except VoiceCloningError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-        except AudioError as e:
-            raise HTTPException(status_code=422, detail=str(e))
-
-    elapsed = time.perf_counter() - start_time
-
-    # Convert format and/or apply speed if needed
-    audio_bytes = output.audio_bytes
-    if fmt != "wav" or speed != 1.0:
-        if fmt == "pcm":
-            # Strip WAV header for raw PCM
-            audio_bytes = audio_bytes[44:]
-        else:
-            audio_bytes = _convert_wav(audio_bytes, fmt, speed=speed)
-
-    media_type = _FORMAT_MEDIA_TYPES[fmt]
-    ext = _FORMAT_EXTENSIONS[fmt]
-
-    logger.info(
-        f"Speech [{req_id}]: {elapsed:.3f}s, "
-        f"duration={output.duration:.2f}s, "
-        f"sample_rate={output.sample_rate}, "
-        f"format={fmt}"
-    )
-
-    return StreamingResponse(
-        iter([audio_bytes]),
-        media_type=media_type,
-        headers={
-            "Content-Disposition": f"attachment; filename=speech.{ext}",
-        },
-    )
-
-
-def _read_speakers_from_config(model_path: str) -> list[str]:
-    """Read TTS speaker list from model config.json without loading the engine."""
-    config_path = Path(model_path) / "config.json"
-    if not config_path.exists():
-        return []
-    try:
-        with open(config_path) as f:
-            config = json.load(f)
-        # VoiceDesign and Base models don't have preset speakers
-        if config.get("tts_model_type") in ("voice_design", "base"):
-            return []
-        talker_config = config.get("talker_config", {})
-        spk_id = talker_config.get("spk_id", {})
-        return list(spk_id.keys())
-    except Exception:
-        return []
-
-
-@app.get("/v1/audio/speakers")
-async def list_speakers(
-    model: str | None = None,
-    _: bool = Depends(verify_api_key),
-) -> SpeakersResponse:
-    """
-    List available TTS speakers for a CustomVoice model.
-
-    Reads the speaker list from the model's config.json on disk — does NOT
-    load the engine, so this endpoint is cheap and won't trigger model swaps.
-
-    Returns an empty list for VoiceDesign/Base models (use instructions instead).
-    """
-    pool = get_engine_pool()
-
-    if model is None:
-        # Find any TTS model (prefer loaded, fall back to any discovered)
-        for mid, entry in pool._entries.items():
-            if entry.engine_type == "tts" and entry.engine is not None:
-                model = mid
-                break
-        if model is None:
-            for mid, entry in pool._entries.items():
-                if entry.engine_type == "tts":
-                    model = mid
-                    break
-        if model is None:
-            raise HTTPException(
-                status_code=400,
-                detail="No TTS model found"
-            )
-
-    entry = pool._entries.get(model)
-    if entry is None or entry.engine_type != "tts":
-        raise HTTPException(status_code=400, detail=f"Model {model} is not a TTS model")
-
-    speakers = _read_speakers_from_config(entry.model_path)
-    return SpeakersResponse(speakers=speakers)
-
-
-@app.get("/v1/audio/languages")
-async def list_languages(
-    model: str | None = None,
-    _: bool = Depends(verify_api_key),
-) -> LanguagesResponse:
-    """
-    List supported languages for an ASR model.
-
-    If no model is specified, uses the first available ASR model.
-    """
-    if model is None:
-        pool = get_engine_pool()
-        for mid, entry in pool._entries.items():
-            if entry.engine_type == "asr":
-                model = mid
-                break
-        if model is None:
-            raise HTTPException(
-                status_code=400,
-                detail="No ASR model specified and none available"
-            )
-
-    async with use_engine(model, EngineType.ASR) as engine:
-        languages = engine.get_languages()
-
-    return LanguagesResponse(
-        languages=languages,
-        model=model,
     )
 
 
@@ -4748,6 +4272,25 @@ async def delete_response(
     if not _server_state.responses_store.delete(response_id):
         raise HTTPException(status_code=404, detail="Response not found")
     return {"id": response_id, "object": "response.deleted", "deleted": True}
+
+
+# =============================================================================
+# Audio routes — all audio endpoints live in audio_routes.py
+# =============================================================================
+
+try:
+    import mlx_audio as _mlx_audio_check  # noqa: F401
+    from .api.audio_routes import (
+        router as audio_router,
+        set_auth_dependency as set_audio_auth,
+        set_settings_manager_getter,
+    )
+    set_audio_auth(verify_api_key)
+    set_settings_manager_getter(lambda: _server_state.settings_manager)
+    app.include_router(audio_router)
+    del _mlx_audio_check
+except ImportError:
+    pass
 
 
 # =============================================================================

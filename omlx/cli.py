@@ -115,8 +115,8 @@ def _has_cli_overrides(args) -> bool:
         return True
     if hasattr(args, "max_process_memory") and args.max_process_memory is not None:
         return True
-    # host: default="0.0.0.0"
-    if hasattr(args, "host") and args.host != "0.0.0.0":
+    # host: argparse default is None; any non-None value means explicitly passed
+    if hasattr(args, "host") and args.host is not None:
         return True
     if hasattr(args, "log_level") and args.log_level is not None:
         return True

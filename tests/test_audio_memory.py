@@ -20,7 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from omlx.engine_pool import EngineEntry, EnginePool
+from omlx.engine_pool import EngineEntry, EnginePool, EngineState
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +112,9 @@ class TestAudioMemoryTracking:
             assert memory_after_load > 0
 
             await pool._unload_engine("whisper-tiny")
+            # Wait for deferred cleanup tasks (two-phase unload)
+            if pool._cleanup_tasks:
+                await asyncio.gather(*pool._cleanup_tasks, return_exceptions=True)
 
         assert pool.current_model_memory < memory_after_load
 
@@ -187,42 +190,42 @@ class TestAudioLRUEviction:
         assert pool._entries["whisper-tiny"].is_pinned is False
         assert pool._entries["kokoro-tts"].is_pinned is False
 
+    def _set_loaded(self, entry, last_access):
+        """Helper: mark entry as loaded with given last_access."""
+        entry.engine = MagicMock(spec=[])  # spec=[] prevents attribute auto-creation
+        entry.last_access = last_access
+        entry.state = EngineState.ACTIVE
+
     def test_find_lru_victim_can_select_stt(self, pool_with_audio):
-        """_find_lru_victim() returns STT model when it is the oldest loaded entry."""
+        """_find_drain_or_evict_candidate() returns STT model when it is the oldest loaded entry."""
         pool = pool_with_audio
 
         # Mark whisper-tiny as loaded and older than all others
-        pool._entries["whisper-tiny"].engine = MagicMock()
-        pool._entries["whisper-tiny"].last_access = 10.0
+        self._set_loaded(pool._entries["whisper-tiny"], 10.0)
 
-        victim = pool._find_lru_victim()
+        victim = pool._find_drain_or_evict_candidate()
         assert victim == "whisper-tiny"
 
     def test_find_lru_victim_selects_oldest_audio_over_newer_llm(self, pool_with_audio):
-        """_find_lru_victim() picks the oldest entry regardless of model type."""
+        """_find_drain_or_evict_candidate() picks the oldest entry regardless of model type."""
         pool = pool_with_audio
 
-        pool._entries["whisper-tiny"].engine = MagicMock()
-        pool._entries["whisper-tiny"].last_access = 50.0  # Older
+        self._set_loaded(pool._entries["whisper-tiny"], 50.0)  # Older
+        self._set_loaded(pool._entries["llama-3b"], 100.0)  # Newer
 
-        pool._entries["llama-3b"].engine = MagicMock()
-        pool._entries["llama-3b"].last_access = 100.0  # Newer
-
-        victim = pool._find_lru_victim()
+        victim = pool._find_drain_or_evict_candidate()
         assert victim == "whisper-tiny"
 
     def test_pinned_audio_not_evicted(self, pool_with_audio):
-        """Pinned audio engine is skipped by _find_lru_victim()."""
+        """Pinned audio engine is skipped by _find_drain_or_evict_candidate()."""
         pool = pool_with_audio
 
-        pool._entries["whisper-tiny"].engine = MagicMock()
-        pool._entries["whisper-tiny"].last_access = 50.0
+        self._set_loaded(pool._entries["whisper-tiny"], 50.0)
         pool._entries["whisper-tiny"].is_pinned = True  # pinned
 
-        pool._entries["llama-3b"].engine = MagicMock()
-        pool._entries["llama-3b"].last_access = 100.0  # Newer but not pinned
+        self._set_loaded(pool._entries["llama-3b"], 100.0)  # Newer but not pinned
 
-        victim = pool._find_lru_victim()
+        victim = pool._find_drain_or_evict_candidate()
         # whisper-tiny is pinned — llama-3b must be the victim
         assert victim == "llama-3b"
 
@@ -248,13 +251,15 @@ class TestAudioPinning:
         pool = EnginePool(max_model_memory=10 * 1024**3)
         pool.discover_models(str(audio_model_dir), pinned_models=["whisper-tiny"])
 
-        pool._entries["whisper-tiny"].engine = MagicMock()
+        pool._entries["whisper-tiny"].engine = MagicMock(spec=[])
         pool._entries["whisper-tiny"].last_access = 1.0  # Oldest
+        pool._entries["whisper-tiny"].state = EngineState.ACTIVE
 
-        pool._entries["llama-3b"].engine = MagicMock()
+        pool._entries["llama-3b"].engine = MagicMock(spec=[])
         pool._entries["llama-3b"].last_access = 99.0
+        pool._entries["llama-3b"].state = EngineState.ACTIVE
 
-        victim = pool._find_lru_victim()
+        victim = pool._find_drain_or_evict_candidate()
         assert victim != "whisper-tiny"
 
 

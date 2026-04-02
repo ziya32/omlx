@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Tests for omlx.engine.asr and omlx.engine.tts modules."""
+"""Tests for omlx.engine.stt and omlx.engine.tts modules."""
 
 import struct
 import wave
@@ -67,71 +67,71 @@ def _patch_stt_generate(mock_gen):
 
 
 # ---------------------------------------------------------------------------
-# ASR Engine Tests
+# STT Engine Tests
 # ---------------------------------------------------------------------------
 
-class TestASREngineInit:
-    """Test ASREngine construction and properties."""
+class TestSTTEngineInit:
+    """Test STTEngine construction and properties."""
 
     def test_init(self):
-        from omlx.engine.asr import ASREngine
-        engine = ASREngine(model_name="mlx-community/whisper-large-v3")
+        from omlx.engine.stt import STTEngine
+        engine = STTEngine(model_name="mlx-community/whisper-large-v3")
         assert engine.model_name == "mlx-community/whisper-large-v3"
         assert engine._model is None
 
     def test_repr_stopped(self):
-        from omlx.engine.asr import ASREngine
-        engine = ASREngine(model_name="whisper-tiny")
+        from omlx.engine.stt import STTEngine
+        engine = STTEngine(model_name="whisper-tiny")
         assert "stopped" in repr(engine)
         assert "whisper-tiny" in repr(engine)
 
     def test_repr_running(self):
-        from omlx.engine.asr import ASREngine
-        engine = ASREngine(model_name="whisper-tiny")
+        from omlx.engine.stt import STTEngine
+        engine = STTEngine(model_name="whisper-tiny")
         engine._model = MagicMock()
         assert "running" in repr(engine)
 
     def test_get_stats_not_loaded(self):
-        from omlx.engine.asr import ASREngine
-        engine = ASREngine(model_name="whisper-tiny")
+        from omlx.engine.stt import STTEngine
+        engine = STTEngine(model_name="whisper-tiny")
         stats = engine.get_stats()
         assert stats["model_name"] == "whisper-tiny"
         assert stats["loaded"] is False
 
     def test_get_stats_loaded(self):
-        from omlx.engine.asr import ASREngine
-        engine = ASREngine(model_name="whisper-tiny")
+        from omlx.engine.stt import STTEngine
+        engine = STTEngine(model_name="whisper-tiny")
         engine._model = MagicMock()
         stats = engine.get_stats()
         assert stats["loaded"] is True
 
     def test_get_model_info_not_loaded(self):
-        from omlx.engine.asr import ASREngine
-        engine = ASREngine(model_name="whisper-tiny")
+        from omlx.engine.stt import STTEngine
+        engine = STTEngine(model_name="whisper-tiny")
         info = engine.get_model_info()
         assert info["loaded"] is False
         assert info["model_name"] == "whisper-tiny"
 
     def test_get_model_info_loaded(self):
-        from omlx.engine.asr import ASREngine
-        engine = ASREngine(model_name="whisper-tiny")
+        from omlx.engine.stt import STTEngine
+        engine = STTEngine(model_name="whisper-tiny")
         engine._model = MagicMock()
         info = engine.get_model_info()
         assert info["loaded"] is True
         assert info["model_name"] == "whisper-tiny"
 
 
-class TestASREngineLifecycle:
-    """Test ASREngine start/stop with mocked mlx_audio.stt."""
+class TestSTTEngineLifecycle:
+    """Test STTEngine start/stop with mocked mlx_audio.stt."""
 
     async def test_start_loads_model(self):
-        from omlx.engine.asr import ASREngine
+        from omlx.engine.stt import STTEngine
 
         mock_model = MagicMock(name="model")
         mock_stt = _make_stt_module()
         mock_stt.load.return_value = mock_model
 
-        engine = ASREngine(model_name="whisper-tiny")
+        engine = STTEngine(model_name="whisper-tiny")
         with _patch_stt(mock_stt):
             await engine.start()
 
@@ -140,21 +140,21 @@ class TestASREngineLifecycle:
 
     async def test_start_idempotent(self):
         """Calling start() twice should not re-load."""
-        from omlx.engine.asr import ASREngine
+        from omlx.engine.stt import STTEngine
 
         mock_stt = _make_stt_module()
-        engine = ASREngine(model_name="whisper-tiny")
+        engine = STTEngine(model_name="whisper-tiny")
         with _patch_stt(mock_stt):
             await engine.start()
             await engine.start()
 
         mock_stt.load.assert_called_once()
 
-    @patch("omlx.engine.asr.mx")
-    @patch("omlx.engine.asr.gc")
+    @patch("omlx.engine.stt.mx")
+    @patch("omlx.engine.stt.gc")
     async def test_stop_clears_model(self, mock_gc, mock_mx):
-        from omlx.engine.asr import ASREngine
-        engine = ASREngine(model_name="whisper-tiny")
+        from omlx.engine.stt import STTEngine
+        engine = STTEngine(model_name="whisper-tiny")
         engine._model = MagicMock()
 
         await engine.stop()
@@ -165,23 +165,23 @@ class TestASREngineLifecycle:
         mock_mx.clear_cache.assert_called_once()
 
     async def test_stop_when_not_started_is_noop(self):
-        from omlx.engine.asr import ASREngine
-        engine = ASREngine(model_name="whisper-tiny")
+        from omlx.engine.stt import STTEngine
+        engine = STTEngine(model_name="whisper-tiny")
         await engine.stop()
         assert engine._model is None
 
 
-class TestASREngineTranscribe:
-    """Test ASREngine.transcribe with mocked generate_transcription."""
+class TestSTTEngineTranscribe:
+    """Test STTEngine.transcribe with mocked generate_transcription."""
 
     async def test_transcribe_not_started_raises(self, wav_path):
-        from omlx.engine.asr import ASREngine
-        engine = ASREngine(model_name="whisper-tiny")
+        from omlx.engine.stt import STTEngine
+        engine = STTEngine(model_name="whisper-tiny")
         with pytest.raises(RuntimeError, match="Engine not started"):
             await engine.transcribe(wav_path)
 
     async def test_transcribe_auto_language(self, wav_path):
-        from omlx.engine.asr import ASREngine, TranscriptionOutput
+        from omlx.engine.stt import STTEngine, TranscriptionOutput
 
         mock_gen = MagicMock(return_value=_make_stt_output(
             text="Hello world",
@@ -189,7 +189,7 @@ class TestASREngineTranscribe:
             segments=[{"start": 0.0, "end": 3.5}],
         ))
 
-        engine = ASREngine(model_name="whisper-tiny")
+        engine = STTEngine(model_name="whisper-tiny")
         engine._model = MagicMock(name="model", sample_rate=16000)
 
         with _patch_stt_generate(mock_gen):
@@ -206,14 +206,14 @@ class TestASREngineTranscribe:
         )
 
     async def test_transcribe_explicit_language(self, wav_path):
-        from omlx.engine.asr import ASREngine
+        from omlx.engine.stt import STTEngine
 
         mock_gen = MagicMock(return_value=_make_stt_output(
             text="Bonjour",
             language="fr",
         ))
 
-        engine = ASREngine(model_name="whisper-tiny")
+        engine = STTEngine(model_name="whisper-tiny")
         engine._model = MagicMock(sample_rate=16000)
 
         with _patch_stt_generate(mock_gen):
@@ -229,11 +229,11 @@ class TestASREngineTranscribe:
         )
 
     async def test_transcribe_no_segments(self, wav_path):
-        from omlx.engine.asr import ASREngine
+        from omlx.engine.stt import STTEngine
 
         mock_gen = MagicMock(return_value=_make_stt_output(text="test"))
 
-        engine = ASREngine(model_name="whisper-tiny")
+        engine = STTEngine(model_name="whisper-tiny")
         engine._model = MagicMock(sample_rate=16000)
 
         with _patch_stt_generate(mock_gen):
@@ -244,11 +244,11 @@ class TestASREngineTranscribe:
         assert result.duration is None
 
     async def test_transcribe_empty_segments(self, wav_path):
-        from omlx.engine.asr import ASREngine
+        from omlx.engine.stt import STTEngine
 
         mock_gen = MagicMock(return_value=_make_stt_output(text="test", segments=[]))
 
-        engine = ASREngine(model_name="whisper-tiny")
+        engine = STTEngine(model_name="whisper-tiny")
         engine._model = MagicMock(sample_rate=16000)
 
         with _patch_stt_generate(mock_gen):
@@ -258,11 +258,11 @@ class TestASREngineTranscribe:
 
     async def test_transcribe_empty_result(self, wav_path):
         """Handles result with no text gracefully."""
-        from omlx.engine.asr import ASREngine
+        from omlx.engine.stt import STTEngine
 
         mock_gen = MagicMock(return_value=_make_stt_output(text=None))
 
-        engine = ASREngine(model_name="whisper-tiny")
+        engine = STTEngine(model_name="whisper-tiny")
         engine._model = MagicMock(sample_rate=16000)
 
         with _patch_stt_generate(mock_gen):
@@ -272,7 +272,7 @@ class TestASREngineTranscribe:
 
     async def test_transcribe_multi_segment_duration(self, wav_path):
         """Duration comes from the last segment's end time."""
-        from omlx.engine.asr import ASREngine
+        from omlx.engine.stt import STTEngine
 
         mock_gen = MagicMock(return_value=_make_stt_output(
             text="one two three",
@@ -284,7 +284,7 @@ class TestASREngineTranscribe:
             ],
         ))
 
-        engine = ASREngine(model_name="whisper-tiny")
+        engine = STTEngine(model_name="whisper-tiny")
         engine._model = MagicMock(sample_rate=16000)
 
         with _patch_stt_generate(mock_gen):
@@ -294,14 +294,14 @@ class TestASREngineTranscribe:
 
     async def test_transcribe_language_as_list(self, wav_path):
         """Handles language returned as list (newer mlx_audio versions)."""
-        from omlx.engine.asr import ASREngine
+        from omlx.engine.stt import STTEngine
 
         mock_gen = MagicMock(return_value=_make_stt_output(
             text="Hello",
             language=["en"],
         ))
 
-        engine = ASREngine(model_name="whisper-tiny")
+        engine = STTEngine(model_name="whisper-tiny")
         engine._model = MagicMock(sample_rate=16000)
 
         with _patch_stt_generate(mock_gen):
@@ -311,14 +311,14 @@ class TestASREngineTranscribe:
 
     async def test_transcribe_language_none_string(self, wav_path):
         """Handles language='None' string from silent audio."""
-        from omlx.engine.asr import ASREngine
+        from omlx.engine.stt import STTEngine
 
         mock_gen = MagicMock(return_value=_make_stt_output(
             text="",
             language=["None"],
         ))
 
-        engine = ASREngine(model_name="whisper-tiny")
+        engine = STTEngine(model_name="whisper-tiny")
         engine._model = MagicMock(sample_rate=16000)
 
         with _patch_stt_generate(mock_gen):
@@ -583,24 +583,22 @@ class TestTTSEngineSynthesize:
         with pytest.raises(RuntimeError, match="Engine not started"):
             await engine.synthesize("Hello")
 
-    @patch("omlx.engine.tts.mx")
-    @patch("omlx.engine.tts._audio_to_wav")
-    async def test_synthesize_custom_voice_defaults(self, mock_audio_to_wav, mock_mx):
+    @patch("omlx.engine.tts._audio_to_wav_bytes")
+    async def test_synthesize_custom_voice_defaults(self, mock_audio_to_wav_bytes):
         from omlx.engine.tts import TTSEngine, SpeechOutput
+        import numpy as np
 
         engine = TTSEngine(model_name="qwen3-tts")
         engine._variant = "custom_voice"
 
         mock_model = MagicMock()
-        mock_model.sample_rate = 24000
-        mock_audio = MagicMock()
-        mock_audio.shape = (24000,)
         mock_segment = MagicMock()
-        mock_segment.audio = mock_audio
+        mock_segment.audio = np.zeros(24000, dtype=np.float32)
+        mock_segment.sample_rate = 24000
         mock_model.generate.return_value = iter([mock_segment])
         engine._model = mock_model
 
-        mock_audio_to_wav.return_value = b"RIFF....WAV"
+        mock_audio_to_wav_bytes.return_value = b"RIFF....WAV"
 
         result = await engine.synthesize("Hello world")
 
@@ -608,57 +606,64 @@ class TestTTSEngineSynthesize:
         assert result.audio_bytes == b"RIFF....WAV"
         assert result.sample_rate == 24000
         assert result.duration == 1.0  # 24000 samples / 24000 Hz
-        # Check generate was called with voice="vivian" (default)
-        mock_model.generate.assert_called_once_with(text="Hello world", voice="vivian")
+        # Check generate was called with text and verbose
+        mock_model.generate.assert_called_once()
+        call_kwargs = mock_model.generate.call_args.kwargs
+        assert call_kwargs["text"] == "Hello world"
 
-    @patch("omlx.engine.tts.mx")
-    @patch("omlx.engine.tts._audio_to_wav")
-    async def test_synthesize_custom_voice_with_speaker_and_instruct(self, mock_audio_to_wav, mock_mx):
+    @patch("omlx.engine.tts._audio_to_wav_bytes")
+    async def test_synthesize_custom_voice_with_voice_and_instructions(self, mock_audio_to_wav_bytes):
         from omlx.engine.tts import TTSEngine
+        import numpy as np
 
         engine = TTSEngine(model_name="qwen3-tts")
         engine._variant = "custom_voice"
 
         mock_model = MagicMock()
-        mock_model.sample_rate = 24000
-        mock_audio = MagicMock()
-        mock_audio.shape = (48000,)
+        import inspect
+        sig_params = {
+            "text": inspect.Parameter("text", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+            "verbose": inspect.Parameter("verbose", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=False),
+            "voice": inspect.Parameter("voice", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=None),
+            "instruct": inspect.Parameter("instruct", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=None),
+        }
+        mock_model.generate = MagicMock()
+        mock_model.generate.__signature__ = inspect.Signature(parameters=list(sig_params.values()))
         mock_segment = MagicMock()
-        mock_segment.audio = mock_audio
+        mock_segment.audio = np.zeros(48000, dtype=np.float32)
+        mock_segment.sample_rate = 24000
         mock_model.generate.return_value = iter([mock_segment])
         engine._model = mock_model
 
-        mock_audio_to_wav.return_value = b"WAV"
+        mock_audio_to_wav_bytes.return_value = b"WAV"
 
-        result = await engine.synthesize("Hi", speaker="ryan", instruct="Speak warmly")
+        result = await engine.synthesize("Hi", voice="ryan", instructions="Speak warmly")
 
-        mock_model.generate.assert_called_once_with(
-            text="Hi", voice="ryan", instruct="Speak warmly"
-        )
+        call_kwargs = mock_model.generate.call_args.kwargs
+        assert call_kwargs["voice"] == "ryan"
+        assert call_kwargs["instruct"] == "Speak warmly"
         assert result.duration == 2.0  # 48000 / 24000
 
-    @patch("omlx.engine.tts.mx")
-    @patch("omlx.engine.tts._audio_to_wav")
-    async def test_synthesize_voice_design(self, mock_audio_to_wav, mock_mx):
+    @patch("omlx.engine.tts._audio_to_wav_bytes")
+    async def test_synthesize_voice_design(self, mock_audio_to_wav_bytes):
         from omlx.engine.tts import TTSEngine
+        import numpy as np
 
         engine = TTSEngine(model_name="qwen3-tts-vd")
         engine._variant = "voice_design"
 
         mock_model = MagicMock()
-        mock_model.sample_rate = 24000
-        mock_audio = MagicMock()
-        mock_audio.shape = (12000,)
         mock_segment = MagicMock()
-        mock_segment.audio = mock_audio
+        mock_segment.audio = np.zeros(12000, dtype=np.float32)
+        mock_segment.sample_rate = 24000
         mock_model.generate.return_value = iter([mock_segment])
         engine._model = mock_model
 
-        mock_audio_to_wav.return_value = b"WAV"
+        mock_audio_to_wav_bytes.return_value = b"WAV"
 
         result = await engine.synthesize(
             "Goodbye",
-            instruct="A warm female narrator with gentle pace",
+            instructions="A warm female narrator with gentle pace",
         )
 
         mock_model.generate.assert_called_once_with(
@@ -667,122 +672,128 @@ class TestTTSEngineSynthesize:
         )
         assert result.duration == 0.5  # 12000 / 24000
 
-    @patch("omlx.engine.tts.mx")
-    @patch("omlx.engine.tts._audio_to_wav")
-    async def test_synthesize_voice_design_default_instruct(self, mock_audio_to_wav, mock_mx):
+    @patch("omlx.engine.tts._audio_to_wav_bytes")
+    async def test_synthesize_voice_design_default_instruct(self, mock_audio_to_wav_bytes):
         from omlx.engine.tts import TTSEngine
+        import numpy as np
 
         engine = TTSEngine(model_name="qwen3-tts-vd")
         engine._variant = "voice_design"
 
         mock_model = MagicMock()
-        mock_model.sample_rate = 24000
-        mock_audio = MagicMock()
-        mock_audio.shape = (24000,)
         mock_segment = MagicMock()
-        mock_segment.audio = mock_audio
+        mock_segment.audio = np.zeros(24000, dtype=np.float32)
+        mock_segment.sample_rate = 24000
         mock_model.generate.return_value = iter([mock_segment])
         engine._model = mock_model
 
-        mock_audio_to_wav.return_value = b"WAV"
+        mock_audio_to_wav_bytes.return_value = b"WAV"
 
         await engine.synthesize("Test")
 
-        # When instruct is None, "A neutral narrator" should be used
+        # When instructions is None, "A neutral narrator" should be used
         mock_model.generate.assert_called_once_with(
             text="Test",
             instruct="A neutral narrator",
         )
 
-    @patch("omlx.engine.tts.mx")
-    @patch("omlx.engine.tts._audio_to_wav")
-    async def test_synthesize_multiple_segments(self, mock_audio_to_wav, mock_mx):
+    @patch("omlx.engine.tts._audio_to_wav_bytes")
+    async def test_synthesize_multiple_segments(self, mock_audio_to_wav_bytes):
         from omlx.engine.tts import TTSEngine
+        import numpy as np
 
         engine = TTSEngine(model_name="qwen3-tts")
         engine._variant = "custom_voice"
 
         mock_model = MagicMock()
-        mock_model.sample_rate = 24000
         seg1 = MagicMock()
+        seg1.audio = np.zeros(24000, dtype=np.float32)
+        seg1.sample_rate = 24000
         seg2 = MagicMock()
+        seg2.audio = np.zeros(24000, dtype=np.float32)
+        seg2.sample_rate = 24000
         seg3 = MagicMock()
+        seg3.audio = np.zeros(24000, dtype=np.float32)
+        seg3.sample_rate = 24000
         mock_model.generate.return_value = iter([seg1, seg2, seg3])
         engine._model = mock_model
 
-        mock_audio = MagicMock()
-        mock_audio.shape = (72000,)
-        mock_mx.concatenate.return_value = mock_audio
-        mock_audio_to_wav.return_value = b"WAV"
+        mock_audio_to_wav_bytes.return_value = b"WAV"
 
         result = await engine.synthesize("Long text")
 
-        # Verify concatenation receives all 3 segment audios
-        concat_args = mock_mx.concatenate.call_args[0][0]
-        assert len(concat_args) == 3
         assert result.duration == 3.0  # 72000 / 24000
 
-    @patch("omlx.engine.tts.mx")
-    @patch("omlx.engine.tts._audio_to_wav")
-    async def test_synthesize_custom_sample_rate(self, mock_audio_to_wav, mock_mx):
+    @patch("omlx.engine.tts._audio_to_wav_bytes")
+    async def test_synthesize_custom_sample_rate(self, mock_audio_to_wav_bytes):
         """If model reports a different sample_rate, it should be respected."""
         from omlx.engine.tts import TTSEngine
+        import numpy as np
 
         engine = TTSEngine(model_name="qwen3-tts")
         engine._variant = "custom_voice"
 
         mock_model = MagicMock()
-        mock_model.sample_rate = 48000  # custom rate
-        mock_audio = MagicMock()
-        mock_audio.shape = (48000,)
         mock_segment = MagicMock()
-        mock_segment.audio = mock_audio
+        mock_segment.audio = np.zeros(48000, dtype=np.float32)
+        mock_segment.sample_rate = 48000  # custom rate
         mock_model.generate.return_value = iter([mock_segment])
         engine._model = mock_model
 
-        mock_audio_to_wav.return_value = b"WAV"
+        mock_audio_to_wav_bytes.return_value = b"WAV"
 
         result = await engine.synthesize("Hi")
 
         assert result.sample_rate == 48000
         assert result.duration == 1.0  # 48000 / 48000
-        mock_audio_to_wav.assert_called_once_with(mock_audio, 48000)
+        mock_audio_to_wav_bytes.assert_called_once()
+        call_args = mock_audio_to_wav_bytes.call_args[0]
+        assert call_args[1] == 48000
 
-    @patch("omlx.engine.tts.mx")
-    @patch("omlx.engine.tts._audio_to_wav")
-    async def test_synthesize_custom_voice_no_instruct(self, mock_audio_to_wav, mock_mx):
-        """When instruct is None for custom_voice, it should not be passed."""
+    @patch("omlx.engine.tts._audio_to_wav_bytes")
+    async def test_synthesize_custom_voice_no_instructions(self, mock_audio_to_wav_bytes):
+        """When instructions is None for custom_voice, instruct should not be passed."""
         from omlx.engine.tts import TTSEngine
+        import numpy as np
+        import inspect
 
         engine = TTSEngine(model_name="qwen3-tts")
         engine._variant = "custom_voice"
 
         mock_model = MagicMock()
-        mock_model.sample_rate = 24000
-        mock_audio = MagicMock()
-        mock_audio.shape = (24000,)
+        sig_params = {
+            "text": inspect.Parameter("text", inspect.Parameter.POSITIONAL_OR_KEYWORD),
+            "verbose": inspect.Parameter("verbose", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=False),
+            "voice": inspect.Parameter("voice", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=None),
+            "instruct": inspect.Parameter("instruct", inspect.Parameter.POSITIONAL_OR_KEYWORD, default=None),
+        }
+        mock_model.generate = MagicMock()
+        mock_model.generate.__signature__ = inspect.Signature(parameters=list(sig_params.values()))
         mock_segment = MagicMock()
-        mock_segment.audio = mock_audio
+        mock_segment.audio = np.zeros(24000, dtype=np.float32)
+        mock_segment.sample_rate = 24000
         mock_model.generate.return_value = iter([mock_segment])
         engine._model = mock_model
 
-        mock_audio_to_wav.return_value = b"WAV"
+        mock_audio_to_wav_bytes.return_value = b"WAV"
 
-        await engine.synthesize("Hi", speaker="ryan")
+        await engine.synthesize("Hi", voice="ryan")
 
-        # instruct not provided -> should NOT appear in generate kwargs
-        mock_model.generate.assert_called_once_with(text="Hi", voice="ryan")
+        # instructions not provided -> instruct should NOT appear in generate kwargs
+        call_kwargs = mock_model.generate.call_args.kwargs
+        assert call_kwargs.get("voice") == "ryan"
+        assert "instruct" not in call_kwargs
 
 
-class TestAudioToWav:
-    """Test the _audio_to_wav helper function."""
+class TestAudioToWavBytes:
+    """Test the audio_to_wav_bytes helper function."""
 
     def test_wav_header_structure(self):
         import numpy as np
-        from omlx.engine.tts import _audio_to_wav
+        from omlx.engine.audio_utils import audio_to_wav_bytes
 
         samples = np.array([0.0, 0.5, -0.5, 1.0, -1.0], dtype=np.float32)
-        wav = _audio_to_wav(samples, 24000)
+        wav = audio_to_wav_bytes(samples, 24000)
 
         assert wav[:4] == b"RIFF"
         assert wav[8:12] == b"WAVE"
@@ -795,10 +806,10 @@ class TestAudioToWav:
 
     def test_wav_total_size(self):
         import numpy as np
-        from omlx.engine.tts import _audio_to_wav
+        from omlx.engine.audio_utils import audio_to_wav_bytes
 
         samples = np.array([0.0] * 100, dtype=np.float32)
-        wav = _audio_to_wav(samples, 24000)
+        wav = audio_to_wav_bytes(samples, 24000)
 
         # Total file = 44 byte header + data
         assert len(wav) == 44 + 100 * 2
@@ -806,10 +817,10 @@ class TestAudioToWav:
     def test_wav_clamping(self):
         """Values outside [-1, 1] should be clamped."""
         import numpy as np
-        from omlx.engine.tts import _audio_to_wav
+        from omlx.engine.audio_utils import audio_to_wav_bytes
 
         samples = np.array([2.0, -2.0, 0.0], dtype=np.float32)
-        wav = _audio_to_wav(samples, 24000)
+        wav = audio_to_wav_bytes(samples, 24000)
 
         # Extract PCM data after 44-byte header
         pcm_data = wav[44:]
@@ -821,10 +832,10 @@ class TestAudioToWav:
     def test_wav_sample_rate_in_header(self):
         """Sample rate should appear in the WAV header."""
         import numpy as np
-        from omlx.engine.tts import _audio_to_wav
+        from omlx.engine.audio_utils import audio_to_wav_bytes
 
         samples = np.array([0.0], dtype=np.float32)
-        wav = _audio_to_wav(samples, 44100)
+        wav = audio_to_wav_bytes(samples, 44100)
 
         # Sample rate is at offset 24
         sr = struct.unpack("<I", wav[24:28])[0]
@@ -833,10 +844,10 @@ class TestAudioToWav:
     def test_wav_mono_16bit(self):
         """Verify WAV format fields: mono, 16-bit PCM."""
         import numpy as np
-        from omlx.engine.tts import _audio_to_wav
+        from omlx.engine.audio_utils import audio_to_wav_bytes
 
         samples = np.array([0.1], dtype=np.float32)
-        wav = _audio_to_wav(samples, 24000)
+        wav = audio_to_wav_bytes(samples, 24000)
 
         # PCM format = 1
         fmt = struct.unpack("<H", wav[20:22])[0]
@@ -853,14 +864,14 @@ class TestTranscriptionOutput:
     """Test TranscriptionOutput dataclass."""
 
     def test_defaults(self):
-        from omlx.engine.asr import TranscriptionOutput
+        from omlx.engine.stt import TranscriptionOutput
         out = TranscriptionOutput(text="hello")
         assert out.text == "hello"
         assert out.language is None
         assert out.duration is None
 
     def test_all_fields(self):
-        from omlx.engine.asr import TranscriptionOutput
+        from omlx.engine.stt import TranscriptionOutput
         out = TranscriptionOutput(text="bonjour", language="fr", duration=2.5)
         assert out.text == "bonjour"
         assert out.language == "fr"

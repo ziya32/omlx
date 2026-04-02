@@ -43,14 +43,14 @@ TINY_WAV = _make_wav_bytes()
 
 def _make_mock_stt_engine(transcript: str = "hello world") -> MagicMock:
     """Build a mock STTEngine that returns the given transcript."""
-    from omlx.engine.stt import STTEngine
+    from omlx.engine.stt import STTEngine, TranscriptionOutput
     engine = MagicMock(spec=STTEngine)
-    engine.transcribe = AsyncMock(return_value={
-        "text": transcript,
-        "language": "en",
-        "duration": 0.1,
-        "segments": [],
-    })
+    engine.transcribe = AsyncMock(return_value=TranscriptionOutput(
+        text=transcript,
+        language="en",
+        duration=0.1,
+        segments=[],
+    ))
     return engine
 
 
@@ -110,6 +110,13 @@ def server_audio_client():
 
     mock_pool = _make_mock_pool()
 
+    mock_settings = MagicMock()
+    mock_settings.get_settings.return_value = MagicMock(
+        display_name=None, default_language="auto", aliases=None,
+        default_voice=None, default_instruct=None,
+    )
+    mock_settings.resolve_model_id = MagicMock(side_effect=lambda m, _: m)
+
     with patch("omlx.server._server_state") as mock_state:
         mock_state.engine_pool = mock_pool
         mock_state.global_settings = None
@@ -117,12 +124,13 @@ def server_audio_client():
         mock_state.hf_downloader = None
         mock_state.ms_downloader = None
         mock_state.mcp_manager = None
-        mock_state.api_key = None
-        mock_state.settings_manager = MagicMock()
-        mock_state.settings_manager.resolve_model_id = MagicMock(
-            side_effect=lambda m, _: m
-        )
-        with TestClient(app, raise_server_exceptions=False) as client:
+        mock_state.api_key = "test-key"
+        mock_state.settings_manager = mock_settings
+        with TestClient(
+            app,
+            raise_server_exceptions=False,
+            headers={"Authorization": "Bearer test-key"},
+        ) as client:
             yield client, mock_pool
 
 
@@ -157,9 +165,10 @@ class TestSTTEndpointBasic:
 
     def test_response_text_matches_engine_output(self, server_audio_client):
         """Response text matches what the engine returned."""
+        from omlx.engine.stt import TranscriptionOutput
         client, mock_pool = server_audio_client
         mock_pool.get_engine.return_value.transcribe = AsyncMock(
-            return_value={"text": "test transcription", "language": "en", "duration": 0.5, "segments": []}
+            return_value=TranscriptionOutput(text="test transcription", language="en", duration=0.5, segments=[])
         )
 
         response = client.post(

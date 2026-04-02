@@ -8,7 +8,7 @@ thread (the global MLX executor) to prevent Metal command buffer races.
 See engine_core.py issue #85.
 
 These tests verify this invariant by monkey-patching the executor and
-checking that MLX operations in TTS, ASR, Embedding, and other engines
+checking that MLX operations in TTS, STT, Embedding, and other engines
 actually dispatch to the executor rather than running inline on the
 asyncio event loop thread.
 """
@@ -54,7 +54,7 @@ class TestTTSThreadSafety:
 
         load_thread_name = None
 
-        def _mock_load_model(path):
+        def _mock_load_model(path, **kwargs):
             nonlocal load_thread_name
             load_thread_name = threading.current_thread().name
             return MagicMock()
@@ -83,6 +83,7 @@ class TestTTSThreadSafety:
 
     async def test_synthesize_runs_on_executor_thread(self):
         """TTS synthesis (model.generate + mx.eval) must run on the executor thread."""
+        import numpy as np
         from omlx.engine.tts import TTSEngine
 
         generate_thread_name = None
@@ -94,7 +95,8 @@ class TestTTSThreadSafety:
             nonlocal generate_thread_name
             generate_thread_name = threading.current_thread().name
             seg = MagicMock()
-            seg.audio = MagicMock()
+            seg.audio = np.zeros(24000, dtype=np.float32)
+            seg.sample_rate = 24000
             return iter([seg])
 
         mock_model.generate = _mock_generate
@@ -103,12 +105,7 @@ class TestTTSThreadSafety:
         engine._model = mock_model
         engine._variant = "custom_voice"
 
-        with patch("omlx.engine.tts.mx") as mock_mx, \
-             patch("omlx.engine.tts._audio_to_wav", return_value=b"WAV"):
-            mock_audio = MagicMock()
-            mock_audio.shape = (24000,)
-            mock_mx.concatenate.return_value = mock_audio
-
+        with patch("omlx.engine.tts._audio_to_wav_bytes", return_value=b"WAV"):
             await engine.synthesize("Hello")
 
         executor_thread = _get_executor_thread_name()
@@ -145,12 +142,12 @@ class TestTTSThreadSafety:
         )
 
 
-class TestASRThreadSafety:
-    """Verify ASREngine operations run on the MLX executor thread."""
+class TestSTTThreadSafety:
+    """Verify STTEngine operations run on the MLX executor thread."""
 
     async def test_start_loads_on_executor_thread(self):
-        """ASR model loading must happen on the MLX executor thread."""
-        from omlx.engine.asr import ASREngine
+        """STT model loading must happen on the MLX executor thread."""
+        from omlx.engine.stt import STTEngine
 
         load_thread_name = None
 
@@ -166,19 +163,19 @@ class TestASRThreadSafety:
             "mlx_audio": MagicMock(stt=mock_stt),
             "mlx_audio.stt": mock_stt,
         }):
-            engine = ASREngine(model_name="whisper-tiny")
+            engine = STTEngine(model_name="whisper-tiny")
             await engine.start()
 
         executor_thread = _get_executor_thread_name()
         assert load_thread_name == executor_thread, (
-            f"ASR stt.load ran on thread '{load_thread_name}', "
+            f"STT stt.load ran on thread '{load_thread_name}', "
             f"expected MLX executor thread '{executor_thread}'. "
             f"This would cause Metal command buffer races!"
         )
 
     async def test_transcribe_runs_on_executor_thread(self, wav_path):
-        """ASR transcription must run on the executor thread."""
-        from omlx.engine.asr import ASREngine
+        """STT transcription must run on the executor thread."""
+        from omlx.engine.stt import STTEngine
 
         transcribe_thread_name = None
 
@@ -194,7 +191,7 @@ class TestASRThreadSafety:
         mock_gen_module = MagicMock()
         mock_gen_module.generate_transcription = _mock_generate_transcription
 
-        engine = ASREngine(model_name="whisper-tiny")
+        engine = STTEngine(model_name="whisper-tiny")
         engine._model = MagicMock(sample_rate=16000)
 
         with patch.dict("sys.modules", {
@@ -206,14 +203,14 @@ class TestASRThreadSafety:
 
         executor_thread = _get_executor_thread_name()
         assert transcribe_thread_name == executor_thread, (
-            f"ASR generate_transcription ran on thread '{transcribe_thread_name}', "
+            f"STT generate_transcription ran on thread '{transcribe_thread_name}', "
             f"expected MLX executor thread '{executor_thread}'. "
             f"This would cause Metal command buffer races!"
         )
 
     async def test_stop_clears_cache_on_executor_thread(self):
-        """ASR mx.clear_cache must run on the executor thread."""
-        from omlx.engine.asr import ASREngine
+        """STT mx.clear_cache must run on the executor thread."""
+        from omlx.engine.stt import STTEngine
 
         clear_cache_thread = None
 
@@ -221,17 +218,17 @@ class TestASRThreadSafety:
             nonlocal clear_cache_thread
             clear_cache_thread = threading.current_thread().name
 
-        engine = ASREngine(model_name="whisper-tiny")
+        engine = STTEngine(model_name="whisper-tiny")
         engine._model = MagicMock()
 
-        with patch("omlx.engine.asr.mx") as mock_mx, \
-             patch("omlx.engine.asr.gc"):
+        with patch("omlx.engine.stt.mx") as mock_mx, \
+             patch("omlx.engine.stt.gc"):
             mock_mx.clear_cache = _track_clear_cache
             await engine.stop()
 
         executor_thread = _get_executor_thread_name()
         assert clear_cache_thread == executor_thread, (
-            f"ASR mx.clear_cache ran on thread '{clear_cache_thread}', "
+            f"STT mx.clear_cache ran on thread '{clear_cache_thread}', "
             f"expected MLX executor thread '{executor_thread}'. "
             f"This would cause Metal command buffer races!"
         )

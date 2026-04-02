@@ -193,128 +193,6 @@ class TestRerankerE2E:
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Prefill-only mode E2E
-# ──────────────────────────────────────────────────────────────────────
-
-
-class TestPrefillOnlyE2E:
-    """E2E tests for prefill_only mode through the real scheduler."""
-
-    @pytest.fixture(scope="class")
-    def llm_model(self):
-        model = _find_model(
-            ["Nanbeige", "SmolLM", "Qwen3-0.6B", "Llama-3.2-1B"],
-            max_size_gb=8.0,
-        )
-        if model is None:
-            pytest.skip("No small LLM model found for prefill_only test")
-        return model
-
-    @pytest.fixture(scope="class")
-    def batched_engine(self, llm_model):
-        """Load a BatchedEngine for prefill_only testing."""
-        import asyncio
-        from omlx.engine.batched import BatchedEngine
-
-        loop = asyncio.new_event_loop()
-        engine = BatchedEngine(model_name=str(llm_model))
-        loop.run_until_complete(engine.start())
-        yield engine, loop
-        loop.run_until_complete(engine.stop())
-        loop.close()
-        gc.collect()
-        mx.clear_cache()
-
-    def test_prefill_only_captures_logits(self, batched_engine):
-        """Test that prefill_only=True captures last_logits in output."""
-        from omlx.request import SamplingParams
-
-        engine, loop = batched_engine
-        params = SamplingParams(
-            max_tokens=1,
-            temperature=0.0,
-            prefill_only=True,
-            prefill_output="logits",
-        )
-
-        output = loop.run_until_complete(engine._engine.generate(
-            prompt="The capital of France is",
-            sampling_params=params,
-        ))
-
-        assert output.finished is True
-        assert output.last_logits is not None
-        assert len(output.last_logits) > 1000
-
-    def test_prefill_only_logits_are_valid(self, batched_engine):
-        """Test that captured logits produce valid probabilities."""
-        from omlx.request import SamplingParams
-
-        engine, loop = batched_engine
-        params = SamplingParams(
-            max_tokens=1,
-            temperature=0.0,
-            prefill_only=True,
-            prefill_output="logits",
-        )
-
-        output = loop.run_until_complete(engine._engine.generate(
-            prompt="Hello",
-            sampling_params=params,
-        ))
-
-        logits = mx.array(output.last_logits)
-        probs = mx.softmax(logits)
-        mx.eval(probs)
-
-        total = float(mx.sum(probs).item())
-        assert abs(total - 1.0) < 1e-3, f"Probabilities sum to {total}, expected ~1.0"
-
-        max_prob = float(mx.max(probs).item())
-        assert max_prob > 0.0
-        assert max_prob <= 1.0
-
-    def test_prefill_only_minimal_generation(self, batched_engine):
-        """Test prefill_only produces exactly 1 completion token."""
-        from omlx.request import SamplingParams
-
-        engine, loop = batched_engine
-        params = SamplingParams(
-            max_tokens=1,
-            temperature=0.0,
-            prefill_only=True,
-            prefill_output="logits",
-        )
-
-        output = loop.run_until_complete(engine._engine.generate(
-            prompt="Test prompt for prefill only",
-            sampling_params=params,
-        ))
-
-        assert output.completion_tokens == 1
-        assert output.prompt_tokens > 0
-
-    def test_prefill_only_without_logits_capture(self, batched_engine):
-        """Test prefill_only=True without prefill_output doesn't capture logits."""
-        from omlx.request import SamplingParams
-
-        engine, loop = batched_engine
-        params = SamplingParams(
-            max_tokens=1,
-            temperature=0.0,
-            prefill_only=True,
-            prefill_output="",
-        )
-
-        output = loop.run_until_complete(engine._engine.generate(
-            prompt="Test",
-            sampling_params=params,
-        ))
-
-        assert output.last_logits is None
-
-
-# ──────────────────────────────────────────────────────────────────────
 # ASR E2E (requires mlx-audio + ASR model)
 # ──────────────────────────────────────────────────────────────────────
 
@@ -335,11 +213,11 @@ class TestASRE2E:
         import asyncio
 
         try:
-            from omlx.engine.asr import ASREngine
+            from omlx.engine.stt import STTEngine
         except ImportError:
             pytest.skip("mlx-audio not installed")
 
-        engine = ASREngine(model_name=str(asr_model))
+        engine = STTEngine(model_name=str(asr_model))
         try:
             asyncio.run(engine.start())
         except ImportError:
@@ -496,11 +374,11 @@ class TestTTSASRRoundTrip:
             pytest.skip("No ASR model found")
 
         try:
-            from omlx.engine.asr import ASREngine
+            from omlx.engine.stt import STTEngine
         except ImportError:
             pytest.skip("mlx-audio not installed")
 
-        engine = ASREngine(model_name=str(model))
+        engine = STTEngine(model_name=str(model))
         try:
             asyncio.run(engine.start())
         except Exception as e:

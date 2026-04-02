@@ -45,6 +45,7 @@ class TestPostDecodeAbort:
         scheduler._step_counter = 0
         scheduler._pending_abort_ids = {"req-1"}
         scheduler.memory_monitor = None
+        scheduler._deferred_clear_steps = None
 
         # Mock batch_generator.next() returning a response for req-1
         mock_response = MagicMock()
@@ -54,7 +55,7 @@ class TestPostDecodeAbort:
 
         # Mock internal methods
         scheduler._process_pending_aborts = MagicMock()
-        scheduler._schedule_waiting = MagicMock(return_value=[])
+        scheduler._schedule_waiting = MagicMock(return_value=([], []))
         scheduler._process_batch_responses = MagicMock(return_value=([], set()))
         scheduler._cleanup_finished = MagicMock()
         scheduler._check_memory_pressure = MagicMock()
