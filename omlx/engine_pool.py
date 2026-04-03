@@ -581,7 +581,7 @@ class EnginePool:
                     # Exclusive pinned models: clear non-pinned models before
                     # returning the engine so inference has maximum headroom.
                     if entry.is_pinned and entry.exclusive:
-                        logger.info(
+                        logger.debug(
                             f"get_engine({model_id}) exclusive fast path: "
                             f"active_uses={entry.active_uses}, "
                             f"exclusive_idle={'set' if entry.exclusive_idle is not None and entry.exclusive_idle.is_set() else 'unset' if entry.exclusive_idle is not None else 'None'}"
@@ -610,7 +610,7 @@ class EnginePool:
                             # Break out of the lock block to enter the wait path.
                         else:
                             # All clear — recalculate vision limits if VLM
-                            logger.info(
+                            logger.debug(
                                 f"get_engine({model_id}) exclusive all clear, "
                                 f"returning engine (active_uses={entry.active_uses})"
                             )
@@ -740,7 +740,7 @@ class EnginePool:
                         # drain_complete or unload_complete from
                         # _clear_for_exclusive or _prepare_memory_for
                         wait_target = "drain_or_unload"
-                logger.info(
+                logger.debug(
                     f"get_engine({model_id}) waiting on {wait_target}, "
                     f"iteration={iterations}, "
                     f"elapsed={time.monotonic() - start_time:.1f}s"
@@ -750,7 +750,7 @@ class EnginePool:
                     await asyncio.wait_for(
                         event.wait(), timeout=self._max_wait_timeout
                     )
-                    logger.info(
+                    logger.debug(
                         f"get_engine({model_id}) woke from {wait_target}, "
                         f"re-entering loop (iteration={iterations})"
                     )
@@ -853,13 +853,13 @@ class EnginePool:
                 # Entering exclusive hold — create fresh event for waiters
                 entry.exclusive_idle = asyncio.Event()
                 entry._exclusive_hold_start = time.time()
-                logger.info(
+                logger.debug(
                     f"acquire_engine({model_id}) exclusive 0→1, "
                     f"created exclusive_idle event"
                 )
             entry.active_uses += 1
             if entry.exclusive:
-                logger.info(
+                logger.debug(
                     f"acquire_engine({model_id}) active_uses={entry.active_uses}"
                 )
 
@@ -872,7 +872,7 @@ class EnginePool:
         if entry is not None and entry.active_uses > 0:
             entry.active_uses -= 1
             if entry.exclusive:
-                logger.info(
+                logger.debug(
                     f"release_engine({model_id}) active_uses={entry.active_uses}"
                 )
             if entry.exclusive and entry.active_uses == 0:
@@ -1055,7 +1055,7 @@ class EnginePool:
         if not entry.is_pinned:
             for mid, e in self._entries.items():
                 if e.exclusive and e.is_pinned:
-                    logger.info(
+                    logger.debug(
                         f"_prepare_memory_for('{entry.model_id}') "
                         f"checking exclusive '{mid}': "
                         f"active_uses={e.active_uses}, "
@@ -1070,7 +1070,7 @@ class EnginePool:
                         return e.exclusive_idle
                     # Log WHY we didn't defer
                     if e.active_uses == 0:
-                        logger.info(
+                        logger.debug(
                             f"_prepare_memory_for('{entry.model_id}') "
                             f"NOT deferring: exclusive '{mid}' has "
                             f"active_uses=0 (no active requests)"
@@ -1262,7 +1262,7 @@ class EnginePool:
             # rejecting with an immediate 507.
             for mid, e in self._entries.items():
                 if e.exclusive and e.is_pinned:
-                    logger.info(
+                    logger.debug(
                         f"_check_process_memory('{entry.model_id}') "
                         f"checking exclusive '{mid}': "
                         f"active_uses={e.active_uses}, "
