@@ -94,6 +94,10 @@ class EngineEntry:
     load_started: float = 0.0                     # For diagnostics
     load_failed_at: float = 0.0                   # Cooldown after load failure
     active_uses: int = 0                          # Number of request handlers currently using this engine
+    exclusive: bool = False                        # Evict all non-pinned models on request (requires is_pinned)
+    exclusive_max_hold: int = 0                    # Max seconds of continuous exclusive hold (0 = unlimited)
+    exclusive_idle: asyncio.Event | None = None    # Signaled when exclusive model active_uses → 0
+    _exclusive_hold_start: float = 0.0             # When active_uses went 0 → 1 (for max_hold tracking)
 
     @property
     def is_loading(self) -> bool:
@@ -402,7 +406,7 @@ class EnginePool:
     def apply_settings_overrides(
         self, settings_manager: "ModelSettingsManager"
     ) -> None:
-        """Apply model_type_override from persisted settings to discovered entries."""
+        """Apply model_type_override and exclusive from persisted settings."""
         for model_id, entry in self._entries.items():
             settings = settings_manager.get_settings(model_id)
             if settings.model_type_override:
@@ -413,6 +417,13 @@ class EnginePool:
                 logger.info(
                     f"Applied model_type override for {model_id}: "
                     f"type={entry.model_type}, engine={entry.engine_type}"
+                )
+            entry.exclusive = settings.exclusive
+            entry.exclusive_max_hold = settings.exclusive_max_hold
+            if settings.exclusive:
+                logger.info(
+                    f"Applied exclusive setting for {model_id}: "
+                    f"exclusive=True, max_hold={entry.exclusive_max_hold}s"
                 )
 
     def get_model_ids(self) -> list[str]:
@@ -442,6 +453,29 @@ class EnginePool:
         if entry is None:
             return False
         entry.is_pinned = pinned
+        return True
+
+    def set_exclusive(
+        self, model_id: str, exclusive: bool, max_hold: int = 0
+    ) -> bool:
+        """Set the exclusive status for a model.
+
+        Args:
+            model_id: The model ID to update
+            exclusive: Whether to enable (True) or disable (False) exclusive mode
+            max_hold: Max seconds of continuous exclusive hold (0 = unlimited)
+
+        Returns:
+            True if successful, False if model not found.
+        """
+        entry = self._entries.get(model_id)
+        if entry is None:
+            return False
+        entry.exclusive = exclusive
+        entry.exclusive_max_hold = max_hold
+        if not exclusive:
+            entry.exclusive_idle = None
+            entry._exclusive_hold_start = 0.0
         return True
 
     def _case_insensitive_entry_match(self, name: str) -> str | None:
@@ -533,6 +567,7 @@ class EnginePool:
 
             should_load = False
             event = None
+            wait_target = ""
 
             async with self._tracked_lock("get_engine"):
                 entry = self._entries.get(model_id)
@@ -542,9 +577,40 @@ class EnginePool:
                 if entry.state == EngineState.ACTIVE and entry.engine is not None:
                     # Fast path: model loaded and ready
                     entry.last_access = time.time()
-                    return entry.engine
 
-                if entry.state == EngineState.LOADING:
+                    # Exclusive pinned models: clear non-pinned models before
+                    # returning the engine so inference has maximum headroom.
+                    if entry.is_pinned and entry.exclusive:
+                        # Step 10: check if exclusive hold has expired
+                        if (
+                            entry.exclusive_max_hold > 0
+                            and entry._exclusive_hold_start > 0
+                        ):
+                            hold = time.time() - entry._exclusive_hold_start
+                            if hold > entry.exclusive_max_hold:
+                                logger.info(
+                                    f"Exclusive hold expired for '{model_id}' "
+                                    f"({hold:.0f}s > {entry.exclusive_max_hold}s)"
+                                )
+                                self._refresh_vision_limits(entry)
+                                return entry.engine
+
+                        wait_event = await self._clear_for_exclusive(entry)
+                        if wait_event is not None:
+                            # Must wait for drain/unload — fall through to the
+                            # wait-outside-lock section, then re-enter loop.
+                            event = wait_event
+                            wait_target = "exclusive_headroom"
+                            # Don't set should_load — model is already loaded.
+                            # Break out of the lock block to enter the wait path.
+                        else:
+                            # All clear — recalculate vision limits if VLM
+                            self._refresh_vision_limits(entry)
+                            return entry.engine
+                    else:
+                        return entry.engine
+
+                elif entry.state == EngineState.LOADING:
                     # Someone else is loading this model — wait for them
                     event = entry.ready_event
 
@@ -655,7 +721,16 @@ class EnginePool:
                 # Wait for state change, then re-check.
                 # CancelledError propagates here if client disconnects.
                 # Bounded by max_wait_timeout to prevent infinite waits.
-                wait_target = "ready_event" if event is entry.ready_event else "drain_complete"
+                if not isinstance(wait_target, str) or wait_target == "":
+                    # Classify the event for logging/timeout handling
+                    if event is entry.ready_event:
+                        wait_target = "ready_event"
+                    elif event is getattr(entry, 'exclusive_idle', None):
+                        wait_target = "exclusive_idle"
+                    else:
+                        # drain_complete or unload_complete from
+                        # _clear_for_exclusive or _prepare_memory_for
+                        wait_target = "drain_or_unload"
                 if __debug__:
                     logger.debug(
                         f"get_engine({model_id}) waiting on {wait_target}, "
@@ -673,7 +748,7 @@ class EnginePool:
                     # If we're waiting for a drain and the draining model
                     # still has active inference, extend the wait — same
                     # logic as the drain monitor's active_uses extension.
-                    if wait_target == "drain_complete":
+                    if wait_target in ("drain_complete", "drain_or_unload", "exclusive_headroom"):
                         draining_entry = self._find_draining_entry(event)
                         if draining_entry is not None and draining_entry.active_uses > 0:
                             logger.warning(
@@ -762,6 +837,10 @@ class EnginePool:
         """
         entry = self._entries.get(model_id)
         if entry is not None:
+            if entry.exclusive and entry.active_uses == 0:
+                # Entering exclusive hold — create fresh event for waiters
+                entry.exclusive_idle = asyncio.Event()
+                entry._exclusive_hold_start = time.time()
             entry.active_uses += 1
 
     def release_engine(self, model_id: str) -> None:
@@ -772,6 +851,22 @@ class EnginePool:
         entry = self._entries.get(model_id)
         if entry is not None and entry.active_uses > 0:
             entry.active_uses -= 1
+            if entry.exclusive and entry.active_uses == 0:
+                entry._exclusive_hold_start = 0.0
+                # CRITICAL: Capture the event reference NOW, not later.
+                # acquire_engine() may replace entry.exclusive_idle with
+                # a fresh Event before _signal_exclusive_idle() runs.
+                event_to_signal = entry.exclusive_idle
+                # Fire async task: clear Metal cache, then signal waiters
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(
+                        self._signal_exclusive_idle(event_to_signal)
+                    )
+                except RuntimeError:
+                    # No running loop (shutdown) — signal directly
+                    if event_to_signal is not None:
+                        event_to_signal.set()
 
     @asynccontextmanager
     async def use_engine(self, model_id: str):
@@ -790,6 +885,123 @@ class EnginePool:
             yield engine
         finally:
             self.release_engine(model_id)
+
+    # -------------------------------------------------------------------------
+    # Exclusive pinned model support
+    # -------------------------------------------------------------------------
+
+    async def _clear_for_exclusive(
+        self, pinned_entry: EngineEntry
+    ) -> asyncio.Event | None:
+        """Evict all non-pinned models to maximize headroom for a pinned model.
+
+        Called under self._lock when a request arrives for a pinned+exclusive model.
+
+        Returns:
+            None — all non-pinned models cleared, caller may proceed.
+            asyncio.Event — a drain or unload is in progress. Caller must
+                await this event outside the lock, then re-enter get_engine().
+        """
+        for mid, e in self._entries.items():
+            if e.is_pinned or e is pinned_entry:
+                continue
+
+            # Already transitioning — collect an event to wait on
+            if e.state == EngineState.DRAINING:
+                return e.drain_complete
+            if e.state == EngineState.UNLOADING:
+                return e.unload_complete
+
+            # Not loaded — skip
+            if e.engine is None or e.state != EngineState.ACTIVE:
+                continue
+
+            # Loaded non-pinned model — must go
+            has_work = (
+                self._engine_has_active_work(e.engine) or e.active_uses > 0
+            )
+            if has_work:
+                # Active requests → drain gracefully
+                self._start_drain(mid)
+                logger.info(
+                    f"Exclusive headroom: draining '{mid}' "
+                    f"(active_uses={e.active_uses})"
+                )
+                return e.drain_complete
+            else:
+                # Idle → unload immediately
+                logger.info(f"Exclusive headroom: evicting idle '{mid}'")
+                await self._unload_engine(mid, reason="exclusive_headroom")
+                # Continue loop — may need to evict more models.
+                # But _unload_engine sets state to UNLOADING and defers
+                # cleanup, so the next iteration will see UNLOADING and
+                # return unload_complete if Metal cleanup isn't done yet.
+
+        # All non-pinned models cleared (or never existed)
+        return None
+
+    def _refresh_vision_limits(self, entry: EngineEntry) -> None:
+        """Recalculate vision limits from committed memory state.
+
+        Called under self._lock after _clear_for_exclusive() returns None
+        (all non-pinned models cleared). Uses _committed_memory() rather
+        than mx.get_active_memory() to avoid Metal calls under the lock.
+        """
+        engine = entry.engine
+        if engine is None or not hasattr(engine, 'vision_chunk_budget_pixels'):
+            return
+
+        enforcer = self._process_memory_enforcer
+        max_bytes = getattr(enforcer, 'max_bytes', 0) if enforcer else 0
+        if not max_bytes:
+            return
+
+        committed = self._committed_memory()
+        headroom = max(0, max_bytes - committed)
+
+        engine.vision_chunk_budget_pixels = int(
+            headroom * self._VISION_SAFETY_FACTOR
+            / self._VISION_BYTES_PER_PIXEL
+        ) if headroom > 0 else 0
+
+        entry._vision_limits_cache = None  # Invalidate cached limits
+
+        logger.debug(
+            "Vision limits refreshed: chunk_budget_pixels=%d "
+            "(headroom=%.1fGB, committed=%.1fGB, limit=%.1fGB)",
+            engine.vision_chunk_budget_pixels,
+            headroom / 1e9,
+            committed / 1e9,
+            max_bytes / 1e9,
+        )
+
+    async def _signal_exclusive_idle(
+        self, event: asyncio.Event | None
+    ) -> None:
+        """Clear Metal buffer cache and signal a specific event.
+
+        Runs as a fire-and-forget task spawned by release_engine().
+        Takes the EVENT directly (not the entry) to avoid the capture
+        race where acquire_engine() replaces entry.exclusive_idle
+        before this task runs.
+
+        Must run mx.synchronize + mx.clear_cache on the MLX executor
+        so that mx.get_active_memory() reflects the freed KV/vision
+        buffers before waiters re-check.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                get_mlx_executor(),
+                lambda: (mx.synchronize(), mx.clear_cache()),
+            )
+        except Exception as e:
+            logger.warning(
+                f"Metal cache clear failed in exclusive idle signal: {e}"
+            )
+        finally:
+            if event is not None:
+                event.set()
 
     # -------------------------------------------------------------------------
     # Memory preparation (drain instead of reject)
@@ -812,6 +1024,25 @@ class EnginePool:
             ModelTooLargeError: If model can't fit even with all non-pinned
                 models evicted (permanent failure, not retryable).
         """
+        # Don't load non-pinned models while an exclusive model is actively
+        # inferring.  Model loading monopolizes the single MLX executor
+        # thread, starving the exclusive model's scheduler steps.  Wait for
+        # the exclusive model to finish instead.
+        if not entry.is_pinned:
+            for mid, e in self._entries.items():
+                if (
+                    e.exclusive
+                    and e.is_pinned
+                    and e.active_uses > 0
+                    and e.exclusive_idle is not None
+                ):
+                    logger.info(
+                        f"Deferring load of '{entry.model_id}': "
+                        f"exclusive model '{mid}' has "
+                        f"{e.active_uses} active request(s)"
+                    )
+                    return e.exclusive_idle
+
         # Don't load while another model is still cleaning up Metal resources.
         # UNLOADING means engine.stop() + mx.synchronize() + mx.clear_cache()
         # is in progress — Metal buffers are still allocated.
@@ -991,6 +1222,24 @@ class EnginePool:
                     f"{format_size(enforcer.max_bytes)}. Proceeding."
                 )
                 return None
+
+            # If an exclusive model has active requests, its runtime memory
+            # (KV cache, vision buffers) will be freed when it finishes.
+            # Wait for it rather than loading into contested memory or
+            # rejecting with an immediate 507.
+            for mid, e in self._entries.items():
+                if (
+                    e.exclusive
+                    and e.is_pinned
+                    and e.active_uses > 0
+                    and e.exclusive_idle is not None
+                ):
+                    logger.info(
+                        f"Waiting for exclusive model '{mid}' to finish "
+                        f"({e.active_uses} active request(s)) before loading "
+                        f"'{entry.model_id}'"
+                    )
+                    return e.exclusive_idle
 
             # Projected memory still too high. Check if committed model
             # weights alone fit and the overshoot is modest (within 25%
@@ -1623,6 +1872,10 @@ class EnginePool:
             "model_type": e.model_type,
             "config_model_type": e.config_model_type,
             "last_access": e.last_access if e.last_access > 0 else None,
+            "exclusive": e.exclusive,
+            "exclusive_max_hold": e.exclusive_max_hold,
+            "active_uses": e.active_uses,
+            "exclusive_idle_pending": e.exclusive_idle is not None and not e.exclusive_idle.is_set() if e.exclusive_idle is not None else False,
         }
         if e.model_type == "vlm":
             if e._vision_limits_cache is None:
@@ -1676,6 +1929,14 @@ class EnginePool:
                     if e.engine
                     else False
                 )
+            info["exclusive"] = e.exclusive
+            info["exclusive_max_hold"] = e.exclusive_max_hold
+            info["active_uses"] = e.active_uses
+            info["exclusive_idle_pending"] = (
+                e.exclusive_idle is not None and not e.exclusive_idle.is_set()
+                if e.exclusive_idle is not None
+                else False
+            )
             models[mid] = info
 
         unloaded_count = sum(
@@ -1710,6 +1971,7 @@ class EnginePool:
                     "engine_loaded": e.engine is not None,
                     "active_uses": e.active_uses,
                     "is_pinned": e.is_pinned,
+                    "exclusive": e.exclusive,
                     "engine_type": e.engine_type,
                     "model_type": e.model_type,
                     "estimated_size_bytes": e.estimated_size,

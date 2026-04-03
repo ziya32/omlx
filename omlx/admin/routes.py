@@ -108,6 +108,8 @@ class ModelSettingsRequest(BaseModel):
     default_response_format: Optional[str] = None
     is_pinned: Optional[bool] = None
     is_default: Optional[bool] = None
+    exclusive: Optional[bool] = None
+    exclusive_max_hold: Optional[int] = None
 
 
 class GlobalSettingsRequest(BaseModel):
@@ -1533,6 +1535,13 @@ async def update_model_settings(
         current_settings.is_pinned = request.is_pinned
         # Also update the engine pool entry
         entry.is_pinned = request.is_pinned
+    if request.exclusive is not None:
+        current_settings.exclusive = request.exclusive
+        # Also update the engine pool entry
+        entry.exclusive = request.exclusive
+    if request.exclusive_max_hold is not None:
+        current_settings.exclusive_max_hold = request.exclusive_max_hold
+        entry.exclusive_max_hold = request.exclusive_max_hold
     if request.is_default is not None:
         current_settings.is_default = request.is_default
         # Update server_state.default_model if setting as default

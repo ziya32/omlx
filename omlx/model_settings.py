@@ -77,6 +77,8 @@ class ModelSettings:
     # Model management flags
     is_pinned: bool = False
     is_default: bool = False  # Only one model can be default
+    exclusive: bool = False  # When True + is_pinned, evict all non-pinned models on request
+    exclusive_max_hold: int = 0  # Max seconds of continuous exclusive hold (0 = unlimited)
 
     # Metadata
     display_name: Optional[str] = None

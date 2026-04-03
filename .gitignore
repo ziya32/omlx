@@ -112,3 +112,6 @@ omlx/_build_info.py
 omlx/admin/tailwindcss-*
 tests/fixtures/sample_speech.wav
 tests/fixtures/sample_speech_transcript.json
+
+# Test reports
+test-reports/

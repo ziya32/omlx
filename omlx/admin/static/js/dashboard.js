@@ -98,6 +98,8 @@
                 force_sampling: false,
                 enableToolResultLimit: false,
                 max_tool_result_tokens: null,
+                exclusive: false,
+                exclusive_max_hold: 0,
                 ctKwargEntries: [],
             },
             savingModelSettings: false,
@@ -929,6 +931,8 @@
                     default_voice: settings.default_voice || '',
                     default_instruct: settings.default_instruct || '',
                     default_language: settings.default_language || '',
+                    exclusive: settings.exclusive || false,
+                    exclusive_max_hold: settings.exclusive_max_hold || 0,
                     ctKwargEntries,
                 };
                 this.showModelSettingsModal = true;
@@ -1006,6 +1010,8 @@
                                 specprefill_threshold: this.modelSettings.specprefill_enabled
                                     ? (this.modelSettings.specprefill_threshold || null)
                                     : null,
+                                exclusive: this.modelSettings.exclusive,
+                                exclusive_max_hold: this.modelSettings.exclusive_max_hold || null,
                             };
                         })()),
                     });
