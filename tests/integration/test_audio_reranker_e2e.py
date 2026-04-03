@@ -317,7 +317,7 @@ class TestTTSE2E:
         import asyncio
 
         output = asyncio.run(
-            tts_engine.synthesize(text="Hello world.")
+            tts_engine.synthesize(text="Hello world.", voice="Vivian")
         )
 
         assert output.audio_bytes is not None
@@ -396,7 +396,7 @@ class TestTTSASRRoundTrip:
 
         # Step 1: TTS — text to audio
         tts_output = asyncio.run(
-            tts_engine.synthesize(text=source_text)
+            tts_engine.synthesize(text=source_text, voice="Vivian")
         )
         assert tts_output.audio_bytes is not None
         assert tts_output.duration > 0.0

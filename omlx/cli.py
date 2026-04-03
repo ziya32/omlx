@@ -239,13 +239,6 @@ def serve_command(args):
     )
     print(f"Log directory: {log_dir}")
 
-    # Enable native crash diagnostics (SIGABRT, SIGSEGV, SIGFPE, SIGBUS).
-    # On Metal/MLX crashes (#511, #520), this dumps all Python thread
-    # tracebacks to the server log before the process terminates.
-    crash_log_path = log_dir / "crash.log"
-    _crash_file = open(crash_log_path, "a")
-    faulthandler.enable(file=_crash_file, all_threads=True)
-
     # When stderr is not a real terminal (e.g., subprocess pipe), remove the
     # stderr StreamHandler to prevent pipe-buffer deadlocks.  If the parent
     # process does not read the pipe fast enough, the pipe buffer fills up,
@@ -277,12 +270,20 @@ def serve_command(args):
         _faulthandler_crash_logfp = None
         fh_for_faulthandler = sys.stderr
 
+    # faulthandler.enable() installs C-level signal handlers for SIGABRT,
+    # SIGSEGV, etc. that dump Python thread stacks.  These fire on ANY thread,
+    # which is critical — Metal GPU errors abort() from background GCD threads,
+    # not the Python main thread.  Do NOT replace this with signal.signal()
+    # which only delivers to the main thread.
     faulthandler.enable(file=fh_for_faulthandler, all_threads=True)
 
-    def _sigabrt_handler(_signum, _frame):
+    # SIGUSR1: voluntary diagnostic dump (memory + engine snapshot + stacks).
+    # Safe to use signal.signal() here since SIGUSR1 is only sent deliberately
+    # (e.g. `kill -USR1 <pid>`) and is always delivered to the main thread.
+    def _sigusr1_handler(_signum, _frame):
         try:
             fh_for_faulthandler.write(
-                "\n--- native crash dumps (memory + thread stacks) append below ---\n"
+                "\n--- diagnostic dump (SIGUSR1) ---\n"
             )
             fh_for_faulthandler.flush()
         except OSError:
@@ -303,15 +304,12 @@ def serve_command(args):
             fh_for_faulthandler.flush()
         except OSError:
             pass
-        signal.signal(signal.SIGABRT, signal.SIG_DFL)
-        os.kill(os.getpid(), signal.SIGABRT)
 
-    # enable() registers SIGABRT; replace with our handler (memory + traceback).
-    signal.signal(signal.SIGABRT, _sigabrt_handler)
+    signal.signal(signal.SIGUSR1, _sigusr1_handler)
 
     logging.getLogger(__name__).info(
-        "faulthandler enabled: SIGABRT dumps memory, engine pool snapshot, "
-        "and Python thread stacks to %s",
+        "faulthandler enabled: SIGABRT dumps Python thread stacks to %s; "
+        "SIGUSR1 dumps memory + engine snapshot + stacks",
         str(crash_log_path) if _faulthandler_crash_logfp else "stderr",
     )
 

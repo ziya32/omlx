@@ -1023,3 +1023,123 @@ class TestReport:
                 f"{VLM_MAX_RESPONSE_TIME}s threshold:\n{details}\n"
                 f"Full report: {report_path}"
             )
+
+    async def test_99b_check_exclusive_isolation(
+        self, client, setup_exclusive
+    ):
+        """Scan server log: no non-VLM engine work during VLM inference.
+
+        Parses the omlx server log for the duration of this test session
+        and checks that no embedding, reranker, TTS, STT, or model-loading
+        activity occurs between a VLM "Chat completion received" and its
+        matching "Chat completion [same-id]: N tokens" completion line.
+        """
+        import re
+        from pathlib import Path
+
+        log_path = Path.home() / ".omlx" / "logs" / "server.log"
+        if not log_path.exists():
+            pytest.skip(f"Server log not found at {log_path}")
+
+        log_lines = log_path.read_text().splitlines()
+
+        # Use the tracker's earliest and latest timestamps to scope the scan
+        # to this test session only.
+        session_start = min(
+            (r.start_time for r in _tracker.records if r.start_time > 0),
+            default=0,
+        )
+        if session_start == 0:
+            pytest.skip("No tracked requests with timestamps")
+
+        # ── Parse log lines ──────────────────────────────────────────
+        # Patterns:
+        #   Chat completion [REQ_ID] received: model=..., ...
+        #   Chat completion [REQ_ID]: N tokens in Xs (Y tok/s)
+        #   Embedding [...]: ...
+        #   Rerank [...]: ...
+        #   Speech [...]: ...
+        #   Loading model: ...
+        #   STT transcribe done: ...
+
+        vlm_received_re = re.compile(
+            r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+).*"
+            r"Chat completion \[([0-9a-f-]+)\] received:.*"
+            r"model=" + re.escape(VLM_MODEL)
+        )
+        vlm_done_re = re.compile(
+            r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+).*"
+            r"Chat completion \[([0-9a-f-]+)\]: \d+ tokens in"
+        )
+
+        # Lines that indicate non-VLM engine work
+        non_vlm_work_re = re.compile(
+            r"Embedding \[|Rerank \[|Speech \[|STT transcribe done|"
+            r"Loading model:|Loaded model:|Reranker engine started|"
+            r"Embedding engine started|state=unloaded→loading"
+        )
+
+        def _parse_ts(ts_str: str) -> str:
+            """Return timestamp string for display."""
+            return ts_str
+
+        # ── Identify VLM in-flight windows ───────────────────────────
+        # Build a list of (req_id, start_line_idx, end_line_idx) tuples
+        vlm_windows: list[tuple[str, int, int]] = []
+        open_vlm: dict[str, int] = {}  # req_id → start line index
+
+        for idx, line in enumerate(log_lines):
+            m = vlm_received_re.match(line)
+            if m:
+                req_id = m.group(2)
+                open_vlm[req_id] = idx
+                continue
+            m = vlm_done_re.match(line)
+            if m:
+                req_id = m.group(2)
+                if req_id in open_vlm:
+                    vlm_windows.append((req_id, open_vlm.pop(req_id), idx))
+
+        # ── Scan for violations ──────────────────────────────────────
+        violations: list[str] = []
+
+        for req_id, start_idx, end_idx in vlm_windows:
+            for line_idx in range(start_idx + 1, end_idx):
+                line = log_lines[line_idx]
+                if non_vlm_work_re.search(line):
+                    violations.append(
+                        f"  VLM [{req_id}] lines {start_idx+1}-{end_idx+1}:\n"
+                        f"    !! line {line_idx+1}: {line.strip()}"
+                    )
+
+        # ── Report ───────────────────────────────────────────────────
+        # Append to the test report file
+        report_dir = REPORT_DIR
+        report_files = sorted(report_dir.glob("exclusive_stress_*.txt"))
+        if report_files:
+            report_path = report_files[-1]
+            with open(report_path, "a") as f:
+                f.write("\n" + "=" * 80 + "\n")
+                f.write("EXCLUSIVE ISOLATION CHECK\n")
+                f.write("=" * 80 + "\n")
+                f.write(f"VLM in-flight windows found: {len(vlm_windows)}\n")
+                f.write(f"Violations: {len(violations)}\n")
+                if violations:
+                    f.write("\nDETAILS:\n")
+                    for v in violations:
+                        f.write(v + "\n")
+                else:
+                    f.write("\nNo exclusivity violations found.\n")
+
+        if violations:
+            summary = "\n".join(violations[:20])
+            extra = (
+                f"\n  ... and {len(violations) - 20} more"
+                if len(violations) > 20 else ""
+            )
+            pytest.fail(
+                f"{len(violations)} exclusivity violation(s) found — "
+                f"non-VLM engine work occurred during VLM inference:\n"
+                f"{summary}{extra}\n"
+                f"Full report: {report_files[-1] if report_files else 'N/A'}"
+            )

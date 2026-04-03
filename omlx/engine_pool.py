@@ -581,6 +581,11 @@ class EnginePool:
                     # Exclusive pinned models: clear non-pinned models before
                     # returning the engine so inference has maximum headroom.
                     if entry.is_pinned and entry.exclusive:
+                        logger.info(
+                            f"get_engine({model_id}) exclusive fast path: "
+                            f"active_uses={entry.active_uses}, "
+                            f"exclusive_idle={'set' if entry.exclusive_idle is not None and entry.exclusive_idle.is_set() else 'unset' if entry.exclusive_idle is not None else 'None'}"
+                        )
                         # Step 10: check if exclusive hold has expired
                         if (
                             entry.exclusive_max_hold > 0
@@ -605,6 +610,10 @@ class EnginePool:
                             # Break out of the lock block to enter the wait path.
                         else:
                             # All clear — recalculate vision limits if VLM
+                            logger.info(
+                                f"get_engine({model_id}) exclusive all clear, "
+                                f"returning engine (active_uses={entry.active_uses})"
+                            )
                             self._refresh_vision_limits(entry)
                             return entry.engine
                     else:
@@ -731,16 +740,19 @@ class EnginePool:
                         # drain_complete or unload_complete from
                         # _clear_for_exclusive or _prepare_memory_for
                         wait_target = "drain_or_unload"
-                if __debug__:
-                    logger.debug(
-                        f"get_engine({model_id}) waiting on {wait_target}, "
-                        f"iteration={iterations}, "
-                        f"elapsed={time.monotonic() - start_time:.1f}s"
-                    )
+                logger.info(
+                    f"get_engine({model_id}) waiting on {wait_target}, "
+                    f"iteration={iterations}, "
+                    f"elapsed={time.monotonic() - start_time:.1f}s"
+                )
 
                 try:
                     await asyncio.wait_for(
                         event.wait(), timeout=self._max_wait_timeout
+                    )
+                    logger.info(
+                        f"get_engine({model_id}) woke from {wait_target}, "
+                        f"re-entering loop (iteration={iterations})"
                     )
                 except asyncio.TimeoutError:
                     elapsed = time.monotonic() - start_time
@@ -841,7 +853,15 @@ class EnginePool:
                 # Entering exclusive hold — create fresh event for waiters
                 entry.exclusive_idle = asyncio.Event()
                 entry._exclusive_hold_start = time.time()
+                logger.info(
+                    f"acquire_engine({model_id}) exclusive 0→1, "
+                    f"created exclusive_idle event"
+                )
             entry.active_uses += 1
+            if entry.exclusive:
+                logger.info(
+                    f"acquire_engine({model_id}) active_uses={entry.active_uses}"
+                )
 
     def release_engine(self, model_id: str) -> None:
         """Decrement active_uses for model_id.
@@ -851,6 +871,10 @@ class EnginePool:
         entry = self._entries.get(model_id)
         if entry is not None and entry.active_uses > 0:
             entry.active_uses -= 1
+            if entry.exclusive:
+                logger.info(
+                    f"release_engine({model_id}) active_uses={entry.active_uses}"
+                )
             if entry.exclusive and entry.active_uses == 0:
                 entry._exclusive_hold_start = 0.0
                 # CRITICAL: Capture the event reference NOW, not later.
@@ -918,7 +942,7 @@ class EnginePool:
 
             # Loaded non-pinned model — must go
             has_work = (
-                self._engine_has_active_work(e.engine) or e.active_uses > 0
+                e.engine.has_active_requests() or e.active_uses > 0
             )
             if has_work:
                 # Active requests → drain gracefully
@@ -1030,18 +1054,27 @@ class EnginePool:
         # the exclusive model to finish instead.
         if not entry.is_pinned:
             for mid, e in self._entries.items():
-                if (
-                    e.exclusive
-                    and e.is_pinned
-                    and e.active_uses > 0
-                    and e.exclusive_idle is not None
-                ):
+                if e.exclusive and e.is_pinned:
                     logger.info(
-                        f"Deferring load of '{entry.model_id}': "
-                        f"exclusive model '{mid}' has "
-                        f"{e.active_uses} active request(s)"
+                        f"_prepare_memory_for('{entry.model_id}') "
+                        f"checking exclusive '{mid}': "
+                        f"active_uses={e.active_uses}, "
+                        f"exclusive_idle={'set' if e.exclusive_idle is not None and e.exclusive_idle.is_set() else 'unset' if e.exclusive_idle is not None else 'None'}"
                     )
-                    return e.exclusive_idle
+                    if e.active_uses > 0 and e.exclusive_idle is not None:
+                        logger.info(
+                            f"Deferring load of '{entry.model_id}': "
+                            f"exclusive model '{mid}' has "
+                            f"{e.active_uses} active request(s)"
+                        )
+                        return e.exclusive_idle
+                    # Log WHY we didn't defer
+                    if e.active_uses == 0:
+                        logger.info(
+                            f"_prepare_memory_for('{entry.model_id}') "
+                            f"NOT deferring: exclusive '{mid}' has "
+                            f"active_uses=0 (no active requests)"
+                        )
 
         # Don't load while another model is still cleaning up Metal resources.
         # UNLOADING means engine.stop() + mx.synchronize() + mx.clear_cache()
@@ -1121,7 +1154,7 @@ class EnginePool:
             victim = self._entries[victim_id]
             victim_busy = (
                 victim.engine is not None
-                and (self._engine_has_active_work(victim.engine)
+                and (victim.engine.has_active_requests()
                      or victim.active_uses > 0)
             )
             if victim_busy:
@@ -1170,7 +1203,7 @@ class EnginePool:
                 victim = self._entries[victim_id]
                 victim_busy = (
                     victim.engine is not None
-                    and (self._engine_has_active_work(victim.engine)
+                    and (victim.engine.has_active_requests()
                          or victim.active_uses > 0)
                 )
                 if victim_busy:
@@ -1228,18 +1261,20 @@ class EnginePool:
             # Wait for it rather than loading into contested memory or
             # rejecting with an immediate 507.
             for mid, e in self._entries.items():
-                if (
-                    e.exclusive
-                    and e.is_pinned
-                    and e.active_uses > 0
-                    and e.exclusive_idle is not None
-                ):
+                if e.exclusive and e.is_pinned:
                     logger.info(
-                        f"Waiting for exclusive model '{mid}' to finish "
-                        f"({e.active_uses} active request(s)) before loading "
-                        f"'{entry.model_id}'"
+                        f"_check_process_memory('{entry.model_id}') "
+                        f"checking exclusive '{mid}': "
+                        f"active_uses={e.active_uses}, "
+                        f"exclusive_idle={'set' if e.exclusive_idle is not None and e.exclusive_idle.is_set() else 'unset' if e.exclusive_idle is not None else 'None'}"
                     )
-                    return e.exclusive_idle
+                    if e.active_uses > 0 and e.exclusive_idle is not None:
+                        logger.info(
+                            f"Waiting for exclusive model '{mid}' to finish "
+                            f"({e.active_uses} active request(s)) before loading "
+                            f"'{entry.model_id}'"
+                        )
+                        return e.exclusive_idle
 
             # Projected memory still too high. Check if committed model
             # weights alone fit and the overshoot is modest (within 25%
@@ -1297,7 +1332,7 @@ class EnginePool:
         TOCTOU races (e.g., has_active_work returns False, but a stale
         reference is used after unload).
 
-        Checks both _engine_has_active_work (in-flight GPU requests in the
+        Checks both has_active_requests() (in-flight GPU requests in the
         scheduler) AND active_uses > 0 (request handlers that have acquired
         the engine via acquire_engine but may not have started GPU work yet).
         If the drain timeout is reached but active_uses > 0, the drain is
@@ -1319,7 +1354,7 @@ class EnginePool:
 
                     has_work = (
                         entry.engine is not None
-                        and (self._engine_has_active_work(entry.engine)
+                        and (entry.engine.has_active_requests()
                              or entry.active_uses > 0)
                     )
                     if not has_work:
@@ -1395,31 +1430,6 @@ class EnginePool:
     # Active work detection
     # -------------------------------------------------------------------------
 
-    @staticmethod
-    def _engine_has_active_work(engine: Any) -> bool:
-        """Check if an engine has in-flight requests or operations.
-
-        Works for all engine types:
-        - BatchedEngine / VLMBatchedEngine: checks _output_collectors
-        - STTEngine / TTSEngine: checks active_operations counter
-        """
-        # BatchedEngine / VLMBatchedEngine: check output collectors
-        engine_core = getattr(engine, "_engine", None)
-        if engine_core is not None:
-            inner = getattr(engine_core, "engine", None)
-            if inner is not None:
-                if len(getattr(inner, "_output_collectors", {})) > 0:
-                    return True
-                # Check if a scheduler step is in flight on the GPU.
-                # Prevents drain from unloading while Metal is computing.
-                if getattr(inner, "_step_in_flight", False):
-                    return True
-        # Audio engines: check active_operations counter
-        active_ops = getattr(engine, "active_operations", 0)
-        if isinstance(active_ops, int) and active_ops > 0:
-            return True
-        return False
-
     # -------------------------------------------------------------------------
     # Victim selection
     # -------------------------------------------------------------------------
@@ -1447,7 +1457,7 @@ class EnginePool:
             if e.state == EngineState.UNLOADING:
                 continue  # Metal cleanup in progress
             has_active = (
-                self._engine_has_active_work(e.engine) or e.active_uses > 0
+                e.engine.has_active_requests() or e.active_uses > 0
             )
             candidates.append((has_active, e.last_access, mid))
         if not candidates:
@@ -1604,6 +1614,11 @@ class EnginePool:
             engine = EmbeddingEngine(model_name=entry.model_path)
         elif effective_type == "reranker":
             engine = RerankerEngine(model_name=entry.model_path)
+        elif effective_type == "llm_reranker":
+            engine = LLMRerankerEngine(
+                model_name=entry.model_path,
+                scheduler_config=self._scheduler_config,
+            )
         elif effective_type == "vlm":
             enforcer = self._process_memory_enforcer
             engine = VLMBatchedEngine(
@@ -1632,86 +1647,40 @@ class EnginePool:
             )
 
         try:
-            effective_type = entry.engine_type
-            if force_lm and effective_type == "vlm":
-                effective_type = "batched"
-                logger.info(f"Loading model as LM (force_lm=True): {model_id}")
-            else:
-                logger.info(f"Loading model: {model_id}")
-
-            # Retrieve per-model settings for post-load transforms
-            model_settings = None
-            if self._settings_manager is not None:
-                model_settings = self._settings_manager.get_settings(model_id)
-
-            # Create engine based on engine type
-            if effective_type == "embedding":
-                engine = EmbeddingEngine(model_name=entry.model_path)
-            elif effective_type == "reranker":
-                engine = RerankerEngine(model_name=entry.model_path)
-            elif effective_type == "llm_reranker":
-                engine = LLMRerankerEngine(
-                    model_name=entry.model_path,
-                    scheduler_config=self._scheduler_config,
+            await engine.start()
+        except Exception as start_error:
+            if force_lm and entry.engine_type == "vlm":
+                # force_lm created a BatchedEngine but mlx-lm can't
+                # load this VLM model — fall back to VLMBatchedEngine.
+                logger.warning(
+                    f"LM loading failed for VLM model {model_id} "
+                    f"(force_lm=True), falling back to VLM engine: "
+                    f"{start_error}"
                 )
-            elif effective_type == "vlm":
+                try:
+                    await engine.stop()
+                except Exception:
+                    pass
+                gc.collect()
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    get_mlx_executor(),
+                    lambda: (mx.synchronize(), mx.clear_cache()),
+                )
+
                 engine = VLMBatchedEngine(
                     model_name=entry.model_path,
                     scheduler_config=self._scheduler_config,
                     model_settings=model_settings,
                 )
-            elif entry.engine_type == "audio_stt":
-                engine = STTEngine(model_name=entry.model_path)
-            elif entry.engine_type == "audio_tts":
-                engine = TTSEngine(model_name=entry.model_path)
-            elif entry.engine_type == "audio_sts":
-                engine = STSEngine(
-                    model_name=entry.model_path,
-                    config_model_type=entry.config_model_type,
-                )
-            else:
-                # BatchedEngine with continuous batching (default)
-                engine = BatchedEngine(
-                    model_name=entry.model_path,
-                    scheduler_config=self._scheduler_config,
-                    model_settings=model_settings,
-                )
-
-            try:
                 await engine.start()
-            except Exception as start_error:
-                if force_lm and entry.engine_type == "vlm":
-                    # force_lm created a BatchedEngine but mlx-lm can't
-                    # load this VLM model — fall back to VLMBatchedEngine.
-                    logger.warning(
-                        f"LM loading failed for VLM model {model_id} "
-                        f"(force_lm=True), falling back to VLM engine: "
-                        f"{start_error}"
-                    )
-                    try:
-                        await engine.stop()
-                    except Exception:
-                        pass
-                    gc.collect()
-                    loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(
-                        get_mlx_executor(),
-                        lambda: (mx.synchronize(), mx.clear_cache()),
-                    )
 
-                    engine = VLMBatchedEngine(
-                        model_name=entry.model_path,
-                        scheduler_config=self._scheduler_config,
-                        model_settings=model_settings,
-                    )
-                    await engine.start()
-
-                    logger.info(
-                        f"Successfully loaded {model_id} as VLM "
-                        f"(fallback from force_lm)"
-                    )
-                elif entry.engine_type == "vlm":
-                    # VLM loading failed — fall back to LLM (BatchedEngine)
+                logger.info(
+                    f"Successfully loaded {model_id} as VLM "
+                    f"(fallback from force_lm)"
+                )
+            elif entry.engine_type == "vlm":
+                # VLM loading failed — fall back to LLM (BatchedEngine)
                 logger.warning(
                     f"VLM loading failed for {model_id}, "
                     f"falling back to LLM: {start_error}"
@@ -1925,7 +1894,7 @@ class EnginePool:
                 info["drain_elapsed_s"] = round(now - e.drain_started, 1)
             if e.state == EngineState.ACTIVE:
                 info["active_requests"] = (
-                    self._engine_has_active_work(e.engine)
+                    e.engine.has_active_requests()
                     if e.engine
                     else False
                 )
@@ -2019,7 +1988,7 @@ class EnginePool:
                     continue
 
                 # Check if model has active requests (works for all engine types)
-                if self._engine_has_active_work(entry.engine):
+                if entry.engine.has_active_requests():
                     # TTL expired + active → start drain instead of refresh
                     logger.info(
                         f"TTL expired for model '{model_id}' with active "

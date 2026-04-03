@@ -1552,7 +1552,7 @@ class BlockAwarePrefixCache(CacheManager):
                     for s in value_states[1:]:
                         cat_vs = _concat_state(cat_vs, s)
                     try:
-                        from mlx_vlm.turboquant import TurboQuantKVCache
+                        from mlx_vlm.turboquant import TurboQuantKVCache, _build_codec
                         from mlx_lm.models.cache import KVCache
                         tq_bits = 4.0
                         tq_seed = 0
@@ -1568,6 +1568,16 @@ class BlockAwarePrefixCache(CacheManager):
                         tq.keys = cat_ks
                         tq.values = cat_vs
                         tq.offset = _state_length(cat_ks)
+                        # Build codecs from quantized state shape —
+                        # _build_codec only needs dim (tensor.shape[-1]).
+                        # ProdState (integer bits) has qjl_signs packed
+                        # 1-bit-per-dim; SplitState wraps sub-states.
+                        ks_inner = cat_ks
+                        while hasattr(ks_inner, 'low'):  # unwrap SplitState
+                            ks_inner = ks_inner.low
+                        dim = ks_inner.qjl_signs.shape[-1] * 32
+                        dummy = mx.zeros((1, 1, 1, dim))
+                        tq._ensure_codecs(dummy, dummy)
                         keys, values = tq.dequantize()
                         cache = KVCache()
                         cache.keys = keys

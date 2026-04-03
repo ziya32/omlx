@@ -283,16 +283,18 @@ class TestTTSModelAliasResolution:
             mock_state.hf_downloader = None
             mock_state.ms_downloader = None
             mock_state.mcp_manager = None
-            mock_state.api_key = None
+            mock_state.api_key = "test-key"
             mock_state.settings_manager = mock_settings_manager
             with TestClient(app, raise_server_exceptions=False) as client:
+                client.headers["Authorization"] = "Bearer test-key"
                 response = client.post(
                     "/v1/audio/speech",
                     json={"model": "qwen3-tts", "input": "Hello"},
                 )
                 assert response.status_code == 200
                 # Verify pool.get_engine was called with the resolved ID
-                mock_pool.get_engine.assert_awaited_once_with(
+                # (called twice: once for validation, once via _use_engine)
+                mock_pool.get_engine.assert_awaited_with(
                     "Qwen3-TTS-12Hz-1.7B-Base-bf16"
                 )
 
@@ -314,9 +316,10 @@ class TestTTSModelAliasResolution:
             mock_state.hf_downloader = None
             mock_state.ms_downloader = None
             mock_state.mcp_manager = None
-            mock_state.api_key = None
+            mock_state.api_key = "test-key"
             mock_state.settings_manager = MagicMock()
             with TestClient(app, raise_server_exceptions=False) as client:
+                client.headers["Authorization"] = "Bearer test-key"
                 response = client.post(
                     "/v1/audio/speech",
                     json={
@@ -325,7 +328,8 @@ class TestTTSModelAliasResolution:
                     },
                 )
                 assert response.status_code == 200
-                mock_pool.get_engine.assert_awaited_once_with(
+                # (called twice: once for validation, once via _use_engine)
+                mock_pool.get_engine.assert_awaited_with(
                     "Qwen3-TTS-12Hz-1.7B-Base-bf16"
                 )
 

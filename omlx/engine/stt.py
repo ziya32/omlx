@@ -52,7 +52,6 @@ class STTEngine(BaseNonStreamingEngine):
         super().__init__()
         self._model_name = model_name
         self._model = None
-        self._active_operations: int = 0
         self._total_operations: int = 0
         self._total_audio_seconds: float = 0.0
         self._total_processing_seconds: float = 0.0
@@ -117,16 +116,18 @@ class STTEngine(BaseNonStreamingEngine):
             raise RuntimeError("Engine not started. Call start() first.")
 
         model = self._model
-        self._active_operations += 1
         start_time = time.perf_counter()
 
+        with self._active_lock:
+            self._active_count += 1
         try:
             return await self._do_transcribe(model, audio_path, language, prompt, on_progress)
         finally:
             elapsed = time.perf_counter() - start_time
-            self._active_operations -= 1
             self._total_operations += 1
             self._total_processing_seconds += elapsed
+            with self._active_lock:
+                self._active_count -= 1
 
     async def _do_transcribe(
         self,
@@ -322,24 +323,13 @@ class STTEngine(BaseNonStreamingEngine):
                 segments=segments,
             )
 
-        with self._active_lock:
-            self._active_count += 1
-        try:
-            loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(
-                get_mlx_executor(), _transcribe_sync
-            )
-
-            elapsed = time.monotonic() - t0
-            text_len = len(result.get("text", ""))
-            logger.info(
-                "STT transcribe done: model=%s, %.2fs, %d chars output",
-                self._model_name, elapsed, text_len,
-            )
-            return result
-        finally:
-            with self._active_lock:
-                self._active_count -= 1
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            get_mlx_executor(), _transcribe_sync
+        )
+        if result.duration:
+            self._total_audio_seconds += result.duration
+        return result
 
     def get_languages(self) -> list[str]:
         """List supported languages for this STT model."""
@@ -360,15 +350,11 @@ class STTEngine(BaseNonStreamingEngine):
             pass
         return []
 
-    @property
-    def active_operations(self) -> int:
-        return self._active_operations
-
     def get_stats(self) -> Dict[str, Any]:
         return {
             "model_name": self._model_name,
             "loaded": self._model is not None,
-            "active_operations": self._active_operations,
+            "active_operations": self._active_count,
             "total_operations": self._total_operations,
             "total_audio_seconds": round(self._total_audio_seconds, 2),
             "total_processing_seconds": round(self._total_processing_seconds, 2),

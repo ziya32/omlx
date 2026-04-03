@@ -37,7 +37,8 @@ class MockSTTEngine(STTEngine):
         self._model_name = model_name
         self._model = True  # Mark as "loaded"
         self._processor = True
-        self._active_operations = 0
+        self._active_count = 0
+        self._active_lock = __import__('threading').Lock()
         self._total_operations = 0
         self._total_audio_seconds = 0.0
         self._total_processing_seconds = 0.0
@@ -70,7 +71,8 @@ class MockTTSEngine(TTSEngine):
         self._model_name = model_name
         self._model = True  # Mark as "loaded"
         self._variant = "custom_voice"
-        self._active_operations = 0
+        self._active_count = 0
+        self._active_lock = __import__('threading').Lock()
         self._total_operations = 0
         self._total_audio_seconds = 0.0
         self._total_processing_seconds = 0.0

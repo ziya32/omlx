@@ -160,7 +160,6 @@ class TTSEngine(BaseNonStreamingEngine):
         self._model = None
         self._kwargs = kwargs
         self._variant: str = "custom_voice"  # "custom_voice" | "voice_design" | "base"
-        self._active_operations: int = 0
         self._total_operations: int = 0
         self._total_audio_seconds: float = 0.0
         self._total_processing_seconds: float = 0.0
@@ -169,10 +168,6 @@ class TTSEngine(BaseNonStreamingEngine):
     def model_name(self) -> str:
         """Get the model name."""
         return self._model_name
-
-    @property
-    def active_operations(self) -> int:
-        return self._active_operations
 
     def _detect_variant(self, model_path: str) -> str:
         """Detect TTS variant from config.json tts_model_type field."""
@@ -342,9 +337,10 @@ class TTSEngine(BaseNonStreamingEngine):
         )
         loop = asyncio.get_running_loop()
         executor = get_mlx_executor()
-        self._active_operations += 1
         start_time = time.perf_counter()
 
+        with self._active_lock:
+            self._active_count += 1
         try:
             # Step 1: Create generator on executor (quick)
             def _create_gen():
@@ -400,18 +396,15 @@ class TTSEngine(BaseNonStreamingEngine):
                     duration=duration,
                 )
 
-        with self._active_lock:
-            self._active_count += 1
-        try:
-            loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(
-                get_mlx_executor(), _synthesize_sync
-            )
+            result = await loop.run_in_executor(executor, _finalize, segments)
+            self._total_audio_seconds += result.duration
+            self._total_operations += 1
+            self._total_processing_seconds += time.perf_counter() - start_time
 
-            elapsed = time.monotonic() - t0
+            elapsed = time.perf_counter() - start_time
             logger.info(
                 "TTS synthesize done: model=%s, %.2fs, %d bytes output",
-                self._model_name, elapsed, len(result),
+                self._model_name, elapsed, len(result.audio_bytes),
             )
             return result
         finally:
@@ -516,7 +509,7 @@ class TTSEngine(BaseNonStreamingEngine):
             "model_name": self._model_name,
             "loaded": self._model is not None,
             "variant": self._variant,
-            "active_operations": self._active_operations,
+            "active_operations": self._active_count,
             "total_operations": self._total_operations,
             "total_audio_seconds": round(self._total_audio_seconds, 2),
             "total_processing_seconds": round(self._total_processing_seconds, 2),

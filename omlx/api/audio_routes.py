@@ -349,13 +349,22 @@ async def create_transcription(
     from omlx.engine.stt import STTEngine
     from omlx.exceptions import AudioError, InvalidAudioFormatError
 
-    pool = _get_engine_pool()
-    model = _resolve_model(model)
+    req_id = str(uuid.uuid4())
+    form = await http_request.form()
+    audio_file = form.get("file")
+    model = form.get("model")
+    language = form.get("language")
+    prompt = form.get("prompt")
+    response_format = str(form.get("response_format", "json"))
+    stream = str(form.get("stream", "false")).lower() == "true"
 
     if audio_file is None:
         raise HTTPException(status_code=400, detail="Audio file is required")
     if model is None:
         raise HTTPException(status_code=400, detail="Model is required")
+
+    pool = _get_engine_pool()
+    model = _resolve_model(str(model))
 
     model_str = str(model)
 
@@ -454,9 +463,16 @@ async def create_speech(
         _FORMAT_EXTENSIONS,
         _convert_wav,
     )
-    from omlx.exceptions import AudioError, VoiceCloningError
+    from omlx.exceptions import AudioError, ModelNotFoundError, VoiceCloningError
 
     req_id = str(uuid.uuid4())
+
+    fmt = request.response_format
+    if fmt not in _SUPPORTED_FORMATS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported format: {fmt}. Supported: {', '.join(sorted(_SUPPORTED_FORMATS))}",
+        )
 
     # Validate input is non-empty
     if not request.input:

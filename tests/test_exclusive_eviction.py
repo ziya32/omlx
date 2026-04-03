@@ -51,13 +51,8 @@ def _make_mock_engine(*, has_active_work: bool = False):
     engine = MagicMock()
     engine.start = AsyncMock()
     engine.stop = AsyncMock()
-    # _engine_has_active_work checks _engine._engine.engine._output_collectors
-    inner = MagicMock()
-    inner._output_collectors = {"fake": True} if has_active_work else {}
-    inner._step_in_flight = False
-    core = MagicMock()
-    core.engine = inner
-    engine._engine = core
+    # Wire has_active_requests() to return the expected value
+    engine.has_active_requests = MagicMock(return_value=has_active_work)
     return engine
 
 

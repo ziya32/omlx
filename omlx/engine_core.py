@@ -123,8 +123,8 @@ class EngineCore:
         self._steps_executed = 0
 
         # True while scheduler.step() is running on the MLX executor thread.
-        # Checked by EnginePool._engine_has_active_work() to prevent the
-        # drain monitor from unloading the model while GPU work is in flight.
+        # Checked by has_active_requests() to prevent the drain monitor
+        # from unloading the model while GPU work is in flight.
         self._step_in_flight = False
 
         # Deferred cleanup: request IDs whose _cleanup_request() is deferred
@@ -400,7 +400,7 @@ class EngineCore:
             event.set()
 
         # Defer cleanup to the engine loop — keeps _output_collectors
-        # non-empty so _engine_has_active_work() returns True until the
+        # non-empty so has_active_requests() returns True until the
         # in-flight step finishes.
         self._pending_cleanups.add(request_id)
 

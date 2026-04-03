@@ -491,6 +491,7 @@ class TestEnginePoolLRU:
 
         # Simulate loaded state
         pool_with_entries._entries["model-a"].engine = MagicMock()
+        pool_with_entries._entries["model-a"].engine.has_active_requests = MagicMock(return_value=False)
         pool_with_entries._entries["model-a"].last_access = 100
 
         victim = pool_with_entries._find_drain_or_evict_candidate()
@@ -500,9 +501,11 @@ class TestEnginePoolLRU:
         """Test that oldest (lowest last_access) is selected."""
         # Simulate loaded state with different access times
         pool_with_entries._entries["model-a"].engine = MagicMock()
+        pool_with_entries._entries["model-a"].engine.has_active_requests = MagicMock(return_value=False)
         pool_with_entries._entries["model-a"].last_access = 100  # Older
 
         pool_with_entries._entries["model-b"].engine = MagicMock()
+        pool_with_entries._entries["model-b"].engine.has_active_requests = MagicMock(return_value=False)
         pool_with_entries._entries["model-b"].last_access = 200  # Newer
 
         victim = pool_with_entries._find_drain_or_evict_candidate()
@@ -513,10 +516,12 @@ class TestEnginePoolLRU:
         # model-a is pinned and older
         pool_with_entries._entries["model-a"].is_pinned = True
         pool_with_entries._entries["model-a"].engine = MagicMock()
+        pool_with_entries._entries["model-a"].engine.has_active_requests = MagicMock(return_value=False)
         pool_with_entries._entries["model-a"].last_access = 50
 
         # model-b is not pinned and newer
         pool_with_entries._entries["model-b"].engine = MagicMock()
+        pool_with_entries._entries["model-b"].engine.has_active_requests = MagicMock(return_value=False)
         pool_with_entries._entries["model-b"].last_access = 200
 
         victim = pool_with_entries._find_drain_or_evict_candidate()
@@ -810,7 +815,7 @@ class TestEnginePoolTTL:
 
     @pytest.mark.asyncio
     async def test_ttl_skips_vlm_with_active_requests(self, pool_with_loaded_model):
-        """Test that TTL does not unload VLM engine with active requests."""
+        """Test that TTL drains (not force-kills) VLM engine with active requests."""
         pool = pool_with_loaded_model
 
         mock_engine = MagicMock()
@@ -826,14 +831,17 @@ class TestEnginePoolTTL:
         with patch("time.time", return_value=200.0):
             expired = await pool.check_ttl_expirations(settings_manager)
 
-        assert expired == []
-        assert pool._entries["model-a"].last_access == 200.0
+        # Model with active requests gets drained, not force-killed
+        assert "model-a" in expired
+        assert pool._entries["model-a"].state == EngineState.DRAINING
+
+        await pool.shutdown()
 
     @pytest.mark.asyncio
     async def test_ttl_skips_non_streaming_with_active_requests(
         self, pool_with_loaded_model
     ):
-        """Test that TTL does not unload non-streaming engine with active requests."""
+        """Test that TTL drains (not force-kills) non-streaming engine with active requests."""
         pool = pool_with_loaded_model
 
         mock_engine = MagicMock()
@@ -849,8 +857,11 @@ class TestEnginePoolTTL:
         with patch("time.time", return_value=200.0):
             expired = await pool.check_ttl_expirations(settings_manager)
 
-        assert expired == []
-        assert pool._entries["model-a"].last_access == 200.0
+        # Model with active requests gets drained, not force-killed
+        assert "model-a" in expired
+        assert pool._entries["model-a"].state == EngineState.DRAINING
+
+        await pool.shutdown()
 
 
 class TestHasActiveRequests:
@@ -886,7 +897,7 @@ class TestHasActiveRequests:
         assert engine.has_active_requests() is False
 
     def test_batched_engine_has_active_requests(self):
-        """Test BatchedEngine.has_active_requests() via _output_collectors."""
+        """Test BatchedEngine.has_active_requests() via _output_collectors and _step_in_flight."""
         from omlx.engine.batched import BatchedEngine
 
         engine = BatchedEngine.__new__(BatchedEngine)
@@ -897,13 +908,18 @@ class TestHasActiveRequests:
         mock_engine_core = MagicMock()
         mock_inner = MagicMock()
         mock_inner._output_collectors = {"req1": MagicMock()}
+        mock_inner._step_in_flight = False
         mock_engine_core.engine = mock_inner
         engine._engine = mock_engine_core
         assert engine.has_active_requests() is True
 
-        # Empty collectors
+        # Empty collectors, no step in flight
         mock_inner._output_collectors = {}
         assert engine.has_active_requests() is False
+
+        # No collectors but step in flight
+        mock_inner._step_in_flight = True
+        assert engine.has_active_requests() is True
 
     def test_vlm_engine_has_active_requests(self):
         """Test VLMBatchedEngine.has_active_requests() via _output_collectors."""

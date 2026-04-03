@@ -84,32 +84,35 @@ class TestStepInFlightBlocksDrain:
 
     def test_step_in_flight_blocks_drain(self):
         """Set _step_in_flight = True on engine core. Call
-        _engine_has_active_work(). Assert returns True."""
-        # Create a mock engine structure matching BatchedEngine layout
-        inner_engine_core = MagicMock()
-        inner_engine_core._output_collectors = {}  # empty collectors
-        inner_engine_core._step_in_flight = True  # step is in flight
+        has_active_requests(). Assert returns True."""
+        from omlx.engine.batched import BatchedEngine
 
-        engine_wrapper = MagicMock()
-        engine_wrapper._engine = MagicMock()
-        engine_wrapper._engine.engine = inner_engine_core
+        # Create a mock engine with the internal structure
+        engine = MagicMock(spec=BatchedEngine)
+        inner_core = MagicMock()
+        inner_core._output_collectors = {}  # empty collectors
+        inner_core._step_in_flight = True  # step is in flight
+        engine._engine = MagicMock()
+        engine._engine.engine = inner_core
+        # Use the real has_active_requests method
+        engine.has_active_requests = BatchedEngine.has_active_requests.__get__(engine)
 
-        assert EnginePool._engine_has_active_work(engine_wrapper) is True
+        assert engine.has_active_requests() is True
 
     def test_no_step_in_flight_allows_drain(self):
         """With _step_in_flight = False and no collectors, engine has no
         active work."""
-        inner_engine_core = MagicMock()
-        inner_engine_core._output_collectors = {}
-        inner_engine_core._step_in_flight = False
+        from omlx.engine.batched import BatchedEngine
 
-        engine_wrapper = MagicMock()
-        engine_wrapper._engine = MagicMock()
-        engine_wrapper._engine.engine = inner_engine_core
-        # Ensure active_operations doesn't interfere
-        engine_wrapper.active_operations = 0
+        engine = MagicMock(spec=BatchedEngine)
+        inner_core = MagicMock()
+        inner_core._output_collectors = {}
+        inner_core._step_in_flight = False
+        engine._engine = MagicMock()
+        engine._engine.engine = inner_core
+        engine.has_active_requests = BatchedEngine.has_active_requests.__get__(engine)
 
-        assert EnginePool._engine_has_active_work(engine_wrapper) is False
+        assert engine.has_active_requests() is False
 
     @pytest.mark.asyncio
     async def test_drain_waits_for_step_in_flight(self):
@@ -126,7 +129,9 @@ class TestStepInFlightBlocksDrain:
         mock_engine = MagicMock()
         mock_engine._engine = MagicMock()
         mock_engine._engine.engine = inner_core
-        mock_engine.active_operations = 0
+        # Wire has_active_requests to check _step_in_flight and _output_collectors
+        from omlx.engine.batched import BatchedEngine
+        mock_engine.has_active_requests = BatchedEngine.has_active_requests.__get__(mock_engine)
         mock_engine.stop = AsyncMock()
 
         entry = EngineEntry(
@@ -161,11 +166,11 @@ class TestStepInFlightBlocksDrain:
         pool._unload_engine = mock_unload
 
         # _step_in_flight is True, so drain should NOT unload
-        assert EnginePool._engine_has_active_work(mock_engine) is True
+        assert mock_engine.has_active_requests() is True
 
         # Now set step_in_flight to False
         inner_core._step_in_flight = False
-        assert EnginePool._engine_has_active_work(mock_engine) is False
+        assert mock_engine.has_active_requests() is False
 
 
 # ---------------------------------------------------------------------------

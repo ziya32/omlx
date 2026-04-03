@@ -1846,8 +1846,10 @@ class VLMBatchedEngine(BaseEngine):
         if engine_core is not None:
             inner = getattr(engine_core, "engine", None)
             if inner is not None:
-                collectors = getattr(inner, "_output_collectors", {})
-                return len(collectors) > 0
+                if len(getattr(inner, "_output_collectors", {})) > 0:
+                    return True
+                if getattr(inner, "_step_in_flight", False):
+                    return True
         return False
 
     def get_stats(self) -> dict[str, Any]:

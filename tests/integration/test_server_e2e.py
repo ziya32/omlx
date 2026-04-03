@@ -420,6 +420,7 @@ class TestTTSEndpoint:
         resp = await client.post("/v1/audio/speech", json={
             "model": model_ids["tts"],
             "input": "Hello, this is a test.",
+            "voice": "vivian",
         })
         assert resp.status_code == 200
         assert resp.headers["content-type"] == "audio/wav"
@@ -462,6 +463,7 @@ class TestTTSASRRoundTripHTTP:
         tts_resp = await client.post("/v1/audio/speech", json={
             "model": model_ids["tts"],
             "input": source_text,
+            "voice": "vivian",
         })
         assert tts_resp.status_code == 200
         wav_bytes = tts_resp.content

@@ -741,8 +741,13 @@ class BatchedEngine(BaseEngine):
         if engine_core is not None:
             inner = getattr(engine_core, "engine", None)
             if inner is not None:
-                collectors = getattr(inner, "_output_collectors", {})
-                return len(collectors) > 0
+                if len(getattr(inner, "_output_collectors", {})) > 0:
+                    return True
+                # A scheduler step may be in flight on the MLX executor
+                # even though _output_collectors is empty (narrow window
+                # between final step completion and collector cleanup).
+                if getattr(inner, "_step_in_flight", False):
+                    return True
         return False
 
     def get_stats(self) -> dict[str, Any]:

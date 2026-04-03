@@ -193,6 +193,7 @@ class TestAudioLRUEviction:
     def _set_loaded(self, entry, last_access):
         """Helper: mark entry as loaded with given last_access."""
         entry.engine = MagicMock(spec=[])  # spec=[] prevents attribute auto-creation
+        entry.engine.has_active_requests = MagicMock(return_value=False)
         entry.last_access = last_access
         entry.state = EngineState.ACTIVE
 
@@ -252,10 +253,12 @@ class TestAudioPinning:
         pool.discover_models(str(audio_model_dir), pinned_models=["whisper-tiny"])
 
         pool._entries["whisper-tiny"].engine = MagicMock(spec=[])
+        pool._entries["whisper-tiny"].engine.has_active_requests = MagicMock(return_value=False)
         pool._entries["whisper-tiny"].last_access = 1.0  # Oldest
         pool._entries["whisper-tiny"].state = EngineState.ACTIVE
 
         pool._entries["llama-3b"].engine = MagicMock(spec=[])
+        pool._entries["llama-3b"].engine.has_active_requests = MagicMock(return_value=False)
         pool._entries["llama-3b"].last_access = 99.0
         pool._entries["llama-3b"].state = EngineState.ACTIVE
 

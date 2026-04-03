@@ -34,14 +34,13 @@ from omlx.exceptions import (
 class MockEngine:
     """Lightweight engine mock with controllable active-work simulation.
 
-    Compatible with EnginePool._engine_has_active_work() via the
-    ``active_operations`` counter (the Audio-engine path).
+    Compatible with EnginePool via has_active_requests().
     """
 
     def __init__(self, model_id: str, load_delay: float = 0):
         self.model_id = model_id
         self._load_delay = load_delay
-        self.active_operations = 0  # Checked by _engine_has_active_work
+        self._active_count = 0
         self._loaded = False
         self._model_name = model_id
         self._stop_called = asyncio.Event()
@@ -56,6 +55,9 @@ class MockEngine:
     def tokenizer(self):
         return None
 
+    def has_active_requests(self) -> bool:
+        return self._active_count > 0
+
     async def start(self):
         if self._load_delay > 0:
             await asyncio.sleep(self._load_delay)
@@ -69,12 +71,12 @@ class MockEngine:
 
     def add_request(self, request_id: str = "req"):
         """Simulate an active in-flight request."""
-        self.active_operations += 1
+        self._active_count += 1
 
     def finish_request(self, request_id: str | None = None):
         """Simulate a request finishing."""
-        if self.active_operations > 0:
-            self.active_operations -= 1
+        if self._active_count > 0:
+            self._active_count -= 1
 
 
 # ---------------------------------------------------------------------------
@@ -588,24 +590,23 @@ class TestDrainBehavior:
         engine_b = await switching_pool.get_engine("model-b")
         engine_b.add_request("req-2")  # Keep busy so model-a is drained
 
-        # Monkey-patch _engine_has_active_work to raise inside drain_monitor.
-        # Use a flag so we only crash AFTER the initial victim selection and
-        # drain start (which need the function to work normally).
+        # Monkey-patch has_active_requests on the drained engine to raise
+        # inside drain_monitor. Use a flag so we only crash AFTER the
+        # initial victim selection and drain start.
         drain_started_flag = asyncio.Event()
-        original_check = switching_pool._engine_has_active_work
+        original_check = engine_a.has_active_requests
 
-        @staticmethod
-        def crashing_check(engine):
+        def crashing_check():
             if drain_started_flag.is_set():
                 raise RuntimeError("simulated crash in drain monitor")
-            return original_check(engine)
+            return original_check()
 
         # Let the normal flow start the drain, then patch + set the flag
         task_c = asyncio.create_task(switching_pool.get_engine("model-c"))
         await asyncio.sleep(0.2)  # Let drain start
 
         # Now patch and set the flag so drain_monitor crashes on next poll
-        switching_pool._engine_has_active_work = crashing_check
+        engine_a.has_active_requests = crashing_check
         drain_started_flag.set()
 
         # Give drain monitor time to crash and recover.

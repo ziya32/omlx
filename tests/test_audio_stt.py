@@ -349,9 +349,10 @@ class TestSTTModelAliasResolution:
             mock_state.hf_downloader = None
             mock_state.ms_downloader = None
             mock_state.mcp_manager = None
-            mock_state.api_key = None
+            mock_state.api_key = "test-key"
             mock_state.settings_manager = MagicMock()
             with TestClient(app, raise_server_exceptions=False) as client:
+                client.headers["Authorization"] = "Bearer test-key"
                 response = client.post(
                     "/v1/audio/transcriptions",
                     data={"model": "whisper"},
@@ -381,9 +382,10 @@ class TestSTTModelAliasResolution:
             mock_state.hf_downloader = None
             mock_state.ms_downloader = None
             mock_state.mcp_manager = None
-            mock_state.api_key = None
+            mock_state.api_key = "test-key"
             mock_state.settings_manager = MagicMock()
             with TestClient(app, raise_server_exceptions=False) as client:
+                client.headers["Authorization"] = "Bearer test-key"
                 response = client.post(
                     "/v1/audio/transcriptions",
                     data={"model": "Qwen3-ASR-1.7B-bf16"},
