@@ -9,10 +9,13 @@ Results survive browser close and persist until explicitly reset.
 """
 
 import asyncio
+import json
 import logging
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 from pydantic import BaseModel, field_validator
@@ -22,8 +25,11 @@ logger = logging.getLogger(__name__)
 # Module-level storage for active benchmark runs
 _accuracy_runs: dict[str, "AccuracyBenchmarkRun"] = {}
 
-# Accumulated results — persists until explicit reset
+# Accumulated results — persists until explicit reset.
+# Disk-backed: loaded from {base_path}/benchmark.json lazily on first
+# access, written atomically after each new result.
 _accumulated_results: list[dict] = []
+_results_loaded: bool = False
 
 # Server-side queue
 _queue: list["AccuracyBenchmarkRequest"] = []
@@ -108,17 +114,104 @@ def cleanup_old_runs() -> None:
         del _accuracy_runs[bid]
 
 
-# --- Accumulated results ---
+# --- Accumulated results (disk-backed) ---
+
+
+def _get_results_file() -> Optional[Path]:
+    """Return {base_path}/benchmark.json, or None if settings unavailable."""
+    try:
+        from ..settings import get_settings
+        return get_settings().base_path / "benchmark.json"
+    except Exception as e:
+        logger.debug(f"Benchmark results: settings not ready yet ({e})")
+        return None
+
+
+def _load_results_from_disk() -> None:
+    """Load results from {base_path}/benchmark.json into _accumulated_results.
+
+    The on-disk structure is grouped by model -> benchmark -> timestamp. This
+    flattens it into the list format that API consumers expect. Missing file
+    or parse errors are treated as an empty result set.
+    """
+    global _results_loaded
+    _results_loaded = True
+    path = _get_results_file()
+    if path is None or not path.exists():
+        return
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            grouped = json.load(f)
+    except Exception as e:
+        logger.warning(f"Failed to load benchmark results from {path}: {e}")
+        return
+
+    flat: list[dict] = []
+    if isinstance(grouped, dict):
+        for model_id, benches in grouped.items():
+            if not isinstance(benches, dict):
+                continue
+            for bench_name, runs in benches.items():
+                if not isinstance(runs, dict):
+                    continue
+                for ts in sorted(runs.keys()):
+                    entry = runs[ts]
+                    if isinstance(entry, dict):
+                        flat.append(entry)
+    _accumulated_results.clear()
+    _accumulated_results.extend(flat)
+    logger.info(f"Loaded {len(flat)} benchmark result(s) from {path}")
+
+
+def _save_results_to_disk() -> None:
+    """Persist _accumulated_results to {base_path}/benchmark.json.
+
+    Writes atomically via a temp file + rename to avoid partial writes.
+    The on-disk structure groups results by model -> benchmark -> timestamp
+    so multiple runs of the same (model, benchmark) are preserved distinctly.
+    """
+    path = _get_results_file()
+    if path is None:
+        return
+
+    grouped: dict[str, dict[str, dict[str, dict]]] = {}
+    for entry in _accumulated_results:
+        model_id = entry.get("model_id", "unknown")
+        bench = entry.get("benchmark", "unknown")
+        ts = entry.get("timestamp") or datetime.now(timezone.utc).isoformat()
+        grouped.setdefault(model_id, {}).setdefault(bench, {})[ts] = entry
+
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(grouped, f, ensure_ascii=False, indent=2)
+        tmp.replace(path)
+    except Exception as e:
+        logger.warning(f"Failed to save benchmark results to {path}: {e}")
+
+
+def _ensure_loaded() -> None:
+    """Load results from disk on first access."""
+    if not _results_loaded:
+        _load_results_from_disk()
 
 
 def get_accumulated_results() -> list[dict]:
     """Get all accumulated benchmark results."""
+    _ensure_loaded()
     return _accumulated_results
 
 
 def reset_accumulated_results() -> None:
-    """Clear all accumulated results."""
+    """Clear all accumulated results (memory and disk)."""
     _accumulated_results.clear()
+    path = _get_results_file()
+    if path is not None and path.exists():
+        try:
+            path.unlink()
+        except Exception as e:
+            logger.warning(f"Failed to delete {path}: {e}")
 
 
 # --- Queue management ---
@@ -425,6 +518,7 @@ async def run_accuracy_benchmark(
             result_data = {
                 "model_id": request.model_id,
                 "benchmark": result.benchmark_name,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
                 "accuracy": round(result.accuracy, 4),
                 "total": result.total_questions,
                 "correct": result.correct_count,
@@ -447,8 +541,10 @@ async def run_accuracy_benchmark(
                     k: round(v, 4) for k, v in result.category_scores.items()
                 }
 
-            # Accumulate persistently
+            # Accumulate persistently (memory + disk)
+            _ensure_loaded()
             _accumulated_results.append(result_data)
+            _save_results_to_disk()
 
             run.results.append(result_data)
             completed += 1
