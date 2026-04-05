@@ -1,7 +1,7 @@
 # Pinned Model Pre-Request Eviction
 
-**Status**: Draft v3
-**Date**: 2026-04-02
+**Status**: Draft v4
+**Date**: 2026-04-04
 
 ## Problem
 
@@ -294,7 +294,7 @@ TTL continues to work for non-exclusive models. For exclusive models, TTL is lar
 
 ### `_prepare_memory_for()`
 
-Unchanged. Still handles memory accounting for model *loading*. Pre-request eviction handles runtime memory for already-loaded models. The two are complementary.
+Gains one additional early gate (Step 9b): non-pinned loads defer while an exclusive model is actively inferring, regardless of memory math. This protects the exclusive model's scheduler throughput from MLX executor contention during weight loading. Remaining memory-accounting logic is unchanged. Pre-request eviction handles runtime memory for already-loaded models; the early gate and Step 9 together handle the reverse direction. The three are complementary.
 
 ### Prefill memory guard
 
@@ -795,6 +795,67 @@ for mid, e in self._entries.items():
         return e.exclusive_idle
 ```
 
+#### Step 9b: Early-gate non-pinned loads in `_prepare_memory_for()`
+
+**File**: `omlx/engine_pool.py`
+
+Step 9 handles the memory-contention case: we wait on `exclusive_idle`
+when a non-pinned load would exceed the process memory limit. But there
+is a second, orthogonal reason to wait — **MLX executor contention**.
+
+The MLX executor is a single-threaded `ThreadPoolExecutor`. Every Metal
+operation — weight loading, scheduler steps, `mx.clear_cache`, vision
+encoding — is serialized onto that one thread. Loading a new model
+takes seconds and occupies the executor for the entire duration. If
+an exclusive VLM is mid-inference when a non-pinned load is admitted,
+the VLM's scheduler steps queue behind the weight-load work and decode
+throughput tanks even when the memory math would pass.
+
+Insert an early gate at the **top** of `_prepare_memory_for()`, before
+any memory checks:
+
+```python
+async def _prepare_memory_for(
+    self, entry: EngineEntry
+) -> asyncio.Event | None:
+    # Don't load non-pinned models while an exclusive model is actively
+    # inferring.  Model loading monopolizes the single MLX executor
+    # thread, starving the exclusive model's scheduler steps.  Wait for
+    # the exclusive model to finish instead.
+    if not entry.is_pinned:
+        for mid, e in self._entries.items():
+            if e.exclusive and e.is_pinned:
+                if e.active_uses > 0 and e.exclusive_idle is not None:
+                    logger.info(
+                        f"Deferring load of '{entry.model_id}': "
+                        f"exclusive model '{mid}' has "
+                        f"{e.active_uses} active request(s)"
+                    )
+                    return e.exclusive_idle
+
+    # ... existing memory checks (UNLOADING wait, LOADING serialization,
+    #     committed-memory check, _check_process_memory, etc.)
+```
+
+**Why this is separate from Step 9:**
+
+| | Step 9 (`_check_process_memory`) | Step 9b (`_prepare_memory_for` gate) |
+|---|---|---|
+| Rationale | Memory contention | MLX executor contention |
+| Fires when | Projected memory > limit | Always, for any non-pinned load |
+| What it protects | Avoid OOM on the load | Avoid starving the VLM scheduler |
+
+The two hooks complement each other. Step 9b catches the common case —
+a small model load arriving during VLM decode where memory would fit
+but executor contention would hurt VLM throughput. Step 9 remains as
+the memory-safety fallback for the tighter case where the load also
+overflows the memory budget.
+
+**Interaction with Layer 2 (bounded wait):** Both hooks return the
+same `exclusive_idle` event, so the waiter is bounded by the same
+`max_wait_timeout` mechanism. Starvation protection from the
+three-layer strategy applies identically to both hooks.
+
 #### Step 10 (optional): Add `exclusive_max_hold` setting
 
 **File**: `omlx/model_settings.py`
@@ -834,7 +895,8 @@ if entry.exclusive_max_hold > 0 and entry._exclusive_hold_start > 0:
 | `omlx/engine_pool.py` | Add `_signal_exclusive_idle()` method |
 | `omlx/engine_pool.py` | Modify `get_engine()` fast path (exclusive eviction + hold expiry) |
 | `omlx/engine_pool.py` | Modify `acquire_engine()` / `release_engine()` (exclusive idle lifecycle) |
-| `omlx/engine_pool.py` | Modify `_check_process_memory()` (wait on exclusive idle) |
+| `omlx/engine_pool.py` | Modify `_check_process_memory()` (wait on exclusive idle — memory-contention hook, Step 9) |
+| `omlx/engine_pool.py` | Early gate in `_prepare_memory_for()` (wait on exclusive idle — MLX executor-contention hook, Step 9b) |
 | `omlx/engine_pool.py` | Wire `exclusive` from settings in `discover_models()` / `apply_settings()` |
 | `tests/` | Unit + integration tests |
 | `tests/integration/test_exclusive_pinned_e2e.py` | E2E: concurrent VLM + embedding + reranker + audio with pinned VLM |
@@ -855,7 +917,8 @@ if entry.exclusive_max_hold > 0 and entry._exclusive_hold_start > 0:
 
 ### Unit tests — non-pinned request waiting (reverse direction)
 
-8. **Wait for exclusive idle**: Pin A (exclusive) with active request. Request B (non-pinned, unloaded). Assert B's `get_engine()` waits on `exclusive_idle`, not immediate 507.
+8. **Wait for exclusive idle (memory hook, Step 9)**: Pin A (exclusive) with active request, projected memory for B would overflow. Request B (non-pinned, unloaded). Assert B's `_check_process_memory()` returns `exclusive_idle`, not immediate 507.
+8b. **Wait for exclusive idle (executor hook, Step 9b)**: Pin A (exclusive) with active request, memory headroom is plenty for B. Request B (non-pinned, unloaded). Assert B's `_prepare_memory_for()` returns `exclusive_idle` at the early gate — before any memory check runs — because loading B would contend with A's scheduler steps on the MLX executor.
 9. **Wake and load**: Pin A (exclusive). Start request on A. Request B (waits). Finish A's request. Assert `exclusive_idle` fires, B loads successfully.
 10. **Metal cache cleared before signal**: Mock `mx.clear_cache`. Assert it is called in `_signal_exclusive_idle` before `exclusive_idle.set()`.
 11. **Re-wait on new VLM request**: Pin A (exclusive). B is waiting on `exclusive_idle`. A finishes (B wakes), but new A request arrives immediately. Assert B waits again on fresh `exclusive_idle` event.

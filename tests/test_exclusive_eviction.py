@@ -214,6 +214,77 @@ class TestExclusiveIdleWait:
 
         assert result is entry_a.exclusive_idle
 
+    async def test_prepare_memory_for_early_gate_fires_with_ample_memory(
+        self, pool_ab
+    ):
+        """Design test #8b: _prepare_memory_for early-gates non-pinned loads
+        when an exclusive model has active requests, REGARDLESS of memory math.
+
+        This tests the MLX-executor-contention hook (Step 9b), distinct from
+        the memory-contention hook at Step 9. The gate must fire even when
+        there is plenty of memory headroom — its purpose is to prevent model
+        loading from starving the exclusive model's scheduler steps on the
+        single MLX executor thread.
+        """
+        pool = pool_ab
+        entry_a = pool.get_entry("model-a")
+        entry_b = pool.get_entry("model-b")
+
+        # entry_a: pinned + exclusive, actively serving a request
+        _activate_entry(entry_a, pinned=True, exclusive=True)
+        entry_a.active_uses = 1
+        entry_a.exclusive_idle = asyncio.Event()
+
+        # entry_b is non-pinned, UNLOADED, about to be loaded.
+        # Deliberately set up ABUNDANT memory so any memory-based wait would
+        # NOT fire — if the early gate returned entry_a.exclusive_idle, that
+        # is proof the executor-contention hook (Step 9b) ran, not Step 9.
+        enforcer = MagicMock()
+        enforcer.max_bytes = 10 * 1024**4  # 10 TiB — effectively unlimited
+        pool._process_memory_enforcer = enforcer
+
+        with patch("omlx.engine_pool.mx") as mock_mx:
+            mock_mx.get_active_memory.return_value = 0  # nothing in use
+
+            async with pool._tracked_lock("test"):
+                result = await pool._prepare_memory_for(entry_b)
+
+        assert result is entry_a.exclusive_idle, (
+            "Step 9b early gate did not fire: non-pinned load was allowed "
+            "to proceed while an exclusive model had active_uses > 0, even "
+            "though doing so would starve the exclusive model's scheduler."
+        )
+
+    async def test_prepare_memory_for_early_gate_skipped_when_exclusive_idle(
+        self, pool_ab
+    ):
+        """Step 9b early gate must NOT fire when the exclusive model is idle.
+
+        Confirms the gate's trigger is specifically active_uses > 0, not mere
+        presence of an exclusive model.
+        """
+        pool = pool_ab
+        entry_a = pool.get_entry("model-a")
+        entry_b = pool.get_entry("model-b")
+
+        # entry_a: pinned + exclusive but with NO active requests
+        _activate_entry(entry_a, pinned=True, exclusive=True)
+        entry_a.active_uses = 0
+        entry_a.exclusive_idle = None  # idle → no event
+
+        enforcer = MagicMock()
+        enforcer.max_bytes = 10 * 1024**4
+        pool._process_memory_enforcer = enforcer
+
+        with patch("omlx.engine_pool.mx") as mock_mx:
+            mock_mx.get_active_memory.return_value = 0
+
+            async with pool._tracked_lock("test"):
+                result = await pool._prepare_memory_for(entry_b)
+
+        # Memory is abundant and no exclusive contention → load may proceed.
+        assert result is None
+
 
 # ---------------------------------------------------------------------------
 # Test 6: Event capture race (THE MOST CRITICAL TEST)

@@ -27,10 +27,12 @@ import io
 import json
 import math
 import os
+import shutil
 import signal
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -625,7 +627,23 @@ def model_dir():
 
 
 @pytest.fixture(scope="session")
-def server_process(model_dir):
+def server_base_path():
+    """Fresh isolated base path for the test subprocess.
+
+    Creates a clean temp directory so the subprocess does NOT inherit the
+    user's ``~/.omlx/model_settings.json`` (which may pin a large VLM that
+    blows past ``SERVER_STARTUP_TIMEOUT`` during ``preload_pinned_models``).
+    The test persists its own pin via the admin API at runtime instead.
+    """
+    base = Path(tempfile.mkdtemp(prefix="omlx-exclusive-test-"))
+    try:
+        yield base
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+@pytest.fixture(scope="session")
+def server_process(model_dir, server_base_path):
     """Start omlx subprocess, wait for health, yield, kill on teardown."""
     python = os.path.join(
         os.path.dirname(sys.executable), "python"
@@ -633,6 +651,7 @@ def server_process(model_dir):
 
     cmd = [
         python, "-m", "omlx", "serve",
+        "--base-path", str(server_base_path),
         "--model-dir", model_dir,
         "--api-key", TEST_API_KEY,
         "--port", str(SERVER_PORT),
@@ -1025,7 +1044,7 @@ class TestReport:
             )
 
     async def test_99b_check_exclusive_isolation(
-        self, client, setup_exclusive
+        self, client, setup_exclusive, server_base_path
     ):
         """Scan server log: no non-VLM engine work during VLM inference.
 
@@ -1035,9 +1054,10 @@ class TestReport:
         matching "Chat completion [same-id]: N tokens" completion line.
         """
         import re
-        from pathlib import Path
 
-        log_path = Path.home() / ".omlx" / "logs" / "server.log"
+        # Server was launched with --base-path server_base_path, so logs
+        # live under <server_base_path>/logs/server.log, NOT ~/.omlx/logs/.
+        log_path = server_base_path / "logs" / "server.log"
         if not log_path.exists():
             pytest.skip(f"Server log not found at {log_path}")
 
