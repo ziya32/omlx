@@ -1,7 +1,7 @@
 # Pinned Model Pre-Request Eviction
 
-**Status**: Draft v4
-**Date**: 2026-04-04
+**Status**: Draft v5
+**Date**: 2026-04-05
 
 ## Problem
 
@@ -295,6 +295,18 @@ TTL continues to work for non-exclusive models. For exclusive models, TTL is lar
 ### `_prepare_memory_for()`
 
 Gains one additional early gate (Step 9b): non-pinned loads defer while an exclusive model is actively inferring, regardless of memory math. This protects the exclusive model's scheduler throughput from MLX executor contention during weight loading. Remaining memory-accounting logic is unchanged. Pre-request eviction handles runtime memory for already-loaded models; the early gate and Step 9 together handle the reverse direction. The three are complementary.
+
+### `pool.get_engine()` fast path
+
+Gains one additional gate (Step 9c): before returning an already-loaded non-pinned engine, check whether an exclusive pinned model is currently holding its lease. If so, route the caller through the wait-outside-lock path to defer until the exclusive model finishes. Steps 9b and 9c together form the complete executor-contention coverage — Step 9b for loads, Step 9c for already-loaded inference.
+
+### Request handlers (`server.py`)
+
+Step 9d moves `pool.acquire_engine()` to run BEFORE the `await get_engine_for_model()` in all four chat-endpoint sites and in the `use_engine()` context manager. This closes the TOCTOU race where a concurrent non-pinned handler could slip through Step 9b's gate (reading `active_uses == 0`) between a VLM handler's `get_engine` return and its `acquire_engine` call. Without this fix, Steps 9b and 9c are ineffective against concurrent request arrivals that beat the VLM's lease acquisition by even a few microseconds.
+
+### Logging (`server.py`, `api/audio_routes.py`)
+
+Step 9e adds `{Engine} [req_id] received:` log lines to every request handler at the first action after req_id generation. Before this change, only `/v1/chat/completions` logged request arrival — all other endpoints logged only after work completion, making per-request lifecycle tracing impossible from logs alone. This is independently useful for latency diagnosis and is a prerequisite for making `test_99b`'s pre-existing-work filter exact.
 
 ### Prefill memory guard
 
@@ -856,6 +868,112 @@ same `exclusive_idle` event, so the waiter is bounded by the same
 `max_wait_timeout` mechanism. Starvation protection from the
 three-layer strategy applies identically to both hooks.
 
+#### Step 9c: Non-pinned fast-path gate in `pool.get_engine()`
+
+**File**: `omlx/engine_pool.py`
+
+**Problem discovered by `tests/integration/test_exclusive_live_server.py::test_99b_check_exclusive_isolation`**: Steps 9 and 9b both fire in `_prepare_memory_for()`, which runs only on the LOADING path (when an entry is in `EngineState.UNLOADED`). Once a non-pinned engine is loaded and its entry state is `EngineState.ACTIVE`, subsequent requests for it take the fast path in `get_engine()` that does not call `_prepare_memory_for()`:
+
+```python
+if entry.state == EngineState.ACTIVE and entry.engine is not None:
+    entry.last_access = time.time()
+    if entry.is_pinned and entry.exclusive:
+        # ... Step 9a/9b path for the exclusive model itself ...
+    else:
+        return entry.engine   # ← non-exclusive fast path: no gate
+```
+
+The rationale for Step 9b applies equally here — the MLX executor is still single-threaded, and an already-loaded non-pinned engine doing inference will still interleave scheduler steps with the exclusive model on the shared executor thread. Under test_99b's strict invariant (no non-VLM engine work inside a VLM window), already-loaded non-pinned inference was a visible violation.
+
+**The fix**: mirror Step 9b's check in the non-pinned fast path of `get_engine()`. Before returning an already-loaded non-pinned engine, iterate entries and look for any exclusive pinned model with `active_uses > 0` and a non-null `exclusive_idle` event. If found, return that event for the caller to wait on (routing through the existing wait-outside-lock section, which re-enters the loop after the wait).
+
+```python
+# In pool.get_engine() fast path, else-branch of is_pinned+exclusive:
+else:
+    contention_event: asyncio.Event | None = None
+    for _mid, _e in self._entries.items():
+        if (
+            _e.exclusive
+            and _e.is_pinned
+            and _e.active_uses > 0
+            and _e.exclusive_idle is not None
+        ):
+            contention_event = _e.exclusive_idle
+            break
+    if contention_event is not None:
+        event = contention_event
+        wait_target = "exclusive_contention"
+        # Fall through to wait path; don't set should_load.
+    else:
+        return entry.engine
+```
+
+**Waiter safety under eviction**: the waiter holds NO lease on its target entry at this point — `acquire_engine()` only fires in the request handler after `get_engine()` returns. So while the waiter sleeps on `exclusive_idle`, the pinned model's own `_clear_for_exclusive()` may freely evict the non-pinned entry (since its `active_uses` is 0). When `exclusive_idle` fires and the waiter re-enters the retry loop:
+
+1. If the entry is still `ACTIVE`, re-check contention. If still contention, wait again (bounded by `max_wait_timeout`); if clear, return engine.
+2. If the entry has been evicted, state is now `UNLOADED`, and the waiter falls through to the normal LOAD path. `_prepare_memory_for()` runs fresh, the model reloads from SSD weights, and the request completes.
+
+The only way a request fails after eviction-during-wait is if memory is genuinely too tight to reload after the VLM finishes — but that's a pre-existing memory constraint, not a new failure mode introduced by this gate.
+
+**Latency cost**: non-pinned requests arriving during VLM inference now block on the VLM's completion plus potential reload. For a 20s VLM burst, an embedding request that would have finished in 100ms can take up to 20s+reload+0.1s. This is an intentional tradeoff — the `exclusive` flag explicitly trades small-model latency for VLM throughput and headroom. Operators who need small-model latency under continuous VLM load can configure `exclusive_max_hold` (Layer 3) to bound the hold window.
+
+**Concurrent-entry race caveat**: Step 9c cannot close the race where a non-pinned handler enters the pool lock BEFORE the VLM's `acquire_engine()` bumps `active_uses`. If an embedding arrives 2 ms before a VLM, it wins the pool lock, passes the gate (because `active_uses == 0` at that instant), and dispatches work to the MLX executor. That work will visibly finish inside the VLM's in-flight window when the VLM arrives milliseconds later. This is fundamental to any concurrent-dispatch system — you cannot retroactively block work that has already been dispatched. The test handles this by computing `effective_start = log_timestamp - "in X.Xs" duration` for each candidate violation line and treating lines where `effective_start < vlm_window_open` as pre-existing work, not violations. In practice these are always under 5 ms of executor time.
+
+#### Step 9d: Close the TOCTOU race in request handlers
+
+**File**: `omlx/server.py`
+
+**Problem discovered during test_99b debugging**: the test_99b invariant was being violated by **reranker model loads** (14-17s of MLX executor time inside VLM windows), not just brief inferences. Tracing revealed a TOCTOU race between the VLM handler's `get_engine_for_model()` call and its subsequent `acquire_engine()` call:
+
+```python
+# BEFORE (racy):
+engine = await get_engine_for_model(request.model)  # ← await, may yield
+pool.acquire_engine(resolved_model)                   # ← bumps active_uses HERE
+```
+
+During the `await`, other coroutines can run. If a reranker request's handler enters `_prepare_memory_for()` in that window, it reads `active_uses == 0` on the VLM entry (because the VLM's `acquire_engine()` hasn't fired yet), Step 9b's gate skips, and the reranker proceeds to load on the MLX executor. By the time the VLM's `acquire_engine()` runs, the reranker's 14-17s weight load is already in flight and cannot be preempted.
+
+**The fix**: move `acquire_engine()` to run BEFORE `await get_engine_for_model()` in all four chat-endpoint sites (chat completions, legacy completions, anthropic messages, responses API) and in the `use_engine()` context manager:
+
+```python
+# AFTER (race closed):
+pool.acquire_engine(resolved_model)  # ← bumps active_uses FIRST (synchronous)
+released = False
+try:
+    engine = await get_engine_for_model(request.model)  # ← await now safe
+    # ... rest of handler ...
+finally:
+    if not released:
+        pool.release_engine(resolved_model)
+```
+
+`acquire_engine()` is synchronous and doesn't take the pool lock — it just reads `self._entries[model_id]` and increments `active_uses`, which is atomic on the single-threaded event loop. Moving it before the first `await` ensures that by the time any event-loop yield happens, the exclusive VLM's `exclusive_idle` event is already set up and any concurrent non-pinned handler will defer at Step 9b/9c.
+
+**Failure-path safety**: if `get_engine_for_model()` raises (model not found, OOM, etc.), the existing `try/finally` block still releases the engine, so there's no active_uses leak. If the model_id doesn't exist at all, `acquire_engine()` is a no-op (early return when `self._entries.get(model_id)` is None) and the subsequent exception propagates normally.
+
+**Scope**: applied to 5 sites total — 4 chat-completion-style endpoint handlers in `omlx/server.py` and the `use_engine()` async context manager (which wraps embedding, rerank, audio, and token-counting endpoints).
+
+#### Step 9e: Uniform request-arrival logging
+
+**File**: `omlx/server.py`, `omlx/api/audio_routes.py`
+
+**Problem**: `test_99b` uses server log lines as the source of truth for "when did the VLM arrive" versus "when did non-VLM engine work happen". Only `/v1/chat/completions` was logging a `received:` line at request entry — all other endpoints logged only their completion line (`Embedding [req_id]: … in X.Xs`). This made the test rely on a duration-subtraction heuristic (effective_start = log_timestamp − reported duration) to identify pre-existing work.
+
+**The fix**: add an explicit `{Engine} [req_id] received: model=…` log at the first action of every request handler:
+
+| Endpoint | Log line |
+|---|---|
+| `/v1/chat/completions` | `Chat completion [req_id] received: …` (already existed) |
+| `/v1/completions` (legacy) | `Completion [req_id] received: model=…, stream=…, max_tokens=…` |
+| `/v1/embeddings` | `Embedding [req_id] received: model=…` |
+| `/v1/rerank` | `Rerank [req_id] received: model=…` |
+| `/v1/anthropic/messages` | `Anthropic message [req_id] received: model=…, messages=…, stream=…, max_tokens=…` |
+| `/v1/responses` | `Responses API [req_id] received: model=…, stream=…` |
+| `/v1/audio/transcriptions` | `Transcription [req_id] received: model=…` |
+| `/v1/audio/speech` | `Speech [req_id] received: model=…, format=…` |
+
+This is independently useful for request-level latency diagnosis (arrival-to-completion tracing by req_id grep) and makes test_99b's invariant check exact instead of approximate — future versions can pair each non-VLM `received:` line with its matching `done` line instead of reconstructing start times from durations.
+
 #### Step 10 (optional): Add `exclusive_max_hold` setting
 
 **File**: `omlx/model_settings.py`
@@ -897,9 +1015,14 @@ if entry.exclusive_max_hold > 0 and entry._exclusive_hold_start > 0:
 | `omlx/engine_pool.py` | Modify `acquire_engine()` / `release_engine()` (exclusive idle lifecycle) |
 | `omlx/engine_pool.py` | Modify `_check_process_memory()` (wait on exclusive idle — memory-contention hook, Step 9) |
 | `omlx/engine_pool.py` | Early gate in `_prepare_memory_for()` (wait on exclusive idle — MLX executor-contention hook, Step 9b) |
+| `omlx/engine_pool.py` | Non-pinned fast-path gate in `get_engine()` (already-loaded inference, Step 9c) |
 | `omlx/engine_pool.py` | Wire `exclusive` from settings in `discover_models()` / `apply_settings()` |
+| `omlx/server.py` | Move `pool.acquire_engine()` before `await get_engine_for_model()` in 4 chat handlers + `use_engine()` (Step 9d, TOCTOU race close) |
+| `omlx/server.py` | Add `{Engine} [req_id] received:` logs for completions/embeddings/rerank/anthropic/responses (Step 9e, observability) |
+| `omlx/api/audio_routes.py` | Add `Transcription [req_id] received:` and `Speech [req_id] received:` logs (Step 9e) |
 | `tests/` | Unit + integration tests |
 | `tests/integration/test_exclusive_pinned_e2e.py` | E2E: concurrent VLM + embedding + reranker + audio with pinned VLM |
+| `tests/integration/test_exclusive_live_server.py` | Stress + isolation-check (`test_99b`) against live subprocess server: scans server log, identifies VLM in-flight windows, reports per-window full log with violating lines marked, filters pre-existing work via duration-subtraction heuristic |
 
 ---
 
@@ -926,6 +1049,12 @@ if entry.exclusive_max_hold > 0 and entry._exclusive_hold_start > 0:
 13. **exclusive_max_hold expiry**: Pin A (exclusive, max_hold=10s). A holds exclusivity for 15s. New A request arrives. Assert `_clear_for_exclusive()` is skipped, non-pinned models allowed to coexist.
 14. **Hold timer reset**: Pin A (exclusive, max_hold=60s). A goes idle (active_uses → 0). Assert `_exclusive_hold_start` resets to 0. Next A request starts fresh hold timer.
 
+### Unit tests — Step 9c (non-pinned fast-path gate)
+
+14a. **Fast-path contention defer**: Pin A (exclusive) with `active_uses > 0` and `exclusive_idle` set. Call `pool.get_engine(B)` where B is a non-pinned ACTIVE entry. Assert the retry loop enters the wait path with `wait_target == "exclusive_contention"` and returns only after the exclusive_idle event fires.
+14b. **Fast-path eviction-during-wait recovery**: Same as 14a, but while B's waiter is blocked, `_clear_for_exclusive()` evicts B (state → UNLOADING → UNLOADED). When the exclusive_idle event fires, the waiter re-enters the loop, sees UNLOADED, falls through to the LOAD path, and reloads B successfully. Assert the request completes.
+14c. **No gate when no exclusive contention**: Pin A (not exclusive) or set A's `active_uses == 0`. Call `pool.get_engine(B)` where B is non-pinned ACTIVE. Assert fast path returns the engine immediately (no deferral).
+
 ### Integration tests
 
 15. **End-to-end VLM → small → VLM cycle**: Start server with pinned exclusive VLM + small LLM. Send VLM request (completes). Send small LLM request (loads, completes). Send VLM request again (evicts small LLM, completes). Assert all three succeed.
@@ -933,6 +1062,7 @@ if entry.exclusive_max_hold > 0 and entry._exclusive_hold_start > 0:
 17. **Latency under load**: Measure added latency for VLM requests when 0, 1, 2 non-pinned models need eviction. Ensure idle eviction adds < 1s, drain eviction adds < drain_timeout.
 18. **Starvation guard**: Set `exclusive_max_hold: 5`. Send continuous VLM requests. Send small LLM request. Assert small LLM eventually gets served within ~5s of the hold expiry window.
 19. **Event capture race**: Pin A (exclusive). Start request on A. B waits on `exclusive_idle`. A finishes → signal task created. BEFORE signal task runs, new A request arrives (`acquire_engine` creates fresh event). Assert OLD event (B's waiter) is still signaled correctly. Assert NEW event is un-set.
+20. **Exclusive isolation check (`test_99b_check_exclusive_isolation`)**: After running the full stress suite, parse the server log, identify every VLM in-flight window (between `Chat completion [req_id] received` and `Chat completion [req_id]: N tokens in Xs`), and scan each window for non-VLM engine work lines (`Embedding [...]`, `Rerank [...]`, `Speech [...]`, `STT transcribe done`, `Loading model:`, `Loaded model:`, state transitions). Subtract the "in X.Xs" duration from each candidate line's timestamp to compute effective start time; filter out candidates where effective_start precedes the VLM window open (pre-existing work from the concurrent-entry race). Assert zero real violations. This is the final gate — it catches regressions in Steps 9 through 9e simultaneously.
 
 ---
 

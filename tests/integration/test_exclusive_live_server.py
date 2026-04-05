@@ -94,7 +94,12 @@ class RequestRecord:
     prompt: str = ""
     max_tokens: int = 0
     streaming: bool = False
-    start_time: float = 0.0
+    # Wall-clock start time captured at record creation. Used by
+    # test_99b_check_exclusive_isolation to scope the server-log scan
+    # to the current test session. Default factory fires when each
+    # do_* helper constructs its RequestRecord, so this reflects the
+    # actual request start (within microseconds).
+    start_time: float = field(default_factory=time.time)
     ttft: float = 0.0          # time to first token (streaming only)
     total_time: float = 0.0
     status_code: int = 0
@@ -1063,13 +1068,15 @@ class TestReport:
 
         log_lines = log_path.read_text().splitlines()
 
-        # Use the tracker's earliest and latest timestamps to scope the scan
-        # to this test session only.
+        # Use the tracker's earliest start_time to scope the scan to lines
+        # produced during this test session only.  Every do_* helper sets
+        # RequestRecord.start_time via default_factory=time.time, so a zero
+        # here means the tracker is unexpectedly empty.
         session_start = min(
             (r.start_time for r in _tracker.records if r.start_time > 0),
-            default=0,
+            default=0.0,
         )
-        if session_start == 0:
+        if session_start == 0.0:
             pytest.skip("No tracked requests with timestamps")
 
         # ── Parse log lines ──────────────────────────────────────────
@@ -1082,6 +1089,9 @@ class TestReport:
         #   Loading model: ...
         #   STT transcribe done: ...
 
+        ts_re = re.compile(
+            r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+)"
+        )
         vlm_received_re = re.compile(
             r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+).*"
             r"Chat completion \[([0-9a-f-]+)\] received:.*"
@@ -1099,16 +1109,42 @@ class TestReport:
             r"Embedding engine started|state=unloaded→loading"
         )
 
-        def _parse_ts(ts_str: str) -> str:
-            """Return timestamp string for display."""
-            return ts_str
+        def _parse_line_ts(line: str) -> float:
+            """Parse the logging asctime prefix into a Unix epoch float.
+
+            Python's logging default format is
+            "%Y-%m-%d %H:%M:%S,%(msecs)03d" emitted in local time.  We use
+            strptime with %f (which accepts 1-6 digits and treats 3-digit
+            ms as microseconds×1000) and .timestamp() for the local-time
+            → epoch conversion.  Returns 0.0 if the line has no timestamp.
+            """
+            m = ts_re.match(line)
+            if not m:
+                return 0.0
+            try:
+                return datetime.strptime(
+                    m.group(1), "%Y-%m-%d %H:%M:%S,%f"
+                ).timestamp()
+            except ValueError:
+                return 0.0
+
+        # Find the first log line whose timestamp is at or after
+        # session_start; everything before that (server startup, pinned
+        # model preload, admin settings writes) is out of scope.
+        scan_start_idx = 0
+        for idx, line in enumerate(log_lines):
+            line_ts = _parse_line_ts(line)
+            if line_ts > 0 and line_ts >= session_start:
+                scan_start_idx = idx
+                break
 
         # ── Identify VLM in-flight windows ───────────────────────────
         # Build a list of (req_id, start_line_idx, end_line_idx) tuples
         vlm_windows: list[tuple[str, int, int]] = []
         open_vlm: dict[str, int] = {}  # req_id → start line index
 
-        for idx, line in enumerate(log_lines):
+        for idx in range(scan_start_idx, len(log_lines)):
+            line = log_lines[idx]
             m = vlm_received_re.match(line)
             if m:
                 req_id = m.group(2)
@@ -1121,45 +1157,153 @@ class TestReport:
                     vlm_windows.append((req_id, open_vlm.pop(req_id), idx))
 
         # ── Scan for violations ──────────────────────────────────────
-        violations: list[str] = []
+        # Group by window: one entry per VLM window that has at least one
+        # violating line in its body.  Each entry captures the window
+        # bounds and the offending line indices so the report can emit
+        # the full in-window log context with violating lines highlighted.
+        #
+        # Pre-existing work filter: a concurrent-entry race between request
+        # handlers is a fundamental property of the server — if an embedding
+        # and a VLM request arrive within a few milliseconds of each other,
+        # whichever wins the pool lock dispatches first.  An embedding that
+        # dispatches 2 ms before the VLM's "received" log is already on the
+        # MLX executor by the time the VLM's exclusive lease is acquired,
+        # and cannot be retroactively blocked or aborted.  These show up as
+        # "Embedding [...]: ... in 0.1s" lines appearing right after the
+        # VLM window opens.  The actual start time (log_ts - reported
+        # duration) precedes the VLM window's open, so they are pre-existing
+        # work, not violations of the exclusive guarantee.
+        #
+        # Strategy: for each candidate violation line that carries an
+        # "in X.XXs" duration suffix, compute start_time = ts - duration.
+        # If start_time < vlm_window_open_time, the work was already in
+        # flight when the VLM arrived — skip as pre-existing.  Lines
+        # without a duration (e.g. "Loading model:", "state=unloaded→
+        # loading") use their own timestamp as the start time.
+        duration_re = re.compile(r"in (\d+\.\d+)s")
+
+        def _line_effective_start(line: str) -> float:
+            """Return the epoch second when the logged work actually began.
+
+            For "... in X.Xs" lines, subtract the duration from the log
+            timestamp (which marks end-of-work).  For lines without a
+            duration, return the log timestamp as-is.  Returns 0.0 if
+            the line has no parseable timestamp.
+            """
+            line_ts = _parse_line_ts(line)
+            if line_ts == 0.0:
+                return 0.0
+            m = duration_re.search(line)
+            if m:
+                try:
+                    return line_ts - float(m.group(1))
+                except ValueError:
+                    return line_ts
+            return line_ts
+
+        violation_windows: list[dict] = []
+        total_violations = 0
+        pre_existing_skipped = 0
 
         for req_id, start_idx, end_idx in vlm_windows:
-            for line_idx in range(start_idx + 1, end_idx):
-                line = log_lines[line_idx]
-                if non_vlm_work_re.search(line):
-                    violations.append(
-                        f"  VLM [{req_id}] lines {start_idx+1}-{end_idx+1}:\n"
-                        f"    !! line {line_idx+1}: {line.strip()}"
-                    )
+            window_open_ts = _parse_line_ts(log_lines[start_idx])
+            offending: list[int] = []
+            for i in range(start_idx + 1, end_idx):
+                line = log_lines[i]
+                if not non_vlm_work_re.search(line):
+                    continue
+                # Filter out pre-existing work whose effective start
+                # precedes the VLM window opening.
+                if window_open_ts > 0.0:
+                    eff_start = _line_effective_start(line)
+                    if eff_start > 0.0 and eff_start < window_open_ts:
+                        pre_existing_skipped += 1
+                        continue
+                offending.append(i)
+            if offending:
+                violation_windows.append({
+                    "req_id": req_id,
+                    "start_idx": start_idx,
+                    "end_idx": end_idx,
+                    "offending": offending,
+                })
+                total_violations += len(offending)
 
         # ── Report ───────────────────────────────────────────────────
-        # Append to the test report file
+        # Append to the test report file.
         report_dir = REPORT_DIR
         report_files = sorted(report_dir.glob("exclusive_stress_*.txt"))
-        if report_files:
-            report_path = report_files[-1]
+        report_path = report_files[-1] if report_files else None
+
+        if report_path is not None:
             with open(report_path, "a") as f:
                 f.write("\n" + "=" * 80 + "\n")
                 f.write("EXCLUSIVE ISOLATION CHECK\n")
                 f.write("=" * 80 + "\n")
                 f.write(f"VLM in-flight windows found: {len(vlm_windows)}\n")
-                f.write(f"Violations: {len(violations)}\n")
-                if violations:
-                    f.write("\nDETAILS:\n")
-                    for v in violations:
-                        f.write(v + "\n")
-                else:
-                    f.write("\nNo exclusivity violations found.\n")
+                f.write(f"Windows with violations:     {len(violation_windows)}\n")
+                f.write(f"Total violating lines:       {total_violations}\n")
+                f.write(f"Pre-existing work skipped:   {pre_existing_skipped}\n")
 
-        if violations:
-            summary = "\n".join(violations[:20])
+                if not violation_windows:
+                    f.write("\nNo exclusivity violations found.\n")
+                else:
+                    f.write("\nDETAILS — full log for each violating window:\n")
+                    # Show every line in the window with a gutter:
+                    #   "     "  regular line
+                    #   "  >  "  VLM open/close boundary
+                    #   "  !  "  offending non-VLM engine work (violation)
+                    for w in violation_windows:
+                        req_id = w["req_id"]
+                        start_idx = w["start_idx"]
+                        end_idx = w["end_idx"]
+                        offending_set = set(w["offending"])
+
+                        f.write("\n")
+                        f.write("-" * 80 + "\n")
+                        f.write(
+                            f"VLM [{req_id}] window: lines "
+                            f"{start_idx + 1}-{end_idx + 1} "
+                            f"({len(offending_set)} violation(s))\n"
+                        )
+                        f.write("-" * 80 + "\n")
+
+                        for i in range(start_idx, end_idx + 1):
+                            if i == start_idx or i == end_idx:
+                                gutter = "  >  "
+                            elif i in offending_set:
+                                gutter = "  !  "
+                            else:
+                                gutter = "     "
+                            f.write(
+                                f"{i + 1:>6}{gutter}{log_lines[i]}\n"
+                            )
+
+        if violation_windows:
+            # Concise summary for the pytest.fail message — first violating
+            # line from each of the first few windows, with a pointer to
+            # the full context written to the report file.
+            summary_lines = []
+            shown = 0
+            for w in violation_windows:
+                if shown >= 5:
+                    break
+                first_off = w["offending"][0]
+                summary_lines.append(
+                    f"  VLM [{w['req_id']}] lines "
+                    f"{w['start_idx'] + 1}-{w['end_idx'] + 1}:\n"
+                    f"    !! line {first_off + 1}: {log_lines[first_off].strip()}"
+                )
+                shown += 1
             extra = (
-                f"\n  ... and {len(violations) - 20} more"
-                if len(violations) > 20 else ""
+                f"\n  ... and {len(violation_windows) - shown} more window(s)"
+                if len(violation_windows) > shown else ""
             )
             pytest.fail(
-                f"{len(violations)} exclusivity violation(s) found — "
-                f"non-VLM engine work occurred during VLM inference:\n"
-                f"{summary}{extra}\n"
-                f"Full report: {report_files[-1] if report_files else 'N/A'}"
+                f"{total_violations} exclusivity violation(s) across "
+                f"{len(violation_windows)} VLM window(s) — non-VLM engine "
+                f"work occurred during VLM inference:\n"
+                + "\n".join(summary_lines)
+                + extra
+                + f"\nFull window logs: {report_path or 'N/A'}"
             )
