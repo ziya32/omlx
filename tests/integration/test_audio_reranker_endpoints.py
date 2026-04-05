@@ -240,6 +240,10 @@ class MockEnginePool:
     def release_engine(self, model_id) -> None:
         pass
 
+    def ensure_engine_alive(self, model_id, engine_ref) -> None:
+        # Tests never race with the process memory enforcer.
+        pass
+
     def get_model_ids(self):
         return list(self._entries.keys())
 
@@ -379,6 +383,53 @@ class TestTranscriptionEndpoint:
         buf.write(struct.pack("<I", 0))       # data size
         buf.seek(0)
         return buf
+
+
+class TestAudioEngineEvictedErrorHandling:
+    """Positive tests that audio_routes._use_engine translates
+    EngineEvictedError to HTTP 503.
+
+    The audio routes use a local _use_engine context manager in
+    omlx/api/audio_routes.py that is separate from server.get_engine,
+    so the hardening there needs its own coverage. Two entry points:
+
+    1. pool.get_engine() raises EngineEvictedError — caught by the
+       outer try/except in _use_engine.
+    2. pool.ensure_engine_alive() raises after pool.get_engine()
+       returned — the race window caught by the inner try/except.
+    """
+
+    def test_transcription_ensure_engine_alive_race_returns_503(self, client):
+        """Race window: get_engine succeeded, then ensure_engine_alive
+        detected the enforcer evicted the model before the audio
+        handler could use it."""
+        from omlx.exceptions import EngineEvictedError
+        from omlx.server import _server_state
+
+        pool = _server_state.engine_pool
+
+        def raise_evicted(model_id, engine_ref):
+            raise EngineEvictedError(model_id)
+
+        original = pool.ensure_engine_alive
+        pool.ensure_engine_alive = raise_evicted
+        try:
+            wav = TestTranscriptionEndpoint._make_wav()
+            response = client.post(
+                "/v1/audio/transcriptions",
+                data={"model": "test-asr-model", "language": "en"},
+                files={"file": ("test.wav", wav, "audio/wav")},
+            )
+        finally:
+            pool.ensure_engine_alive = original
+
+        assert response.status_code == 503
+        data = response.json()
+        # /v1/audio/* is an API route, so the HTTPException handler
+        # wraps the detail in the OpenAI-style error envelope.
+        assert "error" in data
+        assert "evicted" in data["error"]["message"].lower()
+        assert "retry" in data["error"]["message"].lower()
 
 
 class TestStreamingTranscription:

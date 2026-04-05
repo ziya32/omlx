@@ -210,9 +210,15 @@ def check_models(model_dir):
         pytest.skip(f"Missing models: {', '.join(missing)}")
 
 
-@pytest.fixture(scope="session")
-def server_app(model_dir, check_models):
-    """Initialize omlx server with VLM pinned as exclusive."""
+@pytest_asyncio.fixture(loop_scope="session", scope="module")
+async def server_app(model_dir, check_models):
+    """Initialize omlx server with VLM pinned as exclusive.
+
+    **Module-scoped** so the pinned VLM (large) is released as soon as
+    the last test in this module finishes, before any later integration
+    module — in particular ``test_exclusive_live_server.py``, which
+    spawns its own subprocess server — can add memory on top of it.
+    """
     from omlx.model_settings import ModelSettings, ModelSettingsManager
     from omlx.server import _server_state, app, init_server
 
@@ -249,16 +255,25 @@ def server_app(model_dir, check_models):
         _server_state.engine_pool.set_pinned(VLM_MODEL, True)
         _server_state.engine_pool.set_exclusive(VLM_MODEL, True)
 
-        yield app
+        try:
+            yield app
+        finally:
+            # Drain in-flight work, stop background tasks, unload every
+            # engine (including the pinned VLM), clear Metal cache.
+            if _server_state.engine_pool is not None:
+                try:
+                    await _server_state.engine_pool.shutdown()
+                except Exception:
+                    pass
+                _server_state.engine_pool = None
+            gc.collect()
+            try:
+                mx.clear_cache()
+            except Exception:
+                pass
 
-    gc.collect()
-    try:
-        mx.clear_cache()
-    except Exception:
-        pass
 
-
-@pytest_asyncio.fixture(loop_scope="session", scope="session")
+@pytest_asyncio.fixture(loop_scope="session", scope="module")
 async def client(server_app):
     """Async HTTP client with per-request timeout of 5 minutes."""
     transport = ASGITransport(app=server_app)

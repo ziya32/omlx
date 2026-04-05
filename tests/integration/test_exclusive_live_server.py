@@ -631,7 +631,7 @@ def model_dir():
     return d
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 def server_base_path():
     """Fresh isolated base path for the test subprocess.
 
@@ -639,6 +639,10 @@ def server_base_path():
     user's ``~/.omlx/model_settings.json`` (which may pin a large VLM that
     blows past ``SERVER_STARTUP_TIMEOUT`` during ``preload_pinned_models``).
     The test persists its own pin via the admin API at runtime instead.
+
+    **Module-scoped** — paired with the module-scoped ``server_process``
+    so the subprocess's working directory lives exactly as long as the
+    subprocess itself.
     """
     base = Path(tempfile.mkdtemp(prefix="omlx-exclusive-test-"))
     try:
@@ -647,9 +651,52 @@ def server_base_path():
         shutil.rmtree(base, ignore_errors=True)
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 def server_process(model_dir, server_base_path):
-    """Start omlx subprocess, wait for health, yield, kill on teardown."""
+    """Start omlx subprocess, wait for health, yield, kill on teardown.
+
+    **Module-scoped** (not session-scoped) so the subprocess is killed
+    as soon as the last test in this file finishes. If this fixture
+    were session-scoped, later integration modules
+    (test_exclusive_pinned_e2e.py, test_server_e2e.py, test_full_integration.py,
+    etc.) would run their own in-process engine pools WHILE this
+    subprocess is still alive, doubling memory use. See the test audit
+    in the Issue 7 follow-up for the full analysis.
+
+    Before spawning the subprocess, drop any in-process
+    ``_server_state.engine_pool`` that a prior integration module may
+    have left behind. Normally the module-scoped ``server_app``
+    fixtures in ``test_asr_long_audio.py`` / ``test_server_e2e.py`` /
+    ``test_exclusive_pinned_e2e.py`` shut themselves down in their
+    teardown, but if any of them errored during teardown we could
+    still be holding GB of Metal memory in this (the pytest) process.
+    Since this test exclusively talks to the subprocess over HTTP,
+    the in-process pool is never used — clearing it up front ensures
+    pytest + subprocess combined stay near a single-server footprint.
+    """
+    # Belt-and-braces cleanup of any lingering in-process state. The
+    # module-scoped server_app fixtures in the other integration files
+    # are responsible for their own async shutdown; this block just
+    # drops stray references and clears the Metal cache in case one of
+    # them errored during teardown. We deliberately do NOT try to await
+    # the async ``shutdown()`` here — mixing that with pytest-asyncio's
+    # session loop from a sync fixture is fragile. Dropping the pool
+    # reference and running ``mx.clear_cache`` is enough to release
+    # Metal memory for GC.
+    try:
+        from omlx.server import _server_state as _ss  # type: ignore
+        if getattr(_ss, "engine_pool", None) is not None:
+            _ss.engine_pool = None
+        import gc as _gc
+        _gc.collect()
+        try:
+            import mlx.core as _mx
+            _mx.clear_cache()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
     python = os.path.join(
         os.path.dirname(sys.executable), "python"
     ) if "venv" in sys.executable else sys.executable
@@ -704,7 +751,7 @@ def server_process(model_dir, server_base_path):
     _kill_server()
 
 
-@pytest_asyncio.fixture(loop_scope="session", scope="session")
+@pytest_asyncio.fixture(loop_scope="session", scope="module")
 async def client(server_process):
     async with httpx.AsyncClient(
         base_url=SERVER_URL,
@@ -721,7 +768,7 @@ async def client(server_process):
         yield ac
 
 
-@pytest_asyncio.fixture(loop_scope="session", scope="session")
+@pytest_asyncio.fixture(loop_scope="session", scope="module")
 async def setup_exclusive(client):
     original = await _get_model_settings(client, VLM_MODEL)
 
@@ -1102,9 +1149,28 @@ class TestReport:
             r"Chat completion \[([0-9a-f-]+)\]: \d+ tokens in"
         )
 
-        # Lines that indicate non-VLM engine work
+        # Lines that indicate non-VLM engine work.
+        #
+        # Handler arrival logs ("Embedding [id] received: ...",
+        # "Speech [id] received: ...", "Transcription [id] received:
+        # ...", "Rerank [id] received: ...") are explicitly NOT
+        # violations: they fire the moment an HTTP request enters the
+        # handler, BEFORE any acquire_engine or dispatch happens. The
+        # handler will then block at the exclusive Step 9b gate until
+        # the VLM's lease clears — which is exactly the contract we
+        # want to verify. The engine-level lines we DO count are the
+        # completion logs ("Embedding [id]: N inputs, ... in Xs",
+        # "Rerank [id]: N docs, ... in Xs", "Speech [id]: Xs, ...")
+        # which indicate the work actually ran, plus the load-time
+        # markers for fresh model loading.
+        #
+        # We match the handler ID-bracket forms only on the
+        # completion side (followed by ": <digit>") and exclude the
+        # "received:" arrival marker explicitly.
         non_vlm_work_re = re.compile(
-            r"Embedding \[|Rerank \[|Speech \[|STT transcribe done|"
+            r"(?:Embedding|Rerank|Speech) \[[0-9a-f-]+\]: \d|"
+            r"Transcription \[[0-9a-f-]+\]: \d|"
+            r"STT transcribe done|"
             r"Loading model:|Loaded model:|Reranker engine started|"
             r"Embedding engine started|state=unloaded→loading"
         )

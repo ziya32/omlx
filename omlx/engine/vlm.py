@@ -35,6 +35,7 @@ import mlx.core as mx
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..cache.vision_feature_cache import VisionFeatureSSDCache
+from ..exceptions import RequestAbortedError
 from ..models.vlm import VLMModelAdapter
 from ..utils.image import (
     compute_image_hash,
@@ -1427,7 +1428,15 @@ class VLMBatchedEngine(BaseEngine):
     ) -> GenerationOutput:
         """Generate a complete response (non-streaming)."""
         if self._stopped:
-            raise RuntimeError(f"VLMBatchedEngine for {self._model_name} has been stopped")
+            # Narrow race with ProcessMemoryEnforcer: a handler captured
+            # this engine reference before the enforcer's abort + unload,
+            # and ensure_engine_alive may not have tripped. Raise the
+            # typed exception so the FastAPI request_aborted_handler
+            # translates to HTTP 503 instead of falling through to 500.
+            raise RequestAbortedError(
+                f"Engine for {self._model_name} has been stopped "
+                f"due to memory pressure. Please retry the request."
+            )
         if not self._loaded:
             await self.start()
 
@@ -1496,7 +1505,15 @@ class VLMBatchedEngine(BaseEngine):
     ) -> AsyncIterator[GenerationOutput]:
         """Stream generation token by token."""
         if self._stopped:
-            raise RuntimeError(f"VLMBatchedEngine for {self._model_name} has been stopped")
+            # Narrow race with ProcessMemoryEnforcer: a handler captured
+            # this engine reference before the enforcer's abort + unload,
+            # and ensure_engine_alive may not have tripped. Raise the
+            # typed exception so the FastAPI request_aborted_handler
+            # translates to HTTP 503 instead of falling through to 500.
+            raise RequestAbortedError(
+                f"Engine for {self._model_name} has been stopped "
+                f"due to memory pressure. Please retry the request."
+            )
         if not self._loaded:
             await self.start()
 
@@ -1590,7 +1607,15 @@ class VLMBatchedEngine(BaseEngine):
     ) -> GenerationOutput:
         """Chat completion with vision support (non-streaming)."""
         if self._stopped:
-            raise RuntimeError(f"VLMBatchedEngine for {self._model_name} has been stopped")
+            # Narrow race with ProcessMemoryEnforcer: a handler captured
+            # this engine reference before the enforcer's abort + unload,
+            # and ensure_engine_alive may not have tripped. Raise the
+            # typed exception so the FastAPI request_aborted_handler
+            # translates to HTTP 503 instead of falling through to 500.
+            raise RequestAbortedError(
+                f"Engine for {self._model_name} has been stopped "
+                f"due to memory pressure. Please retry the request."
+            )
         if not self._loaded:
             await self.start()
 
@@ -1641,7 +1666,15 @@ class VLMBatchedEngine(BaseEngine):
     ) -> AsyncIterator[GenerationOutput]:
         """Stream chat completion with vision support."""
         if self._stopped:
-            raise RuntimeError(f"VLMBatchedEngine for {self._model_name} has been stopped")
+            # Narrow race with ProcessMemoryEnforcer: a handler captured
+            # this engine reference before the enforcer's abort + unload,
+            # and ensure_engine_alive may not have tripped. Raise the
+            # typed exception so the FastAPI request_aborted_handler
+            # translates to HTTP 503 instead of falling through to 500.
+            raise RequestAbortedError(
+                f"Engine for {self._model_name} has been stopped "
+                f"due to memory pressure. Please retry the request."
+            )
         if not self._loaded:
             await self.start()
 

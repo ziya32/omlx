@@ -83,6 +83,14 @@ class BoundarySnapshotSSDStore:
         # skips queued items for these request IDs.
         self._cancelled_requests: set[str] = set()
 
+        # Serializes the writer thread's file-creation sequence
+        # (mkdir + write + rename) with cleanup_all / cleanup_request
+        # tree mutations (rmtree + mkdir). Without this, a writer that
+        # has already dequeued an item can race with cleanup and leak
+        # files into the freshly-recreated snapshot directory. See
+        # docs/enforcer-eviction-review.md cleanup race note.
+        self._io_lock = threading.Lock()
+
         # Background writer thread.
         self._write_queue: queue.Queue = queue.Queue(maxsize=_MAX_PENDING_WRITES)
         self._shutdown = threading.Event()
@@ -240,7 +248,8 @@ class BoundarySnapshotSSDStore:
 
     def cleanup_request(self, request_id: str) -> None:
         """Delete all snapshot files and pending writes for a request."""
-        # Mark as cancelled so the writer thread skips queued items.
+        # Mark as cancelled so the writer thread skips queued items
+        # AND any item already dequeued that re-checks under _io_lock.
         self._cancelled_requests.add(request_id)
 
         # Remove from pending writes.
@@ -256,14 +265,21 @@ class BoundarySnapshotSSDStore:
         with self._registry_lock:
             self._file_registry.pop(request_id, None)
 
-        # Remove files.
-        req_dir = self._snapshot_dir / request_id
-        if req_dir.exists():
-            try:
-                shutil.rmtree(req_dir)
-            except Exception as e:
-                if __debug__:
-                    logger.debug("Failed to clean up snapshots for %s: %s", request_id, e)
+        # Remove files. Hold _io_lock to serialize with any writer
+        # thread currently processing an item for this request — the
+        # writer re-checks _cancelled_requests under the same lock and
+        # will skip its write if we added the id above.
+        with self._io_lock:
+            req_dir = self._snapshot_dir / request_id
+            if req_dir.exists():
+                try:
+                    shutil.rmtree(req_dir)
+                except Exception as e:
+                    if __debug__:
+                        logger.debug(
+                            "Failed to clean up snapshots for %s: %s",
+                            request_id, e,
+                        )
 
     def cleanup_all(self) -> None:
         """Delete all snapshot files (for reset/startup)."""
@@ -282,15 +298,26 @@ class BoundarySnapshotSSDStore:
             self._pending_writes.clear()
         with self._registry_lock:
             self._file_registry.clear()
-        self._cancelled_requests.clear()
 
-        if self._snapshot_dir.exists():
-            try:
-                shutil.rmtree(self._snapshot_dir)
-            except Exception as e:
-                if __debug__:
-                    logger.debug("Failed to clean up all boundary snapshots: %s", e)
-        self._snapshot_dir.mkdir(parents=True, exist_ok=True)
+        # Hold _io_lock across the rmtree + mkdir + cancelled-set
+        # reset. This blocks until the writer thread finishes any item
+        # it has already dequeued (the writer holds _io_lock for its
+        # entire mkdir + write + rename sequence), guaranteeing no
+        # writer ops land in the freshly-recreated snapshot directory.
+        # Clearing _cancelled_requests AFTER acquiring the lock avoids
+        # undoing any cancellation set between the drain and the lock.
+        with self._io_lock:
+            self._cancelled_requests.clear()
+            if self._snapshot_dir.exists():
+                try:
+                    shutil.rmtree(self._snapshot_dir)
+                except Exception as e:
+                    if __debug__:
+                        logger.debug(
+                            "Failed to clean up all boundary snapshots: %s",
+                            e,
+                        )
+            self._snapshot_dir.mkdir(parents=True, exist_ok=True)
 
     def shutdown(self) -> None:
         """Stop background writer thread."""
@@ -319,24 +346,54 @@ class BoundarySnapshotSSDStore:
             if item is None:  # Sentinel
                 break
 
-            pw_key, tensors_raw, metadata, file_path = item
+            self._process_one_write_item(item)
 
-            # Skip writes for cancelled/cleaned-up requests.
+    def _process_one_write_item(
+        self,
+        item: Tuple[Tuple[str, int], Dict, Dict, Path],
+    ) -> None:
+        """Process a single dequeued write item.
+
+        Extracted from ``_writer_loop`` so tests can drive the race
+        between a dequeued item and ``cleanup_all`` / ``cleanup_request``
+        deterministically without racing against the live writer
+        thread. Behaviour is identical to the inlined version.
+
+        Holds ``_io_lock`` across the entire critical section
+        (staleness check + mkdir + write + rename) so cleanup_all /
+        cleanup_request can serialize with it deterministically.
+        """
+        pw_key, tensors_raw, metadata, file_path = item
+
+        with self._io_lock:
+            # Staleness check under the lock: if our entry is no
+            # longer in _pending_writes, a cleanup_all or
+            # cleanup_request wiped it between dequeue and now. Skip —
+            # writing would leak a file into a directory that cleanup
+            # has already emptied.
+            with self._pending_lock:
+                if pw_key not in self._pending_writes:
+                    return
             if pw_key[0] in self._cancelled_requests:
                 with self._pending_lock:
                     self._pending_writes.pop(pw_key, None)
-                continue
+                return
 
+            temp_path = None
             try:
                 file_path.parent.mkdir(parents=True, exist_ok=True)
                 temp_path = file_path.with_name(
                     file_path.stem + "_tmp.safetensors"
                 )
-                _write_safetensors_no_mx(str(temp_path), tensors_raw, metadata)
+                _write_safetensors_no_mx(
+                    str(temp_path), tensors_raw, metadata
+                )
                 os.rename(str(temp_path), str(file_path))
             except Exception as e:
                 if __debug__:
-                    logger.debug("Background snapshot write failed: %s", e)
+                    logger.debug(
+                        "Background snapshot write failed: %s", e
+                    )
                 for p in (temp_path, file_path):
                     try:
                         if p is not None and p.exists():
@@ -344,9 +401,9 @@ class BoundarySnapshotSSDStore:
                     except Exception:
                         pass
             finally:
-                # Remove extracted cache objects from pending writes to free
-                # memory, but keep tensors_raw for read-back until file is on
-                # disk.
+                # Remove extracted cache objects from pending writes
+                # to free memory, but keep tensors_raw for read-back
+                # until file is on disk.
                 with self._pending_lock:
                     pending = self._pending_writes.get(pw_key)
                     if pending is not None:

@@ -6,7 +6,7 @@ import shutil
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -238,6 +238,112 @@ class TestBoundarySnapshotSSDStore:
         assert snapshot_dir.exists()
         children = list(snapshot_dir.iterdir())
         assert len(children) == 0
+
+    def test_cleanup_all_serializes_with_in_flight_write_item(self, tmp_path):
+        """Deterministic repro for the writer/cleanup_all race.
+
+        The original cleanup_all only drained items still in the write
+        queue; items the writer thread had already dequeued were left
+        to finish on their own, racing with rmtree + mkdir. When the
+        writer's in-flight file operations happened AFTER cleanup_all's
+        rmtree, the request subdir and final file landed inside the
+        freshly-recreated snapshot_dir — leaking a file. This was the
+        exact root cause of the intermittent CI failure of
+        ``test_cleanup_all_drains_queue``.
+
+        Rather than race against the live writer thread (which is what
+        made the original bug flaky in CI), this test shuts the writer
+        thread down up-front, then drives the critical sequence
+        manually via the ``_process_one_write_item`` helper:
+
+          1. Enqueue a work item via ``save()``.
+          2. Dequeue it ourselves (the writer is inactive).
+          3. Run ``cleanup_all()`` — drains the now-empty queue,
+             clears ``_pending_writes``, rmtrees + mkdirs.
+          4. Feed the stale, dequeued item back into
+             ``_process_one_write_item``.
+          5. Assert the snapshot directory is empty.
+
+        Under the fix, step 4's staleness check inside ``_io_lock``
+        observes that ``pw_key`` was cleared from ``_pending_writes``
+        by step 3 and skips the write. Under the buggy code, the
+        staleness check is absent and the writer unconditionally
+        performs ``mkdir + write + rename``, leaking a file into the
+        recreated directory.
+
+        The sequence is fully deterministic — no sleeps, no polling,
+        no threads fighting for a lock.
+        """
+        import queue
+
+        # Shut down the writer thread so the test owns processing.
+        # This is the key trick that makes the race deterministic:
+        # with no writer thread running, step ordering is fully
+        # controlled by the test.
+        self.store._shutdown.set()
+        try:
+            self.store._write_queue.put_nowait(None)  # sentinel
+        except queue.Full:
+            pass
+        self.store._writer_thread.join(timeout=5.0)
+        assert not self.store._writer_thread.is_alive(), (
+            "writer thread did not exit"
+        )
+
+        # Save an item — adds to _pending_writes and enqueues to the
+        # work queue. save() doesn't care about _shutdown.
+        ok = self.store.save(
+            "req-1", 1024, [MagicMock()], _mock_extract_cache_states
+        )
+        assert ok
+
+        # Dequeue the item ourselves (this is what the writer would
+        # have done). The sentinel we put earlier may arrive first or
+        # after, drain until we find the real item.
+        item = None
+        while True:
+            try:
+                candidate = self.store._write_queue.get_nowait()
+            except queue.Empty:
+                break
+            if candidate is None:
+                continue  # sentinel — discard
+            item = candidate
+            break
+        assert item is not None, "save() did not enqueue the item"
+
+        # Sanity check: _pending_writes currently has the item, and
+        # the snapshot_dir is in its pristine post-init state.
+        pw_key = item[0]
+        assert pw_key in self.store._pending_writes
+
+        # Run cleanup_all while the item is "in flight" (dequeued but
+        # not yet processed). This clears _pending_writes, rmtrees,
+        # and recreates the snapshot directory.
+        self.store.cleanup_all()
+
+        # After cleanup_all: _pending_writes is empty, snapshot_dir
+        # exists and is empty.
+        assert pw_key not in self.store._pending_writes
+        snapshot_dir = self.base_dir / "_boundary_snapshots"
+        assert snapshot_dir.exists()
+        assert list(snapshot_dir.iterdir()) == []
+
+        # Now process the dequeued item — this is where the race
+        # manifests in production. Under the fix, the staleness check
+        # returns early. Under the buggy code, the writer mkdirs +
+        # writes the file into the freshly-recreated snapshot_dir.
+        self.store._process_one_write_item(item)
+
+        # Assertion: snapshot_dir must STILL be empty after
+        # processing the stale item.
+        children = list(snapshot_dir.iterdir())
+        assert children == [], (
+            f"Stale write item leaked files into cleanup_all'd "
+            f"snapshot_dir: {children}. The writer should have "
+            f"detected that its item was no longer in "
+            f"_pending_writes and skipped it."
+        )
 
 
 # ---------------------------------------------------------------------------

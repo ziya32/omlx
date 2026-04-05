@@ -172,6 +172,12 @@ class MockEnginePool:
     def release_engine(self, model_id: str) -> None:
         pass
 
+    def ensure_engine_alive(self, model_id: str, engine_ref) -> None:
+        # Tests never race with the process memory enforcer, so treat
+        # every engine reference as live. Mirrors the stub in
+        # test_server_endpoints.py::MockEnginePool.
+        pass
+
     def get_model_ids(self) -> List[str]:
         return [m["id"] for m in self._models]
 

@@ -330,3 +330,130 @@ class TestModelFallback:
         with pytest.raises(HTTPException) as exc_info:
             await get_engine("unknown-model", EngineType.EMBEDDING)
         assert exc_info.value.status_code == 404
+
+
+class TestUseEngineResolveOnce:
+    """Issue #7 (fixed): ``server.use_engine`` resolves the model id
+    EXACTLY ONCE at the outermost layer and passes the resolved id
+    through to ``get_engine`` via the ``resolved_id`` parameter.
+
+    Before the fix, ``server.use_engine`` resolved the id locally to
+    take an ``acquire_engine`` lease, then ``server.get_engine``
+    resolved again internally — if the alias map changed between the
+    two calls, the lease and the ``ensure_engine_alive`` check
+    operated on different ids. After the fix, both operations use
+    the same pre-resolved id, so any alias map churn cannot split
+    them.
+    """
+
+    @pytest.fixture(autouse=True)
+    def setup_server_state(self):
+        state = ServerState()
+        with patch("omlx.server._server_state", state):
+            self._state = state
+            yield
+
+    @pytest.mark.asyncio
+    async def test_resolve_called_once_and_all_ops_see_same_id(self):
+        """Even if ``pool.resolve_model_id`` would return different
+        values on consecutive calls, the fix guarantees it's invoked
+        exactly once and all three ops (acquire, ensure_engine_alive,
+        release) observe the same resolved id.
+        """
+        from omlx.server import use_engine
+
+        acquire_calls: list[str] = []
+        release_calls: list[str] = []
+        ensure_alive_calls: list[str] = []
+
+        pool = MagicMock()
+        # Rig resolve_model_id with TWO different return values.
+        # Under the fix we only consume the first; the second stays
+        # untouched, proving resolve is called exactly once.
+        pool.resolve_model_id = MagicMock(
+            side_effect=["alias-a", "alias-b"]
+        )
+
+        pool.acquire_engine = lambda mid: acquire_calls.append(mid)
+        pool.release_engine = lambda mid: release_calls.append(mid)
+        pool.ensure_engine_alive = lambda mid, eng: ensure_alive_calls.append(mid)
+
+        mock_engine = MagicMock()
+
+        async def get_engine_stub(model_id, *a, **kw):
+            return mock_engine
+
+        pool.get_engine = AsyncMock(side_effect=get_engine_stub)
+
+        self._state.engine_pool = pool
+        self._state.default_model = None
+
+        async with use_engine("my-alias", EngineType.LLM) as eng:
+            assert eng is mock_engine
+
+        # 1. resolve_model_id is called EXACTLY ONCE. The second
+        #    side_effect value ("alias-b") is never consumed.
+        assert pool.resolve_model_id.call_count == 1, (
+            f"Expected resolve_model_id to be called exactly once, got "
+            f"{pool.resolve_model_id.call_count}. "
+            f"The fix must pass resolved_id through to get_engine to "
+            f"skip the second resolve."
+        )
+
+        # 2. All three operations see the same resolved id ("alias-a").
+        assert acquire_calls == ["alias-a"]
+        assert ensure_alive_calls == ["alias-a"]
+        assert release_calls == ["alias-a"]
+
+        # 3. pool.get_engine received the resolved id (not the raw
+        #    alias), since server.use_engine passed resolved_id
+        #    through and server.get_engine honored it.
+        assert pool.get_engine.await_args.args[0] == "alias-a"
+
+    @pytest.mark.asyncio
+    async def test_chat_completion_handler_resolves_once(self):
+        """The same resolve-once invariant applies to the chat/completion
+        handler path: handlers call ``resolve_model_id()`` at the
+        module level, then ``get_engine_for_model(request.model,
+        resolved_id=resolved_model)`` — the convenience wrapper
+        threads ``resolved_id`` through to ``get_engine`` so no
+        second resolve happens.
+        """
+        from omlx.server import get_engine_for_model
+
+        pool = MagicMock()
+        pool.resolve_model_id = MagicMock(
+            side_effect=["resolved-once", "SHOULD-NOT-BE-CALLED"]
+        )
+
+        mock_engine = MagicMock()
+        from omlx.engine.batched import BatchedEngine
+        mock_engine.__class__ = BatchedEngine
+
+        async def get_engine_stub(model_id, *a, **kw):
+            return mock_engine
+
+        pool.get_engine = AsyncMock(side_effect=get_engine_stub)
+        pool.ensure_engine_alive = MagicMock()
+
+        self._state.engine_pool = pool
+        self._state.default_model = None
+
+        # Simulate what a chat handler does: resolve once, then call
+        # get_engine_for_model with resolved_id=resolved_model.
+        from omlx.server import resolve_model_id
+        resolved_model = resolve_model_id("my-alias") or "my-alias"
+        engine = await get_engine_for_model(
+            "my-alias", resolved_id=resolved_model
+        )
+        assert engine is mock_engine
+
+        # Only one resolve across the whole flow.
+        assert pool.resolve_model_id.call_count == 1, (
+            f"Handler path must resolve exactly once via "
+            f"resolve_model_id(), then pass resolved_id through to "
+            f"get_engine_for_model. Got "
+            f"{pool.resolve_model_id.call_count} resolves."
+        )
+        # pool.get_engine received the pre-resolved id.
+        assert pool.get_engine.await_args.args[0] == "resolved-once"

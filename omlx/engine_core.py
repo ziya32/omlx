@@ -22,6 +22,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Set, Union
 
 import mlx.core as mx
 
+from .exceptions import RequestAbortedError
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .scheduler import Scheduler, SchedulerConfig, SchedulerOutput
 from .output_collector import RequestOutputCollector, RequestStreamState
@@ -412,23 +413,37 @@ class EngineCore:
         Sends error output to all active collectors and marks requests
         for deferred abort in the scheduler. Cleanup is handled by
         the consumer (stream_outputs/generate).
+
+        The ``error`` field on the error RequestOutput carries a
+        sanitized, client-facing message — no internal flag names or
+        operator-only hints. Streaming handlers raise this as a typed
+        exception and translate to an SSE error chunk; non-streaming
+        handlers raise it via RequestAbortedError and the FastAPI
+        handler maps to HTTP 503. The ``new_text`` field is left
+        empty so handlers that still iterate the output (e.g. legacy
+        consumers) don't accidentally leak the error into assistant
+        content.
         """
         request_ids = list(self._output_collectors.keys())
+        # Client-facing error message — intentionally brief and
+        # operator-detail-free. Operators get the full story from the
+        # server logs; clients only see "retry, the server is under
+        # pressure".
+        public_error = (
+            "Request aborted due to server memory pressure. "
+            "Please retry the request."
+        )
         for rid in request_ids:
             self.scheduler.abort_request(rid)
             collector = self._output_collectors.get(rid)
             if collector is not None:
-                error_msg = (
-                    "Request aborted: process memory limit exceeded. "
-                    "Increase --max-process-memory or reduce context size."
-                )
                 collector.put(
                     RequestOutput(
                         request_id=rid,
                         finished=True,
                         finish_reason="error",
-                        new_text=f"\n\n[Error: {error_msg}]",
-                        error=error_msg,
+                        new_text="",
+                        error=public_error,
                     )
                 )
             event = self._finished_events.get(rid)
@@ -509,10 +524,28 @@ class EngineCore:
                     else:
                         output = collector.get_nowait() or await collector.get()
 
-                    yield output
-
                     if output.error:
-                        raise RuntimeError(output.error)
+                        # Raise a typed exception that the FastAPI
+                        # streaming handlers catch in their async-for
+                        # wrapping `except Exception:` blocks (e.g.
+                        # stream_chat_completion, stream_completion,
+                        # stream_anthropic_messages, stream_responses_api).
+                        # Those handlers then emit a proper SSE error
+                        # chunk + `data: [DONE]` and return cleanly —
+                        # the client sees a typed error object rather
+                        # than the raw error text embedded as assistant
+                        # content, and the final chunk carries a valid
+                        # OpenAI finish_reason.
+                        #
+                        # Note: we do NOT yield `output` before raising.
+                        # Yielding would let the handler emit the error
+                        # text as a content delta before the except
+                        # block runs, which is exactly the leak we are
+                        # avoiding here. The error payload travels
+                        # solely through the exception.
+                        raise RequestAbortedError(output.error)
+
+                    yield output
 
                     if output.finished:
                         break
@@ -594,7 +627,11 @@ class EngineCore:
             raise RuntimeError(f"No output for request {request_id}")
 
         if final_output.error:
-            raise RuntimeError(final_output.error)
+            # Propagate as a typed exception so the FastAPI exception
+            # handler can translate to HTTP 503 instead of falling
+            # through to the generic 500 handler. Typical trigger:
+            # process memory enforcer called abort_all_requests().
+            raise RequestAbortedError(final_output.error)
 
         return final_output
 

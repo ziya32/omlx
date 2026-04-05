@@ -112,9 +112,15 @@ def model_ids():
 TEST_API_KEY = "test-asr-long-audio-key"
 
 
-@pytest.fixture(scope="session")
-def server_app(model_ids):
-    """Start a real omlx server with ASR and embedding models."""
+@pytest_asyncio.fixture(loop_scope="session", scope="module")
+async def server_app(model_ids):
+    """Start a real omlx server with ASR and embedding models.
+
+    **Module-scoped** so the loaded ASR + embedding engines are torn
+    down as soon as the last test in this module finishes, rather
+    than persisting until the end of the whole pytest session and
+    coexisting with other integration modules' engine pools.
+    """
     from omlx.model_settings import ModelSettings, ModelSettingsManager
     from omlx.server import _server_state, app, init_server
 
@@ -134,16 +140,25 @@ def server_app(model_ids):
         _server_state.api_key = TEST_API_KEY
         _server_state.engine_pool.apply_settings_overrides(settings_mgr)
 
-        yield app
+        try:
+            yield app
+        finally:
+            # Drain in-flight work, stop background tasks, unload every
+            # engine, clear Metal cache.
+            if _server_state.engine_pool is not None:
+                try:
+                    await _server_state.engine_pool.shutdown()
+                except Exception:
+                    pass
+                _server_state.engine_pool = None
+            gc.collect()
+            try:
+                mx.clear_cache()
+            except Exception:
+                pass
 
-    gc.collect()
-    try:
-        mx.clear_cache()
-    except Exception:
-        pass
 
-
-@pytest_asyncio.fixture(loop_scope="session", scope="session")
+@pytest_asyncio.fixture(loop_scope="session", scope="module")
 async def client(server_app):
     """Async HTTP client for the real omlx server.
 

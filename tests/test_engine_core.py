@@ -396,7 +396,17 @@ class TestEngineCoreAbortRequest:
         Regression test: previously abort_request called _cleanup_request
         which reset the collector's asyncio.Event without waking waiters,
         causing stream_outputs to block forever.
+
+        The consumer must wake and terminate by raising
+        :class:`RequestAbortedError` (carrying the abort message).
+        Raising — rather than yielding the error output first and then
+        breaking — means the FastAPI streaming handlers' ``except
+        Exception`` blocks convert it into a proper SSE error event
+        instead of emitting the error text as an assistant content
+        delta. See docs/enforcer-eviction-review.md Issue 5.
         """
+        from omlx.exceptions import RequestAbortedError
+
         with patch("omlx.engine_core.get_registry") as mock_registry:
             mock_registry.return_value.acquire.return_value = True
 
@@ -409,10 +419,15 @@ class TestEngineCoreAbortRequest:
 
                 # Start consuming stream_outputs in a separate task
                 outputs = []
+                aborted_error: list[BaseException] = []
 
                 async def consume():
-                    async for output in engine.stream_outputs(request_id):
-                        outputs.append(output)
+                    try:
+                        async for output in engine.stream_outputs(request_id):
+                            outputs.append(output)
+                    except BaseException as e:
+                        aborted_error.append(e)
+                        raise
 
                 task = asyncio.create_task(consume())
                 # Let it enter await collector.get()
@@ -421,15 +436,22 @@ class TestEngineCoreAbortRequest:
                 # Abort from external context while consumer is waiting
                 await engine.abort_request(request_id)
 
-                # The task should complete (not hang forever)
-                # stream_outputs yields abort error then raises RuntimeError
-                with pytest.raises(RuntimeError, match="Request aborted"):
+                # Consumer must wake and terminate by raising
+                # RequestAbortedError — not hang forever, and not
+                # return normally.
+                with pytest.raises(RequestAbortedError) as exc_info:
                     await asyncio.wait_for(task, timeout=1.0)
 
-                # Verify abort error was received
-                assert len(outputs) == 1
-                assert outputs[0].finished is True
-                assert outputs[0].error == "Request aborted"
+                # The exception carries the abort message from
+                # abort_request's error RequestOutput.
+                assert "Request aborted" in str(exc_info.value)
+
+                # No outputs should have been yielded — stream_outputs
+                # raises BEFORE yielding the error RequestOutput so
+                # handlers don't leak it as a content delta.
+                assert outputs == []
+                assert len(aborted_error) == 1
+                assert isinstance(aborted_error[0], RequestAbortedError)
 
                 # stream_outputs' finally block should have cleaned up
                 assert request_id not in engine._output_collectors
@@ -687,8 +709,20 @@ class TestEngineCoreErrorPropagation:
                 engine.close()
 
     @pytest.mark.asyncio
-    async def test_stream_outputs_raises_on_error(self, mock_model, mock_tokenizer):
-        """Test stream_outputs raises RuntimeError when error output received."""
+    async def test_stream_outputs_raises_request_aborted_error_on_error_output(
+        self, mock_model, mock_tokenizer
+    ):
+        """stream_outputs raises :class:`RequestAbortedError` on error
+        output and does NOT yield the error chunk first.
+
+        This is the Option-A semantic for Issue 5: by raising instead
+        of yielding + breaking, the streaming handlers'
+        ``except Exception`` blocks convert the abort into a proper
+        SSE error event, and the error text never leaks into the
+        stream as an assistant content delta.
+        """
+        from omlx.exceptions import RequestAbortedError
+
         with patch("omlx.engine_core.get_registry") as mock_registry:
             mock_registry.return_value.acquire.return_value = True
 
@@ -702,7 +736,6 @@ class TestEngineCoreErrorPropagation:
                     sampling_params=SamplingParams(max_tokens=50),
                 )
 
-                # Put an error output into the collector
                 collector = engine._output_collectors[request_id]
                 error_output = RequestOutput(
                     request_id=request_id,
@@ -712,17 +745,39 @@ class TestEngineCoreErrorPropagation:
                 )
                 collector.put(error_output)
 
-                # stream_outputs should yield the error output then raise
-                with pytest.raises(RuntimeError, match="Memory limit exceeded"):
-                    async for _ in engine.stream_outputs(request_id):
-                        pass
+                # The iterator must raise and must not yield any
+                # output beforehand.
+                yielded: list = []
+                with pytest.raises(
+                    RequestAbortedError,
+                    match="Memory limit exceeded during prefill",
+                ):
+                    async for out in engine.stream_outputs(request_id):
+                        yielded.append(out)
+
+                assert yielded == [], (
+                    "stream_outputs must raise BEFORE yielding the "
+                    "error output so handlers don't leak the error "
+                    "text as a content delta"
+                )
             finally:
                 await engine.stop()
                 engine.close()
 
     @pytest.mark.asyncio
-    async def test_generate_raises_on_error(self, mock_model, mock_tokenizer):
-        """Test generate() raises RuntimeError when error output received."""
+    async def test_generate_raises_request_aborted_error(
+        self, mock_model, mock_tokenizer
+    ):
+        """generate() raises RequestAbortedError when its request is aborted.
+
+        Simulates the path taken when the process memory enforcer calls
+        abort_all_requests() mid-generate: an error RequestOutput is
+        pushed to the collector and the finished event is set. generate()
+        drains, sees final_output.error, and must raise RequestAbortedError
+        so the FastAPI exception handler can translate to HTTP 503.
+        """
+        from omlx.exceptions import RequestAbortedError
+
         with patch("omlx.engine_core.get_registry") as mock_registry:
             mock_registry.return_value.acquire.return_value = True
 
@@ -731,37 +786,40 @@ class TestEngineCoreErrorPropagation:
             try:
                 await engine.start()
 
-                request_id = await engine.add_request(
-                    prompt="Hello",
-                    sampling_params=SamplingParams(max_tokens=50),
-                )
+                # Fire abort in the background once generate() has
+                # registered its collector (this mirrors what
+                # abort_all_requests does — push error output + set event).
+                async def simulate_abort():
+                    for _ in range(200):
+                        if engine._output_collectors:
+                            break
+                        await asyncio.sleep(0.005)
+                    rid = next(iter(engine._output_collectors))
+                    engine._output_collectors[rid].put(
+                        RequestOutput(
+                            request_id=rid,
+                            finished=True,
+                            finish_reason="error",
+                            error=(
+                                "Request aborted: process memory "
+                                "limit exceeded."
+                            ),
+                        )
+                    )
+                    engine._finished_events[rid].set()
 
-                # Put an error output and set the finished event
-                collector = engine._output_collectors[request_id]
-                error_output = RequestOutput(
-                    request_id=request_id,
-                    finished=True,
-                    finish_reason="error",
-                    error="Memory limit exceeded during prefill",
-                )
-                collector.put(error_output)
+                abort_task = asyncio.create_task(simulate_abort())
 
-                event = engine._finished_events[request_id]
-                event.set()
+                with pytest.raises(
+                    RequestAbortedError,
+                    match="process memory limit exceeded",
+                ):
+                    await engine.generate(
+                        prompt="Hello",
+                        sampling_params=SamplingParams(max_tokens=50),
+                    )
 
-                # generate() internally waits on event then drains collector
-                # We need to call it in a way that bypasses add_request
-                # since the request is already added. Use _generate_from_id
-                # directly, but it doesn't exist. Instead, test the drain logic.
-                final_output = None
-                while True:
-                    output = collector.get_nowait()
-                    if output is None:
-                        break
-                    final_output = output
-
-                assert final_output is not None
-                assert final_output.error == "Memory limit exceeded during prefill"
+                await abort_task
             finally:
                 await engine.stop()
                 engine.close()
@@ -849,7 +907,14 @@ class TestEngineCoreAbortAllRequests:
 
     @pytest.mark.asyncio
     async def test_abort_all_requests(self, mock_model, mock_tokenizer):
-        """Test abort_all_requests() sends errors to all collectors."""
+        """Test abort_all_requests() sends errors to all collectors.
+
+        The error RequestOutput carries a sanitized public-facing
+        message in ``error`` but leaves ``new_text`` empty — the
+        error travels out through the typed ``RequestAbortedError``
+        that stream_outputs / generate raise, not via a content
+        delta. See docs/enforcer-eviction-review.md Issue 5.
+        """
         with patch("omlx.engine_core.get_registry") as mock_registry:
             mock_registry.return_value.acquire.return_value = True
 
@@ -874,11 +939,15 @@ class TestEngineCoreAbortAllRequests:
                         assert output is not None
                         assert output.finished is True
                         assert output.finish_reason == "error"
-                        assert "memory" in output.error.lower()
-                        # new_text should contain error message for SSE delivery
-                        assert output.new_text is not None
-                        assert "[Error:" in output.new_text
-                        assert "memory" in output.new_text.lower()
+                        # Public error message: client-facing, operator
+                        # hints stripped.
+                        assert "Request aborted" in output.error
+                        assert "memory pressure" in output.error.lower()
+                        assert "retry" in output.error.lower()
+                        assert "--max-process-memory" not in output.error
+                        # new_text must be empty — the error travels
+                        # via the typed exception, not via content.
+                        assert output.new_text == ""
 
                     # Finished events should be set
                     event = engine._finished_events.get(rid)

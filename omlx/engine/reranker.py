@@ -80,6 +80,11 @@ class RerankerEngine(BaseNonStreamingEngine):
             return
 
         logger.info(f"Stopping reranker engine: {self._model_name}")
+        # Mark terminal BEFORE clearing the model ref so any handler
+        # racing with stop() sees RequestAbortedError via
+        # _raise_if_aborted instead of a RuntimeError from the model
+        # guard. See docs/enforcer-eviction-review.md #4.
+        self._mark_stopped()
         self._model = None
 
         gc.collect()
@@ -113,6 +118,10 @@ class RerankerEngine(BaseNonStreamingEngine):
         Returns:
             RerankOutput with scores, sorted indices, and token count
         """
+        # Check abort FIRST so a handler racing with stop() sees the
+        # typed RequestAbortedError (→ HTTP 503) rather than the plain
+        # RuntimeError from the model guard (→ HTTP 500).
+        self._raise_if_aborted()
         if self._model is None:
             raise RuntimeError("Engine not started. Call start() first.")
 
@@ -133,6 +142,9 @@ class RerankerEngine(BaseNonStreamingEngine):
             output = await loop.run_in_executor(
                 get_mlx_executor(), _rerank_sync
             )
+            # Discard result if the enforcer aborted us while the MLX
+            # kernel was running on the executor thread.
+            self._raise_if_aborted()
 
             # Apply top_n filtering if specified
             if top_n is not None and top_n < len(output.indices):

@@ -391,6 +391,26 @@ class InsufficientMemoryError(EnginePoolError):
         super().__init__(message)
 
 
+class EngineEvictedError(EnginePoolError):
+    """Raised when an engine reference held by a request handler was
+    evicted by the process memory enforcer while the handler was still
+    using it.
+
+    Handlers see this after a get_engine() call when, during the
+    surrounding await, the enforcer aborted and unloaded the model to
+    stay under the soft memory limit. The request cannot continue on
+    the stale engine reference; the client should retry, at which
+    point the model will be reloaded.
+    """
+
+    def __init__(self, model_id: str):
+        self.model_id = model_id
+        super().__init__(
+            f"Engine for '{model_id}' was evicted due to memory "
+            f"pressure. Please retry the request."
+        )
+
+
 class ModelLoadingError(EnginePoolError):
     """Raised when a model load fails, times out, or is in cooldown."""
 

@@ -129,10 +129,11 @@ def _get_settings_manager():
 async def _use_engine(model_id: str):
     """Get an engine with eviction protection for the duration of the block.
 
-    Converts ModelNotFoundError to HTTP 404 so callers don't need to
-    handle it individually.
+    Converts ModelNotFoundError to HTTP 404 and EngineEvictedError
+    (raised by pool.ensure_engine_alive on the post-get-engine race
+    check) to HTTP 503 so callers don't need to handle them individually.
     """
-    from omlx.exceptions import ModelNotFoundError
+    from omlx.exceptions import EngineEvictedError, ModelNotFoundError
 
     pool = _get_engine_pool()
     sm = _get_settings_manager()
@@ -148,6 +149,14 @@ async def _use_engine(model_id: str):
 
     pool.acquire_engine(resolved)
     try:
+        # Close the race window between pool.get_engine's last yield
+        # and the caller touching `engine`: if the process memory
+        # enforcer unloaded the model in between, fail fast with 503
+        # instead of invoking methods on a stale reference.
+        try:
+            pool.ensure_engine_alive(resolved, engine)
+        except EngineEvictedError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         yield engine
     finally:
         pool.release_engine(resolved)

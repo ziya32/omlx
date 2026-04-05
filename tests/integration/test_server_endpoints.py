@@ -262,6 +262,11 @@ class MockEnginePool:
     def release_engine(self, model_id: str) -> None:
         pass
 
+    def ensure_engine_alive(self, model_id: str, engine_ref) -> None:
+        # Tests never race with the process memory enforcer, so treat
+        # every engine reference as live.
+        pass
+
     def get_model_ids(self) -> List[str]:
         return [m["id"] for m in self._models]
 
@@ -1132,3 +1137,495 @@ class TestErrorHandling:
         )
 
         assert response.status_code == 422
+
+
+class TestRequestAbortedErrorHandling:
+    """Tests for the FastAPI exception handler that translates
+    RequestAbortedError (raised by EngineCore.generate when the
+    process memory enforcer called abort_all_requests() mid-call)
+    into HTTP 503 with an OpenAI-compatible error body.
+    """
+
+    def test_chat_completions_abort_returns_503(self, client, mock_llm_engine):
+        """Non-streaming chat completions: engine.chat raising
+        RequestAbortedError must surface as HTTP 503 with an
+        OpenAI-shaped error envelope."""
+        from omlx.exceptions import RequestAbortedError
+
+        mock_llm_engine.chat = AsyncMock(
+            side_effect=RequestAbortedError(
+                "Request aborted: process memory limit exceeded. "
+                "Increase --max-process-memory or reduce context size."
+            )
+        )
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+            },
+        )
+
+        assert response.status_code == 503
+        data = response.json()
+        # OpenAI-style error envelope from _openai_error_body
+        assert "error" in data
+        assert "process memory limit exceeded" in data["error"]["message"]
+
+    def test_completions_abort_returns_503(self, client, mock_llm_engine):
+        """Non-streaming /v1/completions: engine.generate raising
+        RequestAbortedError must also surface as HTTP 503."""
+        from omlx.exceptions import RequestAbortedError
+
+        mock_llm_engine.generate = AsyncMock(
+            side_effect=RequestAbortedError(
+                "Request aborted: process memory limit exceeded."
+            )
+        )
+
+        response = client.post(
+            "/v1/completions",
+            json={
+                "model": "test-model",
+                "prompt": "Hello",
+            },
+        )
+
+        assert response.status_code == 503
+        data = response.json()
+        assert "error" in data
+        assert "process memory limit exceeded" in data["error"]["message"]
+
+
+class TestEngineEvictedErrorHandling:
+    """Tests for the handler-side hardening that translates
+    EngineEvictedError into HTTP 503.
+
+    Two entry points into server.get_engine can raise this exception:
+
+    1. `pool.get_engine(...)` itself raises — e.g. if the pool's
+       internal state detected a stale entry during load resolution.
+       Caught inside the existing try/except in server.get_engine at
+       the `except EngineEvictedError` branch.
+
+    2. `pool.ensure_engine_alive(model_id, engine)` raises after
+       `pool.get_engine(...)` returned successfully. This is the
+       specific race the hardening was added for: the process memory
+       enforcer nulled `entry.engine` between get_engine's last yield
+       and the handler's first engine method call.
+
+    Both paths must produce HTTP 503 with an OpenAI-shaped error body.
+    """
+
+    def test_chat_completions_ensure_engine_alive_race_returns_503(
+        self, client, mock_engine_pool
+    ):
+        """Race window: get_engine succeeds, then ensure_engine_alive
+        detects the enforcer evicted the engine before the handler
+        could use it. Must surface as HTTP 503."""
+        from omlx.exceptions import EngineEvictedError
+
+        def raise_evicted(model_id, engine_ref):
+            raise EngineEvictedError(model_id)
+
+        mock_engine_pool.ensure_engine_alive = raise_evicted
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+            },
+        )
+
+        assert response.status_code == 503
+        data = response.json()
+        assert "error" in data
+        assert "evicted" in data["error"]["message"].lower()
+        assert "retry" in data["error"]["message"].lower()
+
+
+@pytest.mark.integration
+class TestStoppedEngineReturns503:
+    """Issue #4 server-level: the narrow race where a handler captured
+    the engine reference, then ``BatchedEngine.stop()`` / non-streaming
+    engine ``stop()`` completed between ``ensure_engine_alive`` and the
+    handler invoking a method on the engine.
+
+    Fixed path: the engine raises ``RequestAbortedError`` rather than a
+    plain ``RuntimeError``, so ``request_aborted_handler`` in
+    ``server.py`` translates it to HTTP 503 with an OpenAI-shaped error
+    envelope instead of falling through to the generic 500 handler.
+    """
+
+    def test_chat_on_stopped_engine_returns_503(
+        self, client, mock_llm_engine
+    ):
+        """Chat completions: stopped-engine error → HTTP 503."""
+        from omlx.exceptions import RequestAbortedError
+
+        mock_llm_engine.chat = AsyncMock(
+            side_effect=RequestAbortedError(
+                "Engine for test-model has been stopped "
+                "due to memory pressure. Please retry the request."
+            )
+        )
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+            },
+        )
+
+        assert response.status_code == 503
+        data = response.json()
+        assert "error" in data
+        assert "stopped" in data["error"]["message"].lower()
+        assert "retry" in data["error"]["message"].lower()
+
+    def test_completions_on_stopped_engine_returns_503(
+        self, client, mock_llm_engine
+    ):
+        """Completions: stopped-engine error → HTTP 503."""
+        from omlx.exceptions import RequestAbortedError
+
+        mock_llm_engine.generate = AsyncMock(
+            side_effect=RequestAbortedError(
+                "Engine for test-model has been stopped "
+                "due to memory pressure. Please retry the request."
+            )
+        )
+
+        response = client.post(
+            "/v1/completions",
+            json={
+                "model": "test-model",
+                "prompt": "Hello",
+            },
+        )
+
+        assert response.status_code == 503
+        data = response.json()
+        assert "error" in data
+        assert "stopped" in data["error"]["message"].lower()
+
+
+@pytest.mark.integration
+class TestBatchedEngineStoppedRaisesTypedError:
+    """Issue #4 unit-level: BatchedEngine / VLMBatchedEngine must raise
+    :class:`RequestAbortedError` (not plain ``RuntimeError``) when a
+    method is called after ``stop()``. This is the underlying raise
+    site that ``request_aborted_handler`` depends on.
+
+    All four public async entry points — ``chat``, ``generate``,
+    ``stream_chat``, ``stream_generate`` — must honour the contract.
+    """
+
+    @pytest.mark.asyncio
+    async def test_chat_on_stopped_engine_raises_request_aborted_error(self):
+        from omlx.engine.batched import BatchedEngine
+        from omlx.exceptions import RequestAbortedError
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._stopped = True
+        engine._loaded = True
+
+        with pytest.raises(RequestAbortedError) as exc_info:
+            await engine.chat(
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        assert "test-model" in str(exc_info.value)
+        assert "stopped" in str(exc_info.value).lower()
+
+    @pytest.mark.asyncio
+    async def test_generate_on_stopped_engine_raises_request_aborted_error(
+        self,
+    ):
+        from omlx.engine.batched import BatchedEngine
+        from omlx.exceptions import RequestAbortedError
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._stopped = True
+        engine._loaded = True
+
+        with pytest.raises(RequestAbortedError) as exc_info:
+            await engine.generate(prompt="hello")
+        assert "test-model" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_stream_generate_on_stopped_engine_raises_request_aborted_error(
+        self,
+    ):
+        from omlx.engine.batched import BatchedEngine
+        from omlx.exceptions import RequestAbortedError
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._stopped = True
+        engine._loaded = True
+
+        with pytest.raises(RequestAbortedError) as exc_info:
+            async for _ in engine.stream_generate(prompt="hello"):
+                pass
+        assert "test-model" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_stream_chat_on_stopped_engine_raises_request_aborted_error(
+        self,
+    ):
+        from omlx.engine.batched import BatchedEngine
+        from omlx.exceptions import RequestAbortedError
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._stopped = True
+        engine._loaded = True
+
+        with pytest.raises(RequestAbortedError) as exc_info:
+            async for _ in engine.stream_chat(
+                messages=[{"role": "user", "content": "hi"}],
+            ):
+                pass
+        assert "test-model" in str(exc_info.value)
+
+
+@pytest.mark.integration
+class TestBaseNonStreamingEngineStoppedRaisesTypedError:
+    """Issue #4 for non-streaming engines: ``embed``, ``rerank``,
+    ``transcribe``, ``synthesize``, ``process`` must raise
+    :class:`RequestAbortedError` (not plain ``RuntimeError``) when the
+    engine has been stopped, because ``stop()`` sets the cooperative
+    abort flag and the ``_raise_if_aborted`` check is now ordered
+    before the ``_model is None`` guard. A handler racing with stop
+    therefore receives HTTP 503 instead of 500.
+    """
+
+    @pytest.mark.asyncio
+    async def test_embed_after_stop_raises_request_aborted_error(self):
+        from omlx.engine.embedding import EmbeddingEngine
+        from omlx.exceptions import RequestAbortedError
+        from unittest.mock import MagicMock, patch
+
+        with patch("omlx.engine.embedding.MLXEmbeddingModel"):
+            engine = EmbeddingEngine("fake-embed-model")
+            # Start with a model attached, then stop it. stop() must
+            # set the abort flag before clearing self._model.
+            engine._model = MagicMock()
+            await engine.stop()
+
+            with pytest.raises(RequestAbortedError) as exc_info:
+                await engine.embed(["hello"])
+            assert "fake-embed-model" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_rerank_after_stop_raises_request_aborted_error(self):
+        from omlx.engine.reranker import RerankerEngine
+        from omlx.exceptions import RequestAbortedError
+        from unittest.mock import MagicMock, patch
+
+        with patch("omlx.engine.reranker.MLXRerankerModel"):
+            engine = RerankerEngine("fake-rerank-model")
+            engine._model = MagicMock()
+            await engine.stop()
+
+            with pytest.raises(RequestAbortedError) as exc_info:
+                await engine.rerank(query="q", documents=["a"])
+            assert "fake-rerank-model" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_embed_still_raises_runtime_error_when_never_started(self):
+        """When the engine was never started at all (programming error,
+        not a race), the distinct RuntimeError("Engine not started")
+        still fires — the _aborted flag is clean, so _raise_if_aborted
+        is a no-op and the model guard runs.
+        """
+        from omlx.engine.embedding import EmbeddingEngine
+
+        engine = EmbeddingEngine("fake-embed-model")
+        # Never started — _model is None, _aborted is not set.
+        with pytest.raises(RuntimeError, match="Engine not started"):
+            await engine.embed(["hello"])
+
+
+@pytest.mark.integration
+class TestStreamingAbortSurfacesCleanSSEError:
+    """Issue #5 (fixed): when a stream is aborted mid-flight, the
+    client sees a clean SSE error event — never the error text
+    embedded as assistant content, and never a non-standard
+    ``finish_reason``.
+
+    Option A fix: ``engine_core.stream_outputs`` raises
+    :class:`RequestAbortedError` on error outputs instead of yielding
+    them and breaking. The streaming handlers already wrap their
+    ``async for`` loops in ``except Exception`` blocks that emit a
+    proper SSE error chunk + ``[DONE]`` and return. This is simulated
+    here by making the mock ``stream_chat`` / ``stream_generate``
+    raise the same typed exception the real engine would raise.
+
+    Also verifies the public/private error split: the client-facing
+    message must not contain operator-only hints like the
+    ``--max-process-memory`` CLI flag name.
+    """
+
+    def _parse_sse(self, body: str) -> list[dict]:
+        """Parse ``data: {...}`` SSE lines into parsed JSON dicts."""
+        import json
+
+        out: list[dict] = []
+        for line in body.splitlines():
+            if not line.startswith("data:"):
+                continue
+            payload = line[len("data:"):].strip()
+            if payload == "[DONE]" or not payload:
+                continue
+            try:
+                out.append(json.loads(payload))
+            except json.JSONDecodeError:
+                continue
+        return out
+
+    # Client-facing error message matching what
+    # engine_core.abort_all_requests puts into the error RequestOutput.
+    # Intentionally excludes operator-only hints like flag names.
+    PUBLIC_ABORT_MSG = (
+        "Request aborted due to server memory pressure. "
+        "Please retry the request."
+    )
+
+    def _chat_stream(self, client, mock_llm_engine):
+        from omlx.exceptions import RequestAbortedError
+
+        async def abort_stream(messages, **kwargs):
+            # Mirror the real stream_outputs path: raise BEFORE
+            # yielding anything. No error text leaks as content.
+            raise RequestAbortedError(self.PUBLIC_ABORT_MSG)
+            yield  # pragma: no cover — unreachable, keeps it a generator
+
+        mock_llm_engine.stream_chat = abort_stream
+        return client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True,
+            },
+        )
+
+    def _completion_stream(self, client, mock_llm_engine):
+        from omlx.exceptions import RequestAbortedError
+
+        async def abort_stream(prompt, **kwargs):
+            raise RequestAbortedError(self.PUBLIC_ABORT_MSG)
+            yield  # pragma: no cover
+
+        mock_llm_engine.stream_generate = abort_stream
+        return client.post(
+            "/v1/completions",
+            json={
+                "model": "test-model",
+                "prompt": "Hello",
+                "stream": True,
+            },
+        )
+
+    def test_chat_stream_aborted_has_no_content_leak(
+        self, client, mock_llm_engine
+    ):
+        """No chat content delta carries the abort message."""
+        response = self._chat_stream(client, mock_llm_engine)
+        assert response.status_code == 200
+        chunks = self._parse_sse(response.text)
+
+        for c in chunks:
+            if "error" in c:
+                continue
+            for choice in c.get("choices", []):
+                delta = choice.get("delta") or {}
+                content = delta.get("content") or ""
+                assert "Request aborted" not in content, (
+                    f"abort message leaked into content delta: {content!r}"
+                )
+                assert "memory" not in content.lower(), (
+                    f"abort-related text leaked into content delta: "
+                    f"{content!r}"
+                )
+
+    def test_chat_stream_aborted_emits_clean_sse_error_chunk(
+        self, client, mock_llm_engine
+    ):
+        """A dedicated SSE error chunk carries the public abort message,
+        followed by a ``[DONE]`` terminator. This is the path produced
+        by the streaming handler's ``except Exception:`` block.
+        """
+        response = self._chat_stream(client, mock_llm_engine)
+        assert response.status_code == 200
+        assert response.text.rstrip().endswith("data: [DONE]")
+
+        chunks = self._parse_sse(response.text)
+        error_chunks = [c for c in chunks if "error" in c]
+        assert len(error_chunks) == 1, (
+            f"Expected exactly one SSE error chunk, got "
+            f"{len(error_chunks)}. chunks={chunks}"
+        )
+        err = error_chunks[0]["error"]
+        # Public message is present, operator hints are not.
+        assert "Request aborted" in err["message"]
+        assert "retry" in err["message"].lower()
+
+    def test_chat_stream_aborted_public_error_has_no_operator_leaks(
+        self, client, mock_llm_engine
+    ):
+        """The public-facing abort message must not contain operator-only
+        hints (CLI flag names, ``--max-process-memory``, internal
+        variable names)."""
+        response = self._chat_stream(client, mock_llm_engine)
+        body = response.text
+        assert "--max-process-memory" not in body, (
+            "Operator-only CLI flag name leaked to client"
+        )
+        assert "_max_bytes" not in body
+
+    def test_chat_stream_aborted_no_nonstandard_finish_reason(
+        self, client, mock_llm_engine
+    ):
+        """The final chunk must NOT carry ``finish_reason="error"``.
+        With the fix, the handler returns early via its exception path
+        and never emits a final content-chunk finish_reason at all.
+        """
+        response = self._chat_stream(client, mock_llm_engine)
+        chunks = self._parse_sse(response.text)
+
+        valid = {"stop", "length", "tool_calls", "content_filter", None}
+        for c in chunks:
+            if "error" in c:
+                continue
+            for choice in c.get("choices", []):
+                fr = choice.get("finish_reason")
+                assert fr in valid, (
+                    f"Non-standard finish_reason={fr!r} leaked to "
+                    f"client in chunk: {c}"
+                )
+
+    def test_completion_stream_aborted_emits_clean_sse_error_chunk(
+        self, client, mock_llm_engine
+    ):
+        """Same invariants apply to ``/v1/completions`` streaming via
+        ``stream_completion`` — both handlers share the same
+        ``except Exception`` pattern."""
+        response = self._completion_stream(client, mock_llm_engine)
+        assert response.status_code == 200
+        assert response.text.rstrip().endswith("data: [DONE]")
+
+        chunks = self._parse_sse(response.text)
+        error_chunks = [c for c in chunks if "error" in c]
+        assert len(error_chunks) == 1
+        # No content-shaped chunk contains the abort message text.
+        for c in chunks:
+            if "error" in c:
+                continue
+            for choice in c.get("choices", []):
+                text = choice.get("text") or ""
+                assert "Request aborted" not in text, (
+                    f"abort message leaked into completion text: {text!r}"
+                )

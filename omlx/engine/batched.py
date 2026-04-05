@@ -14,6 +14,7 @@ from typing import Any
 
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
+from ..exceptions import RequestAbortedError
 from ..utils.tokenizer import get_tokenizer_config
 from .base import BaseEngine, GenerationOutput
 
@@ -434,7 +435,15 @@ class BatchedEngine(BaseEngine):
             GenerationOutput with complete text
         """
         if self._stopped:
-            raise RuntimeError(f"BatchedEngine for {self._model_name} has been stopped")
+            # Narrow race with ProcessMemoryEnforcer: a handler captured
+            # this engine reference before the enforcer's abort + unload,
+            # and ensure_engine_alive may not have tripped. Raise the
+            # typed exception so the FastAPI request_aborted_handler
+            # translates to HTTP 503 instead of falling through to 500.
+            raise RequestAbortedError(
+                f"Engine for {self._model_name} has been stopped "
+                f"due to memory pressure. Please retry the request."
+            )
         if not self._loaded:
             await self.start()
 
@@ -506,7 +515,15 @@ class BatchedEngine(BaseEngine):
             GenerationOutput with incremental text
         """
         if self._stopped:
-            raise RuntimeError(f"BatchedEngine for {self._model_name} has been stopped")
+            # Narrow race with ProcessMemoryEnforcer: a handler captured
+            # this engine reference before the enforcer's abort + unload,
+            # and ensure_engine_alive may not have tripped. Raise the
+            # typed exception so the FastAPI request_aborted_handler
+            # translates to HTTP 503 instead of falling through to 500.
+            raise RequestAbortedError(
+                f"Engine for {self._model_name} has been stopped "
+                f"due to memory pressure. Please retry the request."
+            )
         if not self._loaded:
             await self.start()
 
@@ -617,7 +634,15 @@ class BatchedEngine(BaseEngine):
             GenerationOutput with assistant response
         """
         if self._stopped:
-            raise RuntimeError(f"BatchedEngine for {self._model_name} has been stopped")
+            # Narrow race with ProcessMemoryEnforcer: a handler captured
+            # this engine reference before the enforcer's abort + unload,
+            # and ensure_engine_alive may not have tripped. Raise the
+            # typed exception so the FastAPI request_aborted_handler
+            # translates to HTTP 503 instead of falling through to 500.
+            raise RequestAbortedError(
+                f"Engine for {self._model_name} has been stopped "
+                f"due to memory pressure. Please retry the request."
+            )
         if not self._loaded:
             await self.start()
 
@@ -683,7 +708,15 @@ class BatchedEngine(BaseEngine):
             GenerationOutput with incremental text
         """
         if self._stopped:
-            raise RuntimeError(f"BatchedEngine for {self._model_name} has been stopped")
+            # Narrow race with ProcessMemoryEnforcer: a handler captured
+            # this engine reference before the enforcer's abort + unload,
+            # and ensure_engine_alive may not have tripped. Raise the
+            # typed exception so the FastAPI request_aborted_handler
+            # translates to HTTP 503 instead of falling through to 500.
+            raise RequestAbortedError(
+                f"Engine for {self._model_name} has been stopped "
+                f"due to memory pressure. Please retry the request."
+            )
         if not self._loaded:
             await self.start()
 

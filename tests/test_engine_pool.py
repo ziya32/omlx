@@ -1077,3 +1077,121 @@ class TestCrashDiagnosticSnapshot:
         dbg = snap["debug_pool"]
         assert "active_models" in dbg
         assert dbg["unloaded_count"] == 2
+
+
+class TestEngineEvictedErrorInvariant:
+    """Issue #3: document that EngineEvictedError is only raised by
+    ensure_engine_alive — never by pool.get_engine.
+
+    server.py and audio_routes.py wrap pool.get_engine calls with
+    `except EngineEvictedError:` branches that are dead code. These
+    tests codify the current invariant so any future change that adds
+    a raise inside pool.get_engine (which would make the catch live)
+    will flip a visible test failure and force a review of the
+    contract.
+
+    The invariant is important because handlers distinguish:
+      - ensure_engine_alive → race detector, must produce HTTP 503
+      - pool.get_engine → loader/resolver, produces ModelNotFoundError
+        / ModelTooLargeError / ModelLoadingError etc., never
+        EngineEvictedError.
+    """
+
+    def test_engine_evicted_error_only_raised_in_ensure_engine_alive(self):
+        """Static analysis: EngineEvictedError must be raised only from
+        ensure_engine_alive. Any other raise site in engine_pool.py
+        breaks the handler contract.
+        """
+        import ast
+        from pathlib import Path
+
+        path = Path(__file__).resolve().parent.parent / "omlx" / "engine_pool.py"
+        tree = ast.parse(path.read_text(), filename=str(path))
+
+        # Map of function qualified name -> list of raise sites of
+        # EngineEvictedError inside it.
+        class RaiseVisitor(ast.NodeVisitor):
+            def __init__(self):
+                self.raises: list[tuple[str, int]] = []
+                self._stack: list[str] = []
+
+            def visit_FunctionDef(self, node):
+                self._stack.append(node.name)
+                self.generic_visit(node)
+                self._stack.pop()
+
+            def visit_AsyncFunctionDef(self, node):
+                self._stack.append(node.name)
+                self.generic_visit(node)
+                self._stack.pop()
+
+            def visit_Raise(self, node):
+                exc = node.exc
+                name = None
+                if isinstance(exc, ast.Call) and isinstance(exc.func, ast.Name):
+                    name = exc.func.id
+                elif isinstance(exc, ast.Name):
+                    name = exc.id
+                if name == "EngineEvictedError":
+                    qual = ".".join(self._stack) if self._stack else "<module>"
+                    self.raises.append((qual, node.lineno))
+                self.generic_visit(node)
+
+        v = RaiseVisitor()
+        v.visit(tree)
+
+        # Every raise of EngineEvictedError in engine_pool.py must be
+        # inside ensure_engine_alive.
+        for qual, lineno in v.raises:
+            assert qual.endswith("ensure_engine_alive"), (
+                f"Unexpected EngineEvictedError raise at "
+                f"{path.name}:{lineno} inside {qual}. "
+                f"Only ensure_engine_alive is allowed to raise this. "
+                f"Adding it to pool.get_engine would make the "
+                f"currently-dead `except EngineEvictedError` branches "
+                f"in server.py and api/audio_routes.py live — those "
+                f"call sites must be reviewed first."
+            )
+        assert v.raises, (
+            "Expected at least one EngineEvictedError raise in "
+            "engine_pool.py (inside ensure_engine_alive)."
+        )
+
+    @pytest.mark.asyncio
+    async def test_pool_get_engine_does_not_raise_engine_evicted_error(
+        self, small_mock_model_dir
+    ):
+        """Runtime: calling pool.get_engine on a non-existent model
+        raises ModelNotFoundError, not EngineEvictedError. Also shows
+        that plain unloaded-entry access (entry.engine is None mid-call)
+        is handled internally without surfacing as EngineEvictedError.
+        """
+        from omlx.exceptions import EngineEvictedError, ModelNotFoundError
+
+        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+
+        # 1. Non-existent model: must raise ModelNotFoundError, not
+        #    EngineEvictedError.
+        with pytest.raises(ModelNotFoundError):
+            await pool.get_engine("no-such-model")
+
+        # 2. Calling get_engine on a discovered-but-unloaded entry
+        #    should not raise EngineEvictedError either. It will try
+        #    to load (and fail on the fake safetensors blob), but not
+        #    with EngineEvictedError.
+        try:
+            await pool.get_engine("model-a")
+        except EngineEvictedError:
+            pytest.fail(
+                "pool.get_engine raised EngineEvictedError — this breaks "
+                "the invariant that EngineEvictedError is only raised "
+                "by ensure_engine_alive. The currently-dead "
+                "`except EngineEvictedError` around pool.get_engine "
+                "call sites in server.py and api/audio_routes.py would "
+                "become live and must be reviewed."
+            )
+        except Exception:
+            # Any other exception type is fine — load will fail on
+            # the fake model blob, but that's expected.
+            pass

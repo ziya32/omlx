@@ -81,6 +81,11 @@ class STTEngine(BaseNonStreamingEngine):
             return
 
         logger.info(f"Stopping STT engine: {self._model_name}")
+        # Mark terminal BEFORE clearing the model ref so any handler
+        # racing with stop() sees RequestAbortedError via
+        # _raise_if_aborted instead of a RuntimeError from the model
+        # guard. See docs/enforcer-eviction-review.md #4.
+        self._mark_stopped()
         self._model = None
         gc.collect()
         loop = asyncio.get_running_loop()
@@ -112,6 +117,10 @@ class STTEngine(BaseNonStreamingEngine):
         Returns:
             TranscriptionOutput with transcribed text, language, duration, and segments
         """
+        # Check abort FIRST so a handler racing with stop() sees the
+        # typed RequestAbortedError (→ HTTP 503) rather than the plain
+        # RuntimeError from the model guard (→ HTTP 500).
+        self._raise_if_aborted()
         if self._model is None:
             raise RuntimeError("Engine not started. Call start() first.")
 
@@ -174,6 +183,7 @@ class STTEngine(BaseNonStreamingEngine):
 
         try:
             chunks = await loop.run_in_executor(executor, _load_and_split)
+            self._raise_if_aborted()
         except (ImportError, AttributeError, TypeError):
             # Model doesn't support split_audio_into_chunks (not Qwen3-ASR)
             # or has incompatible types (e.g. non-numeric sample_rate)
@@ -222,6 +232,9 @@ class STTEngine(BaseNonStreamingEngine):
             result, offset = await loop.run_in_executor(
                 executor, _transcribe_chunk
             )
+            # Abort between chunks — discards the current chunk result
+            # and aborts the whole multi-chunk transcription.
+            self._raise_if_aborted()
 
             all_texts.append(result.text or "")
 
@@ -327,6 +340,7 @@ class STTEngine(BaseNonStreamingEngine):
         result = await loop.run_in_executor(
             get_mlx_executor(), _transcribe_sync
         )
+        self._raise_if_aborted()
         if result.duration:
             self._total_audio_seconds += result.duration
         return result

@@ -178,12 +178,19 @@ def model_ids(model_dir):
     }
 
 
-@pytest.fixture(scope="session")
-def server_app(model_dir, model_ids):
+@pytest_asyncio.fixture(loop_scope="session", scope="module")
+async def server_app(model_dir, model_ids):
     """Initialize the real omlx server and return the FastAPI app.
 
     Models are NOT pre-loaded — the EnginePool loads them on demand
     via get_engine() and manages memory with LRU eviction.
+
+    **Module-scoped** so that loaded engines, the tempfile settings
+    directory, and Metal buffers are all released as soon as the last
+    test in this module finishes. Session scope would keep this pool
+    alive concurrently with other integration modules' fixtures — and
+    with the subprocess server spawned by test_exclusive_live_server.py
+    — causing double (or triple) memory usage.
     """
     from omlx.model_settings import ModelSettings, ModelSettingsManager
     from omlx.server import _server_state, app, init_server
@@ -209,17 +216,27 @@ def server_app(model_dir, model_ids):
         # Apply our overrides after init_server's own apply_settings_overrides
         _server_state.engine_pool.apply_settings_overrides(settings_mgr)
 
-        yield app
+        try:
+            yield app
+        finally:
+            # Drain in-flight work, stop background tasks, unload every
+            # engine, clear Metal cache — so the next integration module
+            # starts with a clean Metal state and doesn't accumulate
+            # memory on top of this one.
+            if _server_state.engine_pool is not None:
+                try:
+                    await _server_state.engine_pool.shutdown()
+                except Exception:
+                    pass
+                _server_state.engine_pool = None
+            gc.collect()
+            try:
+                mx.clear_cache()
+            except Exception:
+                pass
 
-    # Cleanup
-    gc.collect()
-    try:
-        mx.clear_cache()
-    except Exception:
-        pass
 
-
-@pytest_asyncio.fixture(loop_scope="session", scope="session")
+@pytest_asyncio.fixture(loop_scope="session", scope="module")
 async def client(server_app):
     """Async HTTP client sharing the session event loop.
 

@@ -152,11 +152,13 @@ from .engine.reranker import RerankerEngine
 from .engine.tts import TTSEngine
 from .engine_pool import EnginePool
 from .exceptions import (
+    EngineEvictedError,
     EnginePoolError,
     InsufficientMemoryError,
     ModelLoadingError,
     ModelNotFoundError,
     ModelTooLargeError,
+    RequestAbortedError,
 )
 from .model_discovery import format_size
 from .server_metrics import get_server_metrics, reset_server_metrics
@@ -577,6 +579,34 @@ async def validation_exception_handler(
     return JSONResponse(status_code=422, content=content)
 
 
+@app.exception_handler(RequestAbortedError)
+async def request_aborted_handler(
+    request: FastAPIRequest, exc: RequestAbortedError
+):
+    """Translate in-flight request aborts to HTTP 503.
+
+    Typical trigger: the process memory enforcer called
+    abort_all_requests() on an engine the handler was mid-call on,
+    so EngineCore.generate() raised RequestAbortedError with the
+    abort message. This handler only fires for non-streaming paths —
+    streaming paths deliver the error inside the SSE stream with
+    finish_reason="error" and terminate cleanly, because headers are
+    already flushed by the time the abort arrives.
+    """
+    message = str(exc) or "Request aborted"
+    logger.warning(
+        "%s %s → 503 (request aborted): %s",
+        request.method,
+        request.url.path,
+        message,
+    )
+    if _is_api_route(request):
+        content = _openai_error_body(message, 503)
+    else:
+        content = {"detail": message}
+    return JSONResponse(status_code=503, content=content)
+
+
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: FastAPIRequest, exc: Exception):
     """Log unhandled exceptions as 500 errors."""
@@ -654,6 +684,7 @@ app.add_middleware(DebugRequestLoggingMiddleware)
 async def get_engine(
     model_id: str | None = None,
     engine_type: EngineType = EngineType.LLM,
+    resolved_id: str | None = None,
 ) -> Union[BaseEngine, EmbeddingEngine, RerankerEngine]:
     """
     Get engine for the specified model and type.
@@ -663,6 +694,14 @@ async def get_engine(
     Args:
         model_id: Model ID to get engine for, or None for default (LLM only)
         engine_type: Type of engine to retrieve (LLM, EMBEDDING, or RERANKER)
+        resolved_id: Optional pre-resolved model ID. When provided,
+            skips the internal ``pool.resolve_model_id`` call so a
+            caller that already resolved (e.g. to take an
+            ``acquire_engine`` lease atomically BEFORE the
+            ``get_engine`` await) can guarantee that both the lease
+            and the ``ensure_engine_alive`` check operate on the
+            same id. See Issue 7 in
+            docs/enforcer-eviction-review.md.
 
     Returns:
         The loaded engine of the appropriate type
@@ -687,8 +726,13 @@ async def get_engine(
             detail="No model specified and no default model set"
         )
 
-    # Resolve alias to real model_id
-    model_id = pool.resolve_model_id(model_id, _server_state.settings_manager)
+    # Resolve alias to real model_id — unless the caller already
+    # resolved and passed the result in, in which case we must use
+    # that exact id to stay consistent with any lease they took.
+    if resolved_id is not None:
+        model_id = resolved_id
+    else:
+        model_id = pool.resolve_model_id(model_id, _server_state.settings_manager)
 
     try:
         engine = await pool.get_engine(model_id)
@@ -761,6 +805,16 @@ async def get_engine(
                 detail=f"Model '{model_id}' is not a TTS model."
             )
 
+    # Close the race window between pool.get_engine's last yield and
+    # the caller touching `engine`: the process memory enforcer may
+    # have evicted this model while we were running user-level
+    # validation above. Translating to 503 gives the client a clean
+    # retry signal instead of a silent hang on a stale reference.
+    try:
+        pool.ensure_engine_alive(model_id, engine)
+    except EngineEvictedError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
     return engine
 
 
@@ -786,9 +840,13 @@ async def use_engine(
     """
     pool = get_engine_pool()
 
-    # Resolve the model_id to find the right entry BEFORE awaiting
-    # get_engine, so the lease can be taken atomically before any
-    # event-loop yield.  See the Step 9b gate in _prepare_memory_for().
+    # Resolve the model_id ONCE up front so the lease, the
+    # ensure_engine_alive check inside get_engine, and the release all
+    # operate on the same id. If we re-resolved inside get_engine
+    # and the alias map mutated between the two calls, acquire/release
+    # would protect a different entry than the liveness check saw,
+    # leaking active_uses on one id and missing protection on the
+    # other. See Issue 7 in docs/enforcer-eviction-review.md.
     resolved_id = model_id
     if resolved_id is None:
         resolved_id = _server_state.default_model
@@ -802,7 +860,9 @@ async def use_engine(
     # pinned models and defer at Step 9b.
     pool.acquire_engine(resolved_id)
     try:
-        engine = await get_engine(model_id, engine_type)
+        engine = await get_engine(
+            model_id, engine_type, resolved_id=resolved_id
+        )
         yield engine
     finally:
         pool.release_engine(resolved_id)
@@ -827,7 +887,10 @@ async def _with_engine_guard(
         pool.release_engine(resolved_model_id)
 
 
-async def get_engine_for_model(model: str | None = None) -> BaseEngine:
+async def get_engine_for_model(
+    model: str | None = None,
+    resolved_id: str | None = None,
+) -> BaseEngine:
     """
     Get LLM engine for the specified model (or default).
 
@@ -835,6 +898,9 @@ async def get_engine_for_model(model: str | None = None) -> BaseEngine:
 
     Args:
         model: Model ID to get engine for, or None for default
+        resolved_id: Optional pre-resolved model ID — pass through to
+            ``get_engine`` so a caller that already resolved and
+            leased on the resolved id doesn't re-resolve here.
 
     Returns:
         The loaded engine
@@ -842,10 +908,13 @@ async def get_engine_for_model(model: str | None = None) -> BaseEngine:
     Raises:
         HTTPException: If model not found or memory error
     """
-    return await get_engine(model, EngineType.LLM)
+    return await get_engine(model, EngineType.LLM, resolved_id=resolved_id)
 
 
-async def get_embedding_engine(model: str) -> EmbeddingEngine:
+async def get_embedding_engine(
+    model: str,
+    resolved_id: str | None = None,
+) -> EmbeddingEngine:
     """
     Get embedding engine for the specified model.
 
@@ -853,6 +922,7 @@ async def get_embedding_engine(model: str) -> EmbeddingEngine:
 
     Args:
         model: Model ID to get engine for
+        resolved_id: Optional pre-resolved model ID.
 
     Returns:
         The loaded embedding engine
@@ -860,10 +930,13 @@ async def get_embedding_engine(model: str) -> EmbeddingEngine:
     Raises:
         HTTPException: If model not found, is not an embedding model, or memory error
     """
-    return await get_engine(model, EngineType.EMBEDDING)
+    return await get_engine(model, EngineType.EMBEDDING, resolved_id=resolved_id)
 
 
-async def get_reranker_engine(model: str) -> RerankerEngine:
+async def get_reranker_engine(
+    model: str,
+    resolved_id: str | None = None,
+) -> RerankerEngine:
     """
     Get reranker engine for the specified model.
 
@@ -871,6 +944,7 @@ async def get_reranker_engine(model: str) -> RerankerEngine:
 
     Args:
         model: Model ID to get engine for
+        resolved_id: Optional pre-resolved model ID.
 
     Returns:
         The loaded reranker engine
@@ -878,17 +952,23 @@ async def get_reranker_engine(model: str) -> RerankerEngine:
     Raises:
         HTTPException: If model not found, is not a reranker model, or memory error
     """
-    return await get_engine(model, EngineType.RERANKER)
+    return await get_engine(model, EngineType.RERANKER, resolved_id=resolved_id)
 
 
-async def get_asr_engine(model: str) -> STTEngine:
+async def get_asr_engine(
+    model: str,
+    resolved_id: str | None = None,
+) -> STTEngine:
     """Get ASR engine for the specified model."""
-    return await get_engine(model, EngineType.STT)
+    return await get_engine(model, EngineType.STT, resolved_id=resolved_id)
 
 
-async def get_tts_engine(model: str) -> TTSEngine:
+async def get_tts_engine(
+    model: str,
+    resolved_id: str | None = None,
+) -> TTSEngine:
     """Get TTS engine for the specified model."""
-    return await get_engine(model, EngineType.TTS)
+    return await get_engine(model, EngineType.TTS, resolved_id=resolved_id)
 
 
 def get_sampling_params(
@@ -1926,7 +2006,9 @@ async def create_completion(
     released = False
     try:
         load_start = time.perf_counter()
-        engine = await get_engine_for_model(request.model)
+        engine = await get_engine_for_model(
+            request.model, resolved_id=resolved_model
+        )
         model_load_duration = time.perf_counter() - load_start
 
         # Handle single prompt or list of prompts
@@ -2094,7 +2176,9 @@ async def create_chat_completion(
     released = False
     try:
         load_start = time.perf_counter()
-        engine = await get_engine_for_model(request.model)
+        engine = await get_engine_for_model(
+            request.model, resolved_id=resolved_model
+        )
         model_load_duration = time.perf_counter() - load_start
 
         # Get per-model settings
@@ -3296,7 +3380,9 @@ async def create_anthropic_message(
     pool.acquire_engine(resolved_model)
     released = False
     try:
-        engine = await get_engine_for_model(request.model)
+        engine = await get_engine_for_model(
+            request.model, resolved_id=resolved_model
+        )
 
         # Get per-model settings
         max_tool_result_tokens = None
@@ -3654,7 +3740,9 @@ async def create_response(
     released = False
     try:
         load_start = time.perf_counter()
-        engine = await get_engine_for_model(request.model)
+        engine = await get_engine_for_model(
+            request.model, resolved_id=resolved_model
+        )
         model_load_duration = time.perf_counter() - load_start
 
         current_input_messages = convert_responses_input_to_messages(request.input)

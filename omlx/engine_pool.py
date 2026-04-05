@@ -43,6 +43,7 @@ from .engine.sts import STSEngine
 from .engine.tts import TTSEngine
 from .engine.vlm import VLMBatchedEngine
 from .exceptions import (
+    EngineEvictedError,
     EnginePoolError,
     InsufficientMemoryError,
     ModelLoadingError,
@@ -849,17 +850,22 @@ class EnginePool:
         return None
 
     # -------------------------------------------------------------------------
-    # Engine use-counting (prevents eviction while request handlers use engine)
+    # Engine use-counting (prevents cooperative eviction while request
+    # handlers use an engine)
     #
     # Every server endpoint that holds a reference to an engine MUST bracket
-    # its use with acquire_engine / release_engine (or use_engine context
-    # manager).  This increments active_uses on the EngineEntry, which is
-    # checked by:
+    # its use with acquire_engine / release_engine (or the server-side
+    # ``server.use_engine`` context manager, which wraps them). This
+    # increments active_uses on the EngineEntry, which is checked by:
     #   - _prepare_memory_for   → drains instead of killing busy engines
     #   - _drain_monitor        → waits for active_uses==0 before unloading,
     #                             and extends the drain if timeout is hit
     #                             while active_uses > 0
-    #   - process_memory_enforcer → skips victims with active_uses > 0
+    #
+    # The process memory enforcer deliberately does NOT respect
+    # active_uses on its hard-limit eviction path; it aborts in-flight
+    # requests via the engine's abort_all_requests() contract and then
+    # unloads. See docs/enforcer-eviction-review.md #2.
     #
     # For non-streaming endpoints, use try/finally:
     #     pool.acquire_engine(resolved_id)
@@ -902,6 +908,24 @@ class EnginePool:
                     f"acquire_engine({model_id}) active_uses={entry.active_uses}"
                 )
 
+    def ensure_engine_alive(self, model_id: str, engine_ref: Any) -> None:
+        """Verify engine_ref is still the live engine for model_id.
+
+        The process memory enforcer may evict a model (setting
+        entry.engine = None and scheduling cleanup) at any event-loop
+        yield point after a handler captured an engine reference via
+        get_engine(). Handlers call this after such yields to detect
+        the race and fail fast with EngineEvictedError instead of
+        invoking methods on a stale engine.
+
+        Raises:
+            EngineEvictedError: if the entry was removed, or its
+                engine was replaced, or the engine was unloaded.
+        """
+        entry = self._entries.get(model_id)
+        if entry is None or entry.engine is not engine_ref:
+            raise EngineEvictedError(model_id)
+
     def release_engine(self, model_id: str) -> None:
         """Decrement active_uses for model_id.
 
@@ -930,24 +954,6 @@ class EnginePool:
                     # No running loop (shutdown) — signal directly
                     if event_to_signal is not None:
                         event_to_signal.set()
-
-    @asynccontextmanager
-    async def use_engine(self, model_id: str):
-        """Context manager: get_engine + acquire/release use-counting.
-
-        Usage:
-            async with pool.use_engine(model_id) as engine:
-                await engine.transcribe(...)
-
-        The engine is protected from eviction for the duration of the
-        context manager.
-        """
-        engine = await self.get_engine(model_id)
-        self.acquire_engine(model_id)
-        try:
-            yield engine
-        finally:
-            self.release_engine(model_id)
 
     # -------------------------------------------------------------------------
     # Exclusive pinned model support
@@ -1480,7 +1486,7 @@ class EnginePool:
 
         Prefers idle models over models with active requests or active
         use-count (request handlers that have acquired the engine via
-        acquire_engine/use_engine).
+        acquire_engine).
 
         Returns:
             Model ID of the candidate, or None if no evictable models exist.

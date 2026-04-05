@@ -240,6 +240,11 @@ class TTSEngine(BaseNonStreamingEngine):
             return
 
         logger.info(f"Stopping TTS engine: {self._model_name}")
+        # Mark terminal BEFORE clearing the model ref so any handler
+        # racing with stop() sees RequestAbortedError via
+        # _raise_if_aborted instead of a RuntimeError from the model
+        # guard. See docs/enforcer-eviction-review.md #4.
+        self._mark_stopped()
         self._model = None
 
         gc.collect()
@@ -323,6 +328,10 @@ class TTSEngine(BaseNonStreamingEngine):
         Returns:
             SpeechOutput with WAV audio bytes, sample_rate, and duration
         """
+        # Check abort FIRST so a handler racing with stop() sees the
+        # typed RequestAbortedError (→ HTTP 503) rather than the plain
+        # RuntimeError from the model guard (→ HTTP 500).
+        self._raise_if_aborted()
         if self._model is None:
             raise RuntimeError("Engine not started. Call start() first.")
 
@@ -358,6 +367,7 @@ class TTSEngine(BaseNonStreamingEngine):
                     ) from e
 
             gen = await loop.run_in_executor(executor, _create_gen)
+            self._raise_if_aborted()
 
             # Step 2: Consume one segment at a time, yielding executor between
             # each so LLM scheduler.step() calls can interleave
@@ -373,6 +383,9 @@ class TTSEngine(BaseNonStreamingEngine):
 
             while True:
                 seg = await loop.run_in_executor(executor, _next_seg, gen)
+                # Abort between segments — discards any already-computed
+                # segments and raises to the handler.
+                self._raise_if_aborted()
                 if seg is None:
                     break
                 segments.append(seg)
@@ -397,6 +410,7 @@ class TTSEngine(BaseNonStreamingEngine):
                 )
 
             result = await loop.run_in_executor(executor, _finalize, segments)
+            self._raise_if_aborted()
             self._total_audio_seconds += result.duration
             self._total_operations += 1
             self._total_processing_seconds += time.perf_counter() - start_time
@@ -433,6 +447,10 @@ class TTSEngine(BaseNonStreamingEngine):
         Yields:
             SpeechOutput for each audio segment
         """
+        # Check abort FIRST so a handler racing with stop() sees the
+        # typed RequestAbortedError (→ HTTP 503) rather than the plain
+        # RuntimeError from the model guard (→ HTTP 500).
+        self._raise_if_aborted()
         if self._model is None:
             raise RuntimeError("Engine not started. Call start() first.")
 
@@ -461,6 +479,7 @@ class TTSEngine(BaseNonStreamingEngine):
                     ) from e
 
             gen = await loop.run_in_executor(executor, _create_stream_gen)
+            self._raise_if_aborted()
 
             def _next_seg(g):
                 try:
@@ -482,9 +501,13 @@ class TTSEngine(BaseNonStreamingEngine):
 
             while True:
                 seg = await loop.run_in_executor(executor, _next_seg, gen)
+                # Abort between segments — terminates the stream on the
+                # very next yield point without serving a stale chunk.
+                self._raise_if_aborted()
                 if seg is None:
                     break
                 chunk = await loop.run_in_executor(executor, _segment_to_pcm, seg)
+                self._raise_if_aborted()
                 total_duration += chunk.duration
                 yield chunk
         finally:
