@@ -363,6 +363,8 @@ async def create_transcription(
     if model is None:
         raise HTTPException(status_code=400, detail="Model is required")
 
+    logger.info(f"Transcription [{req_id}] received: model={model}")
+
     pool = _get_engine_pool()
     model = _resolve_model(str(model))
 
@@ -466,6 +468,10 @@ async def create_speech(
     from omlx.exceptions import AudioError, ModelNotFoundError, VoiceCloningError
 
     req_id = str(uuid.uuid4())
+    logger.info(
+        f"Speech [{req_id}] received: model={request.model}, "
+        f"format={request.response_format}"
+    )
 
     fmt = request.response_format
     if fmt not in _SUPPORTED_FORMATS:
