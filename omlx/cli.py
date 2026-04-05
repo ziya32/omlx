@@ -174,7 +174,7 @@ def serve_command(args):
 
     # Enable native crash diagnostics (SIGABRT, SIGSEGV, SIGFPE, SIGBUS).
     # On Metal/MLX crashes (#511, #520), this dumps all Python thread
-    # tracebacks to the server log before the process terminates.
+    # tracebacks to the crash log before the process terminates.
     crash_log_path = log_dir / "crash.log"
     _crash_file = open(crash_log_path, "a")
     faulthandler.enable(file=_crash_file, all_threads=True)
