@@ -785,9 +785,10 @@ async def use_engine(
             output = await engine.embed(texts)
     """
     pool = get_engine_pool()
-    engine = await get_engine(model_id, engine_type)
 
-    # Resolve the model_id to find the right entry
+    # Resolve the model_id to find the right entry BEFORE awaiting
+    # get_engine, so the lease can be taken atomically before any
+    # event-loop yield.  See the Step 9b gate in _prepare_memory_for().
     resolved_id = model_id
     if resolved_id is None:
         resolved_id = _server_state.default_model
@@ -796,8 +797,12 @@ async def use_engine(
             resolved_id, _server_state.settings_manager
         )
 
+    # Acquire the lease BEFORE the get_engine await so any non-pinned
+    # loads arriving concurrently see active_uses > 0 on exclusive
+    # pinned models and defer at Step 9b.
     pool.acquire_engine(resolved_id)
     try:
+        engine = await get_engine(model_id, engine_type)
         yield engine
     finally:
         pool.release_engine(resolved_id)
@@ -1722,6 +1727,7 @@ async def create_embeddings(
     - Optional dimension reduction (with renormalization)
     """
     req_id = str(uuid.uuid4())
+    logger.info(f"Embedding [{req_id}] received: model={request.model}")
     oq_manager = getattr(_server_state, "oq_manager", None)
     if oq_manager and oq_manager.is_quantizing:
         raise HTTPException(
@@ -1834,6 +1840,7 @@ async def create_rerank(
     - Optional return_documents to include document text in response
     """
     req_id = str(uuid.uuid4())
+    logger.info(f"Rerank [{req_id}] received: model={request.model}")
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
         raise HTTPException(
             status_code=503,
@@ -1895,6 +1902,10 @@ async def create_completion(
 ):
     """Create a text completion."""
     req_id = str(uuid.uuid4())
+    logger.info(
+        f"Completion [{req_id}] received: model={request.model}, "
+        f"stream={request.stream}, max_tokens={request.max_tokens}"
+    )
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
         raise HTTPException(
             status_code=503,
@@ -1904,13 +1915,20 @@ async def create_completion(
     pool = get_engine_pool()
     resolved_model = resolve_model_id(request.model) or request.model
 
-    load_start = time.perf_counter()
-    engine = await get_engine_for_model(request.model)
-    model_load_duration = time.perf_counter() - load_start
-
+    # Acquire the engine lease BEFORE the get_engine await so that
+    # pinned+exclusive active_uses is bumped atomically before any
+    # event-loop yield. Otherwise a non-pinned load arriving during the
+    # await would see active_uses==0 and the Step 9b gate would skip,
+    # letting it race through _prepare_memory_for and start a model
+    # load on the single MLX executor thread — starving the VLM
+    # scheduler steps that are about to run.
     pool.acquire_engine(resolved_model)
     released = False
     try:
+        load_start = time.perf_counter()
+        engine = await get_engine_for_model(request.model)
+        model_load_duration = time.perf_counter() - load_start
+
         # Handle single prompt or list of prompts
         prompts = request.prompt if isinstance(request.prompt, list) else [request.prompt]
 
@@ -2069,13 +2087,16 @@ async def create_chat_completion(
     resolved_model = resolve_model_id(request.model) or request.model
     pool = get_engine_pool()
 
-    load_start = time.perf_counter()
-    engine = await get_engine_for_model(request.model)
-    model_load_duration = time.perf_counter() - load_start
-
+    # Acquire the engine lease BEFORE awaiting get_engine so that
+    # pinned+exclusive active_uses is bumped atomically before any
+    # event-loop yield.  See the Step 9b gate in _prepare_memory_for().
     pool.acquire_engine(resolved_model)
     released = False
     try:
+        load_start = time.perf_counter()
+        engine = await get_engine_for_model(request.model)
+        model_load_duration = time.perf_counter() - load_start
+
         # Get per-model settings
         max_tool_result_tokens = None
         merged_ct_kwargs = {}
@@ -3253,12 +3274,11 @@ async def create_anthropic_message(
     Streaming is supported with `stream: true`.
     """
     req_id = str(uuid.uuid4())
-    if __debug__:
-        logger.debug(
-            f"Anthropic Messages request: model={request.model}, "
-            f"messages={len(request.messages)}, stream={request.stream}, "
-            f"max_tokens={request.max_tokens}"
-        )
+    logger.info(
+        f"Anthropic message [{req_id}] received: model={request.model}, "
+        f"messages={len(request.messages)}, stream={request.stream}, "
+        f"max_tokens={request.max_tokens}"
+    )
 
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
         raise HTTPException(
@@ -3270,11 +3290,14 @@ async def create_anthropic_message(
     resolved_model = resolve_model_id(request.model) or request.model
     pool = get_engine_pool()
 
-    engine = await get_engine_for_model(request.model)
-
+    # Acquire the engine lease BEFORE awaiting get_engine so that
+    # pinned+exclusive active_uses is bumped atomically before any
+    # event-loop yield.  See the Step 9b gate in _prepare_memory_for().
     pool.acquire_engine(resolved_model)
     released = False
     try:
+        engine = await get_engine_for_model(request.model)
+
         # Get per-model settings
         max_tool_result_tokens = None
         merged_ct_kwargs = {}
@@ -3611,27 +3634,29 @@ async def create_response(
 ):
     """Create a response (OpenAI Responses API)."""
     req_id = str(uuid.uuid4())
+    logger.info(
+        f"Responses API [{req_id}] received: model={request.model}, "
+        f"stream={request.stream}"
+    )
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
         raise HTTPException(
             status_code=503,
             detail="Server is busy with oQ quantization. Please try again after quantization completes.",
         )
 
-    if __debug__:
-        logger.debug(
-            f"Responses API request: model={request.model}, stream={request.stream}"
-        )
-
     resolved_model = resolve_model_id(request.model) or request.model
     pool = get_engine_pool()
 
-    load_start = time.perf_counter()
-    engine = await get_engine_for_model(request.model)
-    model_load_duration = time.perf_counter() - load_start
-
+    # Acquire the engine lease BEFORE awaiting get_engine so that
+    # pinned+exclusive active_uses is bumped atomically before any
+    # event-loop yield.  See the Step 9b gate in _prepare_memory_for().
     pool.acquire_engine(resolved_model)
     released = False
     try:
+        load_start = time.perf_counter()
+        engine = await get_engine_for_model(request.model)
+        model_load_duration = time.perf_counter() - load_start
+
         current_input_messages = convert_responses_input_to_messages(request.input)
 
         # Build previous context from previous_response_id

@@ -617,7 +617,46 @@ class EnginePool:
                             self._refresh_vision_limits(entry)
                             return entry.engine
                     else:
-                        return entry.engine
+                        # Non-pinned fast path (Option A / Step 9b extended).
+                        # Before returning an already-loaded non-pinned engine,
+                        # check whether any exclusive pinned model is currently
+                        # holding its lease (active_uses > 0).  If so, defer
+                        # this request — same rationale as Step 9b's load-time
+                        # gate in _prepare_memory_for: the MLX executor is
+                        # single-threaded, so any non-pinned inference work
+                        # interleaves with the exclusive model's scheduler
+                        # steps on the same thread.  The load-time gate alone
+                        # isn't enough because already-loaded models skip
+                        # _prepare_memory_for entirely and would run freely
+                        # on the shared executor during VLM inference.
+                        #
+                        # Safety: the waiter holds no lease on this entry, so
+                        # _clear_for_exclusive on the other side is free to
+                        # evict it while we wait.  When exclusive_idle fires
+                        # and the loop re-enters, if our entry has been
+                        # evicted the state will now be UNLOADED and we fall
+                        # through to the normal load path — the request
+                        # reloads from SSD and completes.
+                        contention_event: asyncio.Event | None = None
+                        for _mid, _e in self._entries.items():
+                            if (
+                                _e.exclusive
+                                and _e.is_pinned
+                                and _e.active_uses > 0
+                                and _e.exclusive_idle is not None
+                            ):
+                                contention_event = _e.exclusive_idle
+                                break
+                        if contention_event is not None:
+                            logger.debug(
+                                f"get_engine({model_id}) non-pinned deferred: "
+                                f"exclusive model has active_uses>0"
+                            )
+                            event = contention_event
+                            wait_target = "exclusive_contention"
+                            # Don't set should_load — fall through to wait path.
+                        else:
+                            return entry.engine
 
                 elif entry.state == EngineState.LOADING:
                     # Someone else is loading this model — wait for them
