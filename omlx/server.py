@@ -1615,6 +1615,64 @@ async def _with_sse_keepalive(
             await ait.aclose()
 
 
+async def _with_json_keepalive(
+    http_request: Optional["FastAPIRequest"],
+    coro,
+    interval: float = 10.0,
+    disconnect_poll: float = 2.0,
+) -> AsyncIterator[str]:
+    """Wrap a coroutine to send keepalive spaces while waiting for completion.
+
+    Non-streaming response bodies are buffered until the handler returns,
+    so a long prefill can blow past client/proxy read timeouts before any
+    bytes hit the wire.  This wrapper turns the response into a stream
+    that emits a leading space (then more spaces every ``interval`` s)
+    while the underlying coroutine runs.  JSON parsers ignore leading
+    whitespace, so the final response parses normally on the client.
+
+    Polls ``http_request.is_disconnected()`` every ``disconnect_poll`` s
+    so a client read-timeout at the proxy cancels the engine task instead
+    of running it to completion and discarding the result.
+    """
+    task = asyncio.ensure_future(coro)
+    keepalive_elapsed = 0.0
+
+    yield " "
+
+    try:
+        while not task.done():
+            done, _ = await asyncio.wait({task}, timeout=disconnect_poll)
+            if done:
+                break
+            if http_request is not None:
+                try:
+                    disconnected = await http_request.is_disconnected()
+                    if disconnected:
+                        logger.info("Client disconnected during non-streaming response, cancelling")
+                        task.cancel()
+                        try:
+                            await task
+                        except (asyncio.CancelledError, StopAsyncIteration):
+                            pass
+                        return
+                except Exception:
+                    pass
+            keepalive_elapsed += disconnect_poll
+            if keepalive_elapsed >= interval:
+                keepalive_elapsed = 0.0
+                yield " "
+        result = task.result()
+        if result is not None:
+            yield result
+    finally:
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, StopAsyncIteration):
+                pass
+
+
 async def _run_with_disconnect_guard(
     http_request: FastAPIRequest,
     coro,
@@ -2090,13 +2148,9 @@ async def create_completion(
                 media_type="text/event-stream",
             )
 
-        # Non-streaming response with timing
-        start_time = time.perf_counter()
-        choices = []
-        total_completion_tokens = 0
-        total_prompt_tokens = 0
-        total_cached_tokens = 0
-
+        # Non-streaming response with keepalive during prefill.  Hand
+        # engine ownership to _build_completion, whose finally releases
+        # the lease after generation + post-processing complete.
         temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold = get_sampling_params(
             request.temperature, request.top_p, request.model,
             req_min_p=getattr(request, 'min_p', None),
@@ -2107,66 +2161,81 @@ async def create_completion(
             req_xtc_threshold=getattr(request, 'xtc_threshold', None),
         )
 
-        for i, prompt in enumerate(prompts):
-            output = await _run_with_disconnect_guard(
-                http_request,
-                engine.generate(
-                    prompt=prompt,
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=top_k,
-                    min_p=min_p,
-                    repetition_penalty=repetition_penalty,
-                    presence_penalty=presence_penalty,
-                    frequency_penalty=frequency_penalty,
-                    xtc_probability=xtc_probability,
-                    xtc_threshold=xtc_threshold,
-                    stop=request.stop,
-                    seed=request.seed,
-                    request_id=req_id,
-                ),
-            )
-            if output is None:
-                return  # Client disconnected
+        async def _build_completion() -> Optional[str]:
+            try:
+                start_time = time.perf_counter()
+                choices = []
+                total_completion_tokens = 0
+                total_prompt_tokens = 0
+                total_cached_tokens = 0
 
-            choices.append(CompletionChoice(
-                index=i,
-                text=output.text,
-                finish_reason=output.finish_reason,
-            ))
-            total_completion_tokens += output.completion_tokens
-            total_prompt_tokens += output.prompt_tokens
-            total_cached_tokens += output.cached_tokens
+                for i, prompt in enumerate(prompts):
+                    output = await _run_with_disconnect_guard(
+                        http_request,
+                        engine.generate(
+                            prompt=prompt,
+                            max_tokens=max_tokens,
+                            temperature=temperature,
+                            top_p=top_p,
+                            top_k=top_k,
+                            min_p=min_p,
+                            repetition_penalty=repetition_penalty,
+                            presence_penalty=presence_penalty,
+                            frequency_penalty=frequency_penalty,
+                            xtc_probability=xtc_probability,
+                            xtc_threshold=xtc_threshold,
+                            stop=request.stop,
+                            seed=request.seed,
+                            request_id=req_id,
+                        ),
+                    )
+                    if output is None:
+                        return None  # Client disconnected
+
+                    choices.append(CompletionChoice(
+                        index=i,
+                        text=output.text,
+                        finish_reason=output.finish_reason,
+                    ))
+                    total_completion_tokens += output.completion_tokens
+                    total_prompt_tokens += output.prompt_tokens
+                    total_cached_tokens += output.cached_tokens
+
+                elapsed = time.perf_counter() - start_time
+                tokens_per_sec = total_completion_tokens / elapsed if elapsed > 0 else 0
+                logger.info(f"Completion [{req_id}]: {total_completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)")
+
+                get_server_metrics().record_request_complete(
+                    prompt_tokens=total_prompt_tokens,
+                    completion_tokens=total_completion_tokens,
+                    cached_tokens=total_cached_tokens,
+                    generation_duration=elapsed,
+                    model_id=request.model,
+                )
+
+                return CompletionResponse(
+                    model=request.model,
+                    choices=choices,
+                    usage=Usage(
+                        prompt_tokens=total_prompt_tokens,
+                        completion_tokens=total_completion_tokens,
+                        total_tokens=total_prompt_tokens + total_completion_tokens,
+                        prompt_tokens_details=PromptTokensDetails(
+                            cached_tokens=total_cached_tokens,
+                        ),
+                    ),
+                ).model_dump_json()
+            finally:
+                pool.release_engine(resolved_model)
+
+        released = True  # _build_completion takes ownership of the lease
+        return StreamingResponse(
+            _with_json_keepalive(http_request, _build_completion()),
+            media_type="application/json",
+        )
     finally:
         if not released:
             pool.release_engine(resolved_model)
-
-    elapsed = time.perf_counter() - start_time
-    tokens_per_sec = total_completion_tokens / elapsed if elapsed > 0 else 0
-    logger.info(f"Completion [{req_id}]: {total_completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)")
-
-    # Record metrics
-    get_server_metrics().record_request_complete(
-        prompt_tokens=total_prompt_tokens,
-        completion_tokens=total_completion_tokens,
-        cached_tokens=total_cached_tokens,
-        generation_duration=elapsed,
-        model_id=request.model,
-    )
-
-    return CompletionResponse(
-        model=request.model,
-        choices=choices,
-        usage=Usage(
-            prompt_tokens=total_prompt_tokens,
-            completion_tokens=total_completion_tokens,
-            total_tokens=total_prompt_tokens + total_completion_tokens,
-            prompt_tokens_details=PromptTokensDetails(
-                cached_tokens=total_cached_tokens,
-            ),
-        ),
-    )
 
 
 @app.post("/v1/chat/completions")
@@ -2440,102 +2509,108 @@ async def create_chat_completion(
                 media_type="text/event-stream",
             )
 
-        # Non-streaming response with timing
-        start_time = time.perf_counter()
+        # Non-streaming response with keepalive during prefill.  Hand
+        # engine ownership to _build_chat_completion, whose finally
+        # releases the lease after generation + post-processing.
+        async def _build_chat_completion() -> Optional[str]:
+            try:
+                start_time = time.perf_counter()
 
-        output = await _run_with_disconnect_guard(
-            http_request,
-            engine.chat(messages=messages, request_id=req_id, **chat_kwargs),
+                output = await _run_with_disconnect_guard(
+                    http_request,
+                    engine.chat(messages=messages, request_id=req_id, **chat_kwargs),
+                )
+                if output is None:
+                    return None  # Client disconnected
+
+                elapsed = time.perf_counter() - start_time
+                tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
+                in_tokens_per_sec = output.prompt_tokens / elapsed if elapsed > 0 else 0
+                logger.info(f"✅ Chat completion [{req_id}]: in={output.prompt_tokens} (cached={output.cached_tokens}, {in_tokens_per_sec:.1f} in tok/s) out={output.completion_tokens} in {elapsed:.2f}s ({tokens_per_sec:.1f} out tok/s)")
+
+                get_server_metrics().record_request_complete(
+                    prompt_tokens=output.prompt_tokens,
+                    completion_tokens=output.completion_tokens,
+                    cached_tokens=output.cached_tokens,
+                    generation_duration=elapsed,
+                    model_id=request.model,
+                )
+
+                # Separate thinking from content
+                raw_text = clean_special_tokens(output.text) if output.text else ""
+                thinking_content, regular_content = extract_thinking(raw_text)
+                cleaned_thinking = sanitize_tool_call_markup(thinking_content, engine.tokenizer)
+
+                # For Harmony (gpt-oss) models, tool_calls are already extracted by the parser
+                # For other models, parse from text output
+                if engine.model_type == "gpt_oss" and output.tool_calls:
+                    from .api.openai_models import ToolCall, FunctionCall
+                    tool_calls = [
+                        ToolCall(
+                            id=f"call_{uuid.uuid4().hex[:8]}",
+                            type="function",
+                            function=FunctionCall(
+                                name=tc["name"],
+                                arguments=tc["arguments"],
+                            ),
+                        )
+                        for tc in output.tool_calls
+                    ]
+                    cleaned_text = regular_content
+                else:
+                    extraction = extract_tool_calls_with_thinking(
+                        thinking_content,
+                        regular_content,
+                        tokenizer=engine.tokenizer,
+                        tools=tools_for_template,
+                    )
+                    cleaned_text = extraction.cleaned_text
+                    tool_calls = extraction.tool_calls
+                    cleaned_thinking = extraction.cleaned_thinking
+
+                # Process response_format if specified
+                if response_format and not tool_calls:
+                    cleaned_text, parsed_json, is_valid, error = parse_json_output(
+                        cleaned_text or regular_content,
+                        response_format
+                    )
+                    if parsed_json is not None:
+                        cleaned_text = json.dumps(parsed_json)
+                    if not is_valid:
+                        logger.warning(f"JSON validation failed: {error}")
+
+                finish_reason = "tool_calls" if tool_calls else output.finish_reason
+
+                return ChatCompletionResponse(
+                    model=request.model,
+                    choices=[ChatCompletionChoice(
+                        message=AssistantMessage(
+                            content=cleaned_text.strip() if cleaned_text else None,
+                            reasoning_content=cleaned_thinking if cleaned_thinking else None,
+                            tool_calls=tool_calls,
+                        ),
+                        finish_reason=finish_reason,
+                    )],
+                    usage=Usage(
+                        prompt_tokens=output.prompt_tokens,
+                        completion_tokens=output.completion_tokens,
+                        total_tokens=output.prompt_tokens + output.completion_tokens,
+                        prompt_tokens_details=PromptTokensDetails(
+                            cached_tokens=output.cached_tokens,
+                        ),
+                    ),
+                ).model_dump_json()
+            finally:
+                pool.release_engine(resolved_model)
+
+        released = True  # _build_chat_completion takes ownership of the lease
+        return StreamingResponse(
+            _with_json_keepalive(http_request, _build_chat_completion()),
+            media_type="application/json",
         )
-        if output is None:
-            return  # Client disconnected
     finally:
         if not released:
             pool.release_engine(resolved_model)
-
-    elapsed = time.perf_counter() - start_time
-    tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
-    in_tokens_per_sec = output.prompt_tokens / elapsed if elapsed > 0 else 0
-    logger.info(f"✅ Chat completion [{req_id}]: in={output.prompt_tokens} (cached={output.cached_tokens}, {in_tokens_per_sec:.1f} in tok/s) out={output.completion_tokens} in {elapsed:.2f}s ({tokens_per_sec:.1f} out tok/s)")
-
-    # Record metrics
-    get_server_metrics().record_request_complete(
-        prompt_tokens=output.prompt_tokens,
-        completion_tokens=output.completion_tokens,
-        cached_tokens=output.cached_tokens,
-        generation_duration=elapsed,
-        model_id=request.model,
-    )
-
-    # Separate thinking from content
-    raw_text = clean_special_tokens(output.text) if output.text else ""
-    thinking_content, regular_content = extract_thinking(raw_text)
-    cleaned_thinking = sanitize_tool_call_markup(thinking_content, engine.tokenizer)
-
-    # For Harmony (gpt-oss) models, tool_calls are already extracted by the parser
-    # For other models, parse from text output
-    if engine.model_type == "gpt_oss" and output.tool_calls:
-        # Harmony model with tool calls - convert format
-        from .api.openai_models import ToolCall, FunctionCall
-        tool_calls = [
-            ToolCall(
-                id=f"call_{uuid.uuid4().hex[:8]}",
-                type="function",
-                function=FunctionCall(
-                    name=tc["name"],
-                    arguments=tc["arguments"],
-                ),
-            )
-            for tc in output.tool_calls
-        ]
-        cleaned_text = regular_content
-    else:
-        # Parse tool calls from regular content, falling back to thinking
-        # content for small models that emit tool calls inside <think> blocks
-        extraction = extract_tool_calls_with_thinking(
-            thinking_content,
-            regular_content,
-            tokenizer=engine.tokenizer,
-            tools=tools_for_template,
-        )
-        cleaned_text = extraction.cleaned_text
-        tool_calls = extraction.tool_calls
-        cleaned_thinking = extraction.cleaned_thinking
-
-    # Process response_format if specified
-    if response_format and not tool_calls:
-        cleaned_text, parsed_json, is_valid, error = parse_json_output(
-            cleaned_text or regular_content,
-            response_format
-        )
-        if parsed_json is not None:
-            # Return JSON as string
-            cleaned_text = json.dumps(parsed_json)
-        if not is_valid:
-            logger.warning(f"JSON validation failed: {error}")
-
-    # Determine finish reason
-    finish_reason = "tool_calls" if tool_calls else output.finish_reason
-
-    return ChatCompletionResponse(
-        model=request.model,
-        choices=[ChatCompletionChoice(
-            message=AssistantMessage(
-                content=cleaned_text.strip() if cleaned_text else None,
-                reasoning_content=cleaned_thinking if cleaned_thinking else None,
-                tool_calls=tool_calls,
-            ),
-            finish_reason=finish_reason,
-        )],
-        usage=Usage(
-            prompt_tokens=output.prompt_tokens,
-            completion_tokens=output.completion_tokens,
-            total_tokens=output.prompt_tokens + output.completion_tokens,
-            prompt_tokens_details=PromptTokensDetails(
-                cached_tokens=output.cached_tokens,
-            ),
-        ),
-    )
 
 
 def _inject_json_instruction(messages: list, instruction: str) -> list:
@@ -3664,95 +3739,102 @@ async def create_anthropic_message(
                 media_type="text/event-stream",
             )
 
-        # Non-streaming response
-        start_time = time.perf_counter()
+        # Non-streaming response with keepalive during prefill.  Hand
+        # engine ownership to _build_anthropic_message, whose finally
+        # releases the lease after generation + post-processing.
+        async def _build_anthropic_message() -> Optional[str]:
+            try:
+                start_time = time.perf_counter()
 
-        output = await _run_with_disconnect_guard(
-            http_request,
-            engine.chat(messages=messages, request_id=req_id, **chat_kwargs),
+                output = await _run_with_disconnect_guard(
+                    http_request,
+                    engine.chat(messages=messages, request_id=req_id, **chat_kwargs),
+                )
+                if output is None:
+                    return None  # Client disconnected
+
+                elapsed = time.perf_counter() - start_time
+                tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
+                logger.info(
+                    f"Anthropic message [{req_id}]: {output.completion_tokens} tokens in {elapsed:.2f}s "
+                    f"({tokens_per_sec:.1f} tok/s)"
+                )
+
+                get_server_metrics().record_request_complete(
+                    prompt_tokens=output.prompt_tokens,
+                    completion_tokens=output.completion_tokens,
+                    cached_tokens=output.cached_tokens,
+                    generation_duration=elapsed,
+                    model_id=request.model,
+                )
+
+                # Separate thinking from content
+                raw_text = clean_special_tokens(output.text) if output.text else ""
+                thinking_content, regular_content = extract_thinking(raw_text)
+                cleaned_thinking = sanitize_tool_call_markup(thinking_content, engine.tokenizer)
+
+                # For Harmony (gpt-oss) models, tool_calls are already extracted by the parser
+                # For other models, parse from text output
+                if engine.model_type == "gpt_oss" and output.tool_calls:
+                    from .api.openai_models import ToolCall, FunctionCall
+                    tool_calls = [
+                        ToolCall(
+                            id=f"call_{uuid.uuid4().hex[:8]}",
+                            type="function",
+                            function=FunctionCall(
+                                name=tc["name"],
+                                arguments=tc["arguments"],
+                            ),
+                        )
+                        for tc in output.tool_calls
+                    ]
+                    cleaned_text = regular_content
+                else:
+                    extraction = extract_tool_calls_with_thinking(
+                        thinking_content,
+                        regular_content,
+                        tokenizer=engine.tokenizer,
+                        tools=internal_tools,
+                    )
+                    cleaned_text = extraction.cleaned_text
+                    tool_calls = extraction.tool_calls
+                    cleaned_thinking = extraction.cleaned_thinking
+
+                # Reverse Gemma 4 parameter renaming
+                if tool_calls and "gemma" in (resolved_model or "").lower():
+                    for tc in tool_calls:
+                        if tc.function and tc.function.arguments:
+                            try:
+                                args = json.loads(tc.function.arguments)
+                                args = restore_gemma4_param_names(args)
+                                tc.function.arguments = json.dumps(args, ensure_ascii=False)
+                            except (json.JSONDecodeError, AttributeError):
+                                pass
+
+                response = convert_internal_to_anthropic_response(
+                    text=cleaned_text.strip() if cleaned_text else regular_content,
+                    model=request.model,
+                    prompt_tokens=scale_anthropic_tokens(output.prompt_tokens, request.model),
+                    completion_tokens=scale_anthropic_tokens(output.completion_tokens, request.model),
+                    finish_reason=output.finish_reason,
+                    tool_calls=tool_calls,
+                    thinking=cleaned_thinking if cleaned_thinking else None,
+                    cached_tokens=scale_anthropic_tokens(output.cached_tokens, request.model),
+                    prefix_cache_enabled=engine.prefix_cache_enabled,
+                )
+
+                return response.model_dump_json()
+            finally:
+                pool.release_engine(resolved_model)
+
+        released = True  # _build_anthropic_message takes ownership of the lease
+        return StreamingResponse(
+            _with_json_keepalive(http_request, _build_anthropic_message()),
+            media_type="application/json",
         )
-        if output is None:
-            return  # Client disconnected
     finally:
         if not released:
             pool.release_engine(resolved_model)
-
-    elapsed = time.perf_counter() - start_time
-    tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
-    logger.info(
-        f"Anthropic message [{req_id}]: {output.completion_tokens} tokens in {elapsed:.2f}s "
-        f"({tokens_per_sec:.1f} tok/s)"
-    )
-
-    # Record metrics
-    get_server_metrics().record_request_complete(
-        prompt_tokens=output.prompt_tokens,
-        completion_tokens=output.completion_tokens,
-        cached_tokens=output.cached_tokens,
-        generation_duration=elapsed,
-        model_id=request.model,
-    )
-
-    # Separate thinking from content
-    raw_text = clean_special_tokens(output.text) if output.text else ""
-    thinking_content, regular_content = extract_thinking(raw_text)
-    cleaned_thinking = sanitize_tool_call_markup(thinking_content, engine.tokenizer)
-
-    # For Harmony (gpt-oss) models, tool_calls are already extracted by the parser
-    # For other models, parse from text output
-    if engine.model_type == "gpt_oss" and output.tool_calls:
-        # Harmony model with tool calls - convert format
-        from .api.openai_models import ToolCall, FunctionCall
-        tool_calls = [
-            ToolCall(
-                id=f"call_{uuid.uuid4().hex[:8]}",
-                type="function",
-                function=FunctionCall(
-                    name=tc["name"],
-                    arguments=tc["arguments"],
-                ),
-            )
-            for tc in output.tool_calls
-        ]
-        cleaned_text = regular_content
-    else:
-        # Parse tool calls from regular content, falling back to thinking
-        # content for small models that emit tool calls inside <think> blocks
-        extraction = extract_tool_calls_with_thinking(
-            thinking_content,
-            regular_content,
-            tokenizer=engine.tokenizer,
-            tools=internal_tools,
-        )
-        cleaned_text = extraction.cleaned_text
-        tool_calls = extraction.tool_calls
-        cleaned_thinking = extraction.cleaned_thinking
-
-    # Reverse Gemma 4 parameter renaming
-    if tool_calls and "gemma" in (resolved_model or "").lower():
-        for tc in tool_calls:
-            if tc.function and tc.function.arguments:
-                try:
-                    args = json.loads(tc.function.arguments)
-                    args = restore_gemma4_param_names(args)
-                    tc.function.arguments = json.dumps(args, ensure_ascii=False)
-                except (json.JSONDecodeError, AttributeError):
-                    pass
-
-    # Convert to Anthropic response format
-    response = convert_internal_to_anthropic_response(
-        text=cleaned_text.strip() if cleaned_text else regular_content,
-        model=request.model,
-        prompt_tokens=scale_anthropic_tokens(output.prompt_tokens, request.model),
-        completion_tokens=scale_anthropic_tokens(output.completion_tokens, request.model),
-        finish_reason=output.finish_reason,
-        tool_calls=tool_calls,
-        thinking=cleaned_thinking if cleaned_thinking else None,
-        cached_tokens=scale_anthropic_tokens(output.cached_tokens, request.model),
-        prefix_cache_enabled=engine.prefix_cache_enabled,
-    )
-
-    return response
 
 
 @app.post("/v1/messages/count_tokens")
@@ -4073,103 +4155,112 @@ async def create_response(
                 media_type="text/event-stream",
             )
 
-        # Non-streaming
-        start_time = time.perf_counter()
-        output = await _run_with_disconnect_guard(
-            http_request,
-            engine.chat(messages=messages, request_id=req_id, **chat_kwargs),
+        # Non-streaming response with keepalive during prefill.  Hand
+        # engine ownership to _build_response, whose finally releases
+        # the lease after generation + post-processing + storage.
+        async def _build_response() -> Optional[str]:
+            try:
+                start_time = time.perf_counter()
+                output = await _run_with_disconnect_guard(
+                    http_request,
+                    engine.chat(messages=messages, request_id=req_id, **chat_kwargs),
+                )
+                if output is None:
+                    return None  # Client disconnected
+
+                elapsed = time.perf_counter() - start_time
+                tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
+                logger.info(
+                    f"Responses API [{req_id}]: {output.completion_tokens} tokens in {elapsed:.2f}s "
+                    f"({tokens_per_sec:.1f} tok/s)"
+                )
+
+                get_server_metrics().record_request_complete(
+                    prompt_tokens=output.prompt_tokens,
+                    completion_tokens=output.completion_tokens,
+                    cached_tokens=output.cached_tokens,
+                    generation_duration=elapsed,
+                    model_id=request.model,
+                )
+
+                # Process output text
+                raw_text = clean_special_tokens(output.text) if output.text else ""
+                thinking_content, regular_content = extract_thinking(raw_text)
+
+                # Parse tool calls
+                if engine.model_type == "gpt_oss" and output.tool_calls:
+                    tool_calls = output.tool_calls
+                    cleaned_text = regular_content
+                else:
+                    extraction = extract_tool_calls_with_thinking(
+                        thinking_content,
+                        regular_content,
+                        tokenizer=engine.tokenizer,
+                        tools=tools_for_template,
+                    )
+                    cleaned_text = extraction.cleaned_text
+                    tool_calls = extraction.tool_calls
+
+                # Build output items
+                output_items: list[OutputItem] = []
+                output_items.append(
+                    build_message_output_item(cleaned_text.strip() if cleaned_text else "")
+                )
+
+                if tool_calls:
+                    for tc in tool_calls:
+                        if hasattr(tc, "function"):
+                            call_id = tc.id
+                            name = tc.function.name
+                            arguments = tc.function.arguments
+                        elif isinstance(tc, dict):
+                            call_id = tc.get("call_id", tc.get("id", f"call_{uuid.uuid4().hex[:8]}"))
+                            name = tc.get("name", "")
+                            arguments = tc.get("arguments", "{}")
+                        else:
+                            continue
+                        output_items.append(
+                            build_function_call_output_item(
+                                name=name,
+                                arguments=arguments,
+                                call_id=call_id,
+                            )
+                        )
+
+                usage = build_response_usage(output.prompt_tokens, output.completion_tokens)
+
+                response_obj = ResponseObject(
+                    model=request.model,
+                    status="completed",
+                    output=output_items,
+                    usage=usage,
+                    tools=request.tools or [],
+                    tool_choice=request.tool_choice or "auto",
+                    temperature=temperature,
+                    top_p=top_p,
+                    max_output_tokens=request.max_output_tokens,
+                    previous_response_id=request.previous_response_id,
+                )
+
+                # Store response
+                if _should_store_response(request.store):
+                    _store_response_state(
+                        response_obj.model_dump(exclude_none=True),
+                        input_messages=current_input_messages,
+                    )
+
+                return response_obj.model_dump_json()
+            finally:
+                pool.release_engine(resolved_model)
+
+        released = True  # _build_response takes ownership of the lease
+        return StreamingResponse(
+            _with_json_keepalive(http_request, _build_response()),
+            media_type="application/json",
         )
-        if output is None:
-            return
     finally:
         if not released:
             pool.release_engine(resolved_model)
-
-    elapsed = time.perf_counter() - start_time
-    tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
-    logger.info(
-        f"Responses API [{req_id}]: {output.completion_tokens} tokens in {elapsed:.2f}s "
-        f"({tokens_per_sec:.1f} tok/s)"
-    )
-
-    get_server_metrics().record_request_complete(
-        prompt_tokens=output.prompt_tokens,
-        completion_tokens=output.completion_tokens,
-        cached_tokens=output.cached_tokens,
-        generation_duration=elapsed,
-        model_id=request.model,
-    )
-
-    # Process output text
-    raw_text = clean_special_tokens(output.text) if output.text else ""
-    thinking_content, regular_content = extract_thinking(raw_text)
-
-    # Parse tool calls
-    if engine.model_type == "gpt_oss" and output.tool_calls:
-        tool_calls = output.tool_calls
-        cleaned_text = regular_content
-    else:
-        # Falls back to thinking content for small models that emit
-        # tool calls inside <think> blocks
-        extraction = extract_tool_calls_with_thinking(
-            thinking_content,
-            regular_content,
-            tokenizer=engine.tokenizer,
-            tools=tools_for_template,
-        )
-        cleaned_text = extraction.cleaned_text
-        tool_calls = extraction.tool_calls
-
-    # Build output items
-    output_items: list[OutputItem] = []
-    output_items.append(
-        build_message_output_item(cleaned_text.strip() if cleaned_text else "")
-    )
-
-    if tool_calls:
-        for tc in tool_calls:
-            if hasattr(tc, "function"):
-                # ToolCall Pydantic model
-                call_id = tc.id
-                name = tc.function.name
-                arguments = tc.function.arguments
-            elif isinstance(tc, dict):
-                call_id = tc.get("call_id", tc.get("id", f"call_{uuid.uuid4().hex[:8]}"))
-                name = tc.get("name", "")
-                arguments = tc.get("arguments", "{}")
-            else:
-                continue
-            output_items.append(
-                build_function_call_output_item(
-                    name=name,
-                    arguments=arguments,
-                    call_id=call_id,
-                )
-            )
-
-    usage = build_response_usage(output.prompt_tokens, output.completion_tokens)
-
-    response_obj = ResponseObject(
-        model=request.model,
-        status="completed",
-        output=output_items,
-        usage=usage,
-        tools=request.tools or [],
-        tool_choice=request.tool_choice or "auto",
-        temperature=temperature,
-        top_p=top_p,
-        max_output_tokens=request.max_output_tokens,
-        previous_response_id=request.previous_response_id,
-    )
-
-    # Store response
-    if _should_store_response(request.store):
-        _store_response_state(
-            response_obj.model_dump(exclude_none=True),
-            input_messages=current_input_messages,
-        )
-
-    return response_obj
 
 
 async def stream_responses_api(
