@@ -57,8 +57,6 @@ class AudioSpeechRequest(BaseModel):
     ref_text: Optional[str] = None
     speed: Optional[float] = 1.0
     response_format: Optional[str] = "wav"
-    ref_audio: Optional[str] = None
-    ref_text: Optional[str] = None
     temperature: Optional[float] = None
     top_k: Optional[int] = None
     top_p: Optional[float] = None
