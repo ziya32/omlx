@@ -472,6 +472,16 @@ class Scheduler:
         self.requests: Dict[str, Request] = {}  # All requests by ID
         self.finished_req_ids: Set[str] = set()  # Recently finished
 
+        # Peek-and-commit tracking: the request currently being attempted
+        # by _schedule_waiting.  Set at the top of each loop iteration,
+        # cleared at normal loop exit.  If _schedule_waiting raises, this
+        # field stays set, and step()'s except handler lets
+        # _reschedule_running_requests bump cache_corruption_retries on the
+        # failing request — otherwise the same request would be re-peeked
+        # forever on persistent corruption, because the retry counter is
+        # only tracked for requests that made it into self.running.
+        self._scheduling_request: Optional["Request"] = None
+
         # Thread-safe set for deferred aborts (main thread → executor thread)
         # CPython GIL guarantees set.add() and `x in set` are atomic.
         self._pending_abort_ids: Set[str] = set()
@@ -481,6 +491,15 @@ class Scheduler:
         self._memory_limit_bytes: int = 0  # soft limit
         self._memory_hard_limit_bytes: int = 0  # hard limit (system_ram - 4GB)
         self._prefill_memory_guard: bool = False  # set by ProcessMemoryEnforcer
+        # Model weight size (bytes), used by the generation memory guard as
+        # a per-request memory estimate (5% of model size). Set by
+        # ProcessMemoryEnforcer._propagate_memory_limit() from
+        # EngineEntry.estimated_size.
+        self._model_size_bytes: int = 0
+        # Throttle for the generation memory guard's deferral log line.
+        # Without this, the log fires on every scheduler tick (~200 ms)
+        # while under sustained pressure → tens of duplicate lines.
+        self._last_defer_log_time: float = 0.0
 
         # SpecPrefill: draft model for attention-based sparse prefill
         self._specprefill_draft_model: Optional[Any] = None
@@ -508,7 +527,19 @@ class Scheduler:
         self.paged_cache_manager: Optional[PagedCacheManager] = None
         self.block_aware_cache: Optional[BlockAwarePrefixCache] = None
         self.paged_ssd_cache_manager: Optional["PagedSSDCacheManager"] = None
-        self.memory_monitor: Optional["MemoryMonitor"] = None
+
+        # Memory monitor: used by the admission guard, preflight memory check,
+        # and KV cache eviction estimators. Without this, those checks fall
+        # through to no-op (returning 0/None) and silently disable themselves.
+        # The max_kv_cache_memory parameter is a constructor requirement but is
+        # not used by the estimator functions we rely on.
+        from .memory_monitor import MemoryMonitor
+        try:
+            self.memory_monitor = MemoryMonitor(max_kv_cache_memory=1024**3)
+            self._set_model_info_for_monitor()
+        except Exception as e:
+            logger.warning(f"Failed to initialize memory monitor: {e}")
+            self.memory_monitor = None
 
         # Initialize paged SSD cache if paged_ssd_cache_dir is specified
         if self.config.paged_ssd_cache_dir:
@@ -1168,9 +1199,16 @@ class Scheduler:
         # Prefill runs with standard KVCache; TurboQuant quantization
         # happens inside BatchGenerator during the decode phase.
 
-        # Clear stale mRoPE position state for text-only requests.
+        # For text-only requests, clear stale mRoPE position state left by
+        # a previous VLM request so the model computes text-only positions.
+        # For VLM requests, restore the per-request position state — it may
+        # have been cleared by cache-corruption recovery or overwritten by
+        # an intervening text-only request (the root cause of the
+        # broadcast_shapes crash during VLM retry).
         if vlm_embeds is None and hasattr(self.model, "clear_vlm_position_state"):
             self.model.clear_vlm_position_state()
+        else:
+            self._restore_vlm_position_state(vlm_embeds)
 
         # Boundary snapshot setup
         block_size = self.config.paged_cache_block_size
@@ -1223,14 +1261,25 @@ class Scheduler:
         # Prefill tokens[0:N-1] (leave last token for insert())
         prefill_tokens = tokens[:-1]
         last_token = tokens[-1:]
-        total_length = len(tokens)
+        # total_length matches what this loop ACTUALLY processes (N-1).
+        # Using len(tokens) here would cap progress at (N-1)/N and prevent
+        # the prefill progress tracker's auto-remove (which fires only when
+        # processed >= total). The last token is processed by
+        # batch_generator.insert(), not by this loop.
+        total_length = len(prefill_tokens)
 
         input_arr = mx.array(prefill_tokens)[None]  # (1, seq_len)
         processed_tokens = 0
         prefill_step_size = self.config.prefill_step_size
+        # Cap prefill chunk size for VLM requests so abort checks fire
+        # between smaller chunks instead of processing the entire vision
+        # embedding in one shot (which can take minutes for multi-frame video).
+        if vlm_embeds is not None:
+            prefill_step_size = min(prefill_step_size, 4096)
         uid = self.request_id_to_uid.get(request.request_id)
 
         emitted_boundaries: Dict[int, int] = {}
+        _prefill_chunk_idx = 0
 
         while input_arr.shape[1] > 0:
             remaining = input_arr.shape[1]
@@ -1285,9 +1334,22 @@ class Scheduler:
                     )
                     emitted_boundaries[request.request_id] = total_tokens
 
+            _prefill_chunk_idx += 1
+
             # Memory monitoring
             if self._memory_limit_bytes > 0:
                 active = mx.get_active_memory()
+                if vlm_embeds is not None and _prefill_chunk_idx % 4 == 0:
+                    logger.info(
+                        "Prefill chunk: request=%s, processed=%d/%d, "
+                        "active_memory=%.1fGB, soft_limit=%.1fGB, "
+                        "hard_limit=%.1fGB",
+                        request.request_id,
+                        processed_tokens, total_length,
+                        active / 1024**3,
+                        self._memory_limit_bytes / 1024**3,
+                        self._memory_hard_limit_bytes / 1024**3,
+                    )
                 if (
                     self._memory_hard_limit_bytes > 0
                     and active > self._memory_hard_limit_bytes
@@ -2342,6 +2404,23 @@ class Scheduler:
                     request.shared_prefix_blocks = len(block_table.block_ids)
                     # Recalculate remaining_tokens in case block_table was truncated
                     request.remaining_tokens = request.prompt_token_ids[block_table.num_tokens:]
+                    # Diagnostic: prefix cache hits load KV from SSD into
+                    # GPU memory and contribute to admission-time bursts.
+                    kv_bytes_loaded = 0
+                    if self.memory_monitor is not None:
+                        kv_bytes_loaded = self.memory_monitor.estimate_prompt_kv_bytes(
+                            request.cached_tokens
+                        )
+                    logger.info(
+                        "🎯 Prefix cache hit: request=%s cached=%d/%d tokens "
+                        "(%d blocks, ~%.2fGB KV from SSD), remaining=%d",
+                        request.request_id,
+                        request.cached_tokens,
+                        request.num_prompt_tokens,
+                        request.shared_prefix_blocks,
+                        kv_bytes_loaded / 1024**3,
+                        len(request.remaining_tokens),
+                    )
                     # For exact prefix hits we need cache state at (N-1) and the
                     # last prompt token as input to produce the first decode logit.
                     # Reusing cache state at N and feeding the last token again
@@ -2740,6 +2819,15 @@ class Scheduler:
         # Clean up protocol-specific output parser session
         self._cleanup_output_parser_session(request_id)
 
+        # Clean up SpecPrefill RoPE patch if this request was holding it.
+        # Idempotent: only acts when _specprefill_active_request_id matches.
+        # Without this, aborting a SpecPrefill request leaves the RoPE
+        # offset installed and the scheduler-global lock pointing at a
+        # now-dead request, causing all non-SpecPrefill requests to defer
+        # at _schedule_waiting's Step "A specprefill request is running"
+        # gate until server restart.
+        self._cleanup_specprefill(request_id)
+
         # Clean up VLM adapter state to prevent contamination
         if hasattr(self.model, 'clear_vlm_position_state'):
             self.model.clear_vlm_position_state()
@@ -2811,6 +2899,22 @@ class Scheduler:
                 req._extracted_cache = None
                 req.prompt_cache = None
         self.waiting.clear()
+        self._scheduling_request = None
+        # Restore SpecPrefill RoPE patch if any request was holding it.
+        # All requests are now gone, so there is nobody left who could
+        # hold the lock.  Without this, a SpecPrefill request that was
+        # mid-flight when fail_all_requests ran would leave the RoPE
+        # offset installed and the lock pointing at a dead request id.
+        if self._specprefill_active_request_id is not None:
+            try:
+                from .patches.specprefill import cleanup_rope
+                cleanup_rope(self.model)
+            except Exception as e:
+                logger.warning(
+                    f"SpecPrefill RoPE cleanup failed during "
+                    f"fail_all_requests: {e}"
+                )
+            self._specprefill_active_request_id = None
         # Reset batch generator only (cache is not corrupted)
         self.batch_generator = None
         self._current_sampler_params = None
@@ -2870,10 +2974,23 @@ class Scheduler:
             return None  # can't estimate, skip
 
         current = mx.get_active_memory()
+        is_vlm = request.vlm_inputs_embeds is not None
+
+        from .utils.hardware import format_bytes
+        logger.info(
+            "Preflight memory check: request=%s, prompt_tokens=%d, "
+            "new_tokens=%d, estimated_peak=%s, current=%s, "
+            "hard_limit=%s, is_vlm=%s",
+            request.request_id,
+            prompt_tokens,
+            new_tokens,
+            format_bytes(peak),
+            format_bytes(current),
+            format_bytes(self._memory_hard_limit_bytes),
+            is_vlm,
+        )
 
         if current + peak > self._memory_hard_limit_bytes:
-            from .utils.hardware import format_bytes
-
             return (
                 f"Prefill would require ~{format_bytes(current + peak)} peak "
                 f"(model {format_bytes(current)} + KV+SDPA {format_bytes(peak)}) "
@@ -2910,8 +3027,28 @@ class Scheduler:
 
         while self.waiting and len(self.running) < self.config.max_num_seqs:
             # Generation memory guard: when requests are already running,
-            # defer scheduling if memory pressure is high to prevent
-            # Metal allocation failures during batch_generator.next().
+            # defer scheduling if the projected total cost of all concurrent
+            # VLM requests would exceed the soft limit.
+            #
+            # The estimate has two components:
+            #
+            #   1. Per-request peak: ~8% of model weight size, multiplied by
+            #      (running_vlm + 1). 8% (vs the original 5%) reflects that
+            #      the actual per-request cost during concurrent prefill is
+            #      higher than just the KV cache — it includes SDPA attention
+            #      matrices, intermediate buffers, and ongoing decode growth.
+            #      Multiplying by (running_vlm + 1) accounts for the fact that
+            #      ALL concurrent requests' KV caches keep growing during
+            #      decode, not just the new one.
+            #
+            #   2. Cache-hit overhead: requests with prefix-cache hits have
+            #      KV state loaded from SSD into GPU during reconstruct_cache().
+            #      The next request's cached_tokens drives this estimate.
+            #
+            # The check is predictive: defer when active + total cost would
+            # exceed the soft limit, instead of waiting until active alone
+            # crosses it.
+            #
             # First request always passes (self.running is empty).
             if (
                 self._prefill_memory_guard
@@ -2919,22 +3056,80 @@ class Scheduler:
                 and self.running
             ):
                 active = mx.get_active_memory()
-                if active > self._memory_limit_bytes:
-                    logger.debug(
-                        "Generation memory guard: deferring scheduling "
-                        "(%s > %s), %d running",
-                        active, self._memory_limit_bytes, len(self.running),
+                per_request_estimate = int(self._model_size_bytes * 0.08)
+                # Count ALL running requests, not just those still holding
+                # vlm_inputs_embeds. The embeds field is cleared after the
+                # first decode token (scheduler.py: ~"Release VLM embeddings
+                # after first decode token"), but the request keeps consuming
+                # KV cache memory throughout decode. Filtering by embeds
+                # would silently drop count to 0 once requests start decoding,
+                # making the guard pass admissions it should defer.
+                n_running = len(self.running)
+                concurrent_cost = (n_running + 1) * per_request_estimate
+                # Peek at the next request to account for its cache-hit
+                # KV reconstruction cost (loaded from SSD).
+                next_request = self.waiting[0]
+                cached_overhead = 0
+                if (
+                    next_request.cached_tokens > 0
+                    and self.memory_monitor is not None
+                ):
+                    cached_overhead = (
+                        self.memory_monitor.estimate_prompt_kv_bytes(
+                            next_request.cached_tokens
+                        )
                     )
+                if (
+                    active + concurrent_cost + cached_overhead
+                    > self._memory_limit_bytes
+                ):
+                    # Throttle the log to once per 5 seconds — under
+                    # sustained pressure the scheduler tick (~200 ms)
+                    # would otherwise produce dozens of duplicate lines.
+                    now = time.monotonic()
+                    if now - self._last_defer_log_time >= 5.0:
+                        self._last_defer_log_time = now
+                        logger.info(
+                            "Generation memory guard: deferring scheduling "
+                            "(active=%.1fGB + concurrent_cost=%.1fGB "
+                            "(%d×%.2fGB) + cached_overhead=%.2fGB "
+                            "> soft=%.1fGB), %d running",
+                            active / 1024**3,
+                            concurrent_cost / 1024**3,
+                            n_running + 1,
+                            per_request_estimate / 1024**3,
+                            cached_overhead / 1024**3,
+                            self._memory_limit_bytes / 1024**3,
+                            n_running,
+                        )
                     break
 
-            request = self.waiting.popleft()
+            # Peek-and-commit: inspect the head of self.waiting but do NOT
+            # pop it yet.  The request is only popleft'd at the exact point
+            # we commit to one of three outcomes — (1) placed in
+            # self.running, (2) rejected by preflight with a RequestOutput,
+            # or (3) dropped because batch_generator.insert returned no
+            # uids.  Any exception raised in the body below therefore
+            # leaves the request at the head of self.waiting, where the
+            # caller's recovery path (e.g. _reschedule_running_requests
+            # after cache corruption) can re-drive it on the next step().
+            # Without this invariant, a raise between popleft() and
+            # self.running[rid] = request silently dropped the request,
+            # orphaning its handler on a never-completing await and
+            # leaking the engine_pool active_uses lease.  See
+            # engine_pool.py:1109 (deferred-load gate).
+            request = self.waiting[0]
+            # Track the peeked request so that a cache-corruption error
+            # raised from anywhere below can bump its retry counter.
+            # See _reschedule_running_requests for the handling.
+            self._scheduling_request = request
 
             # Ensure we have a batch generator
             self._ensure_batch_generator(request.sampling_params)
 
             if self.batch_generator is None:
-                # Put back and try again later
-                self.waiting.appendleft(request)
+                # Batch generator not ready — leave request in waiting,
+                # break out and retry on the next step().
                 break
 
             # Determine tokens to process and cache to use
@@ -2967,27 +3162,42 @@ class Scheduler:
             # specprefill request is already running (offset RoPE active).
             request_is_specprefill = request.specprefill_indices is not None
             if self._specprefill_active_request_id is not None and not request_is_specprefill:
-                # A specprefill request is running — defer all others until it finishes
-                self.waiting.appendleft(request)
+                # A specprefill request is running — defer all others until it finishes.
+                # Request stays in self.waiting (peek-and-commit).
                 break
             if batch_specprefill_status is None:
                 batch_specprefill_status = request_is_specprefill
             elif batch_specprefill_status != request_is_specprefill:
-                self.waiting.appendleft(request)
+                # Mixed specprefill/non-specprefill batch not allowed.
+                # Request stays in self.waiting (peek-and-commit).
                 break
             if request_is_specprefill and len(scheduled) > 0:
-                # SpecPrefill request must be alone
-                self.waiting.appendleft(request)
+                # SpecPrefill request must be alone.
+                # Request stays in self.waiting (peek-and-commit).
                 break
 
             # Check VLM status homogeneity: VLM and text-only requests use
             # different prefill paths (embeddings vs token IDs)
             request_is_vlm = request.vlm_inputs_embeds is not None
+            if request_is_vlm:
+                embeds = request.vlm_inputs_embeds
+                embeds_bytes = embeds.nbytes if hasattr(embeds, "nbytes") else 0
+                logger.info(
+                    "Scheduling VLM request %s: embeds_shape=%s, "
+                    "embeds_size=%.1fGB, prompt_tokens=%d, "
+                    "running=%d, active_memory=%.1fGB",
+                    request.request_id,
+                    list(embeds.shape) if hasattr(embeds, "shape") else "?",
+                    embeds_bytes / 1024**3,
+                    request.num_prompt_tokens,
+                    len(self.running),
+                    mx.get_active_memory() / 1024**3,
+                )
             if batch_vlm_status is None:
                 batch_vlm_status = request_is_vlm
             elif batch_vlm_status != request_is_vlm:
-                # VLM status mismatch - defer this request to next batch
-                self.waiting.appendleft(request)
+                # VLM status mismatch - defer this request to next batch.
+                # Request stays in self.waiting (peek-and-commit).
                 logger.debug(
                     f"Deferring request {request.request_id} to next batch "
                     f"(VLM status mismatch: batch={batch_vlm_status}, request={request_is_vlm})"
@@ -2999,8 +3209,8 @@ class Scheduler:
             if batch_cache_status is None:
                 batch_cache_status = request_has_cache
             elif batch_cache_status != request_has_cache:
-                # Cache status mismatch - defer this request to next batch
-                self.waiting.appendleft(request)
+                # Cache status mismatch - defer this request to next batch.
+                # Request stays in self.waiting (peek-and-commit).
                 logger.debug(
                     f"Deferring request {request.request_id} to next batch "
                     f"(cache status mismatch: batch={batch_cache_status}, request={request_has_cache})"
@@ -3030,6 +3240,13 @@ class Scheduler:
                     f"Request {request.request_id} rejected by prefill "
                     f"memory guard: {preflight_error}"
                 )
+                # Commit the peek: we are terminally rejecting this
+                # request, so remove it from self.waiting and clear the
+                # peek-and-commit tracker (otherwise an exception before
+                # the next loop iteration sets a new tracker would leave
+                # a stale reference to the already-rejected request).
+                self.waiting.popleft()
+                self._scheduling_request = None
                 self.requests.pop(request.request_id, None)
                 rejected_outputs.append(
                     RequestOutput(
@@ -3063,7 +3280,6 @@ class Scheduler:
                         _OffsetAdjustedRoPE,
                     )
 
-                    import time
                     t0 = time.monotonic()
 
                     sp_cache = make_prompt_cache(self.model)
@@ -3148,6 +3364,14 @@ class Scheduler:
             # External prefill: process tokens[0:N-1] outside BatchGenerator.
             # Only the last token goes to insert() for the first decode step.
             # SpecPrefill already handled its own prefill above, so skip for those.
+            #
+            # Any exception raised from here through batch_generator.insert
+            # (e.g. ValueError("[broadcast_shapes]") from paged-cache corruption,
+            # _PrefillAbortedError, or OOM) propagates up to step()'s except
+            # handlers.  Because of the peek-and-commit invariant above, the
+            # request is still at the head of self.waiting when that happens,
+            # so the corruption-recovery path (_reschedule_running_requests)
+            # plus the next step() iteration re-drive it cleanly.
             if request.specprefill_indices is None and len(tokens_to_process) > 1:
                 # Assign UID early so progress callbacks can map uid->request_id
                 # during external prefill. Use a temporary UID that will be replaced
@@ -3164,16 +3388,21 @@ class Scheduler:
                         request.cached_tokens,
                     )
 
-                prefilled_cache, last_token = self._do_external_prefill(
-                    request,
-                    tokens_to_process,
-                    cache_to_use,
-                    vlm_embeds=vlm_embeds,
-                )
-
-                # Clean up temp UID mapping
-                del self.uid_to_request_id[temp_uid]
-                del self.request_id_to_uid[request.request_id]
+                try:
+                    prefilled_cache, last_token = self._do_external_prefill(
+                        request,
+                        tokens_to_process,
+                        cache_to_use,
+                        vlm_embeds=vlm_embeds,
+                    )
+                finally:
+                    # Always clean up the temp UID mapping, on success and
+                    # on exception.  Without the try/finally, a raise from
+                    # _do_external_prefill (broadcast_shapes, OOM, etc.)
+                    # would leak both halves of the mapping into the
+                    # scheduler's dicts until shutdown.
+                    self.uid_to_request_id.pop(temp_uid, None)
+                    self.request_id_to_uid.pop(request.request_id, None)
 
                 # Prefill complete: remove from progress tracker so dashboard
                 # shows "generating" instead of "PP" during decode.
@@ -3234,27 +3463,58 @@ class Scheduler:
                 state_machines=[sm],
             )
 
-            if uids:
-                uid = uids[0]
-                self.request_id_to_uid[request.request_id] = uid
-                self.uid_to_request_id[uid] = request.request_id
-                request.batch_uid = uid
-                request.status = RequestStatus.RUNNING
-                self.running[request.request_id] = request
-                scheduled.append(request)
-
-                # Register per-UID rope_delta for mRoPE decode.
-                if hasattr(self.model, "register_rope_delta"):
-                    self.model.register_rope_delta(uid, request.rope_deltas)
-
-                self.total_prompt_tokens += request.num_prompt_tokens
-                cache_info = f", {request.cached_tokens} cached" if request.cached_tokens > 0 else ""
-                cache_used = "with cache" if cache_to_use else "no cache"
-                logger.debug(
-                    f"Scheduled request {request.request_id} (uid={uid}) "
-                    f"with {len(tokens_to_process)} tokens to process "
-                    f"({request.num_prompt_tokens} total){cache_info}, {cache_used}"
+            if not uids:
+                # batch_generator.insert returned no uids — unusual.
+                # Leave the request at the head of self.waiting and break
+                # out of the loop to avoid an infinite peek-retry on the
+                # same request.  It will be retried on the next step().
+                logger.warning(
+                    f"batch_generator.insert returned no uids for "
+                    f"request {request.request_id}; deferring to next step"
                 )
+                break
+
+            uid = uids[0]
+            # Commit: atomically (1) remove from self.waiting, (2) register
+            # the real uid mappings, (3) install in self.running, (4) clear
+            # the peek-and-commit tracker.  All of these operations are
+            # pure Python dict/deque mutations and cannot raise under
+            # normal conditions, so partial commits should not occur.
+            # Clearing the tracker at commit is important: otherwise an
+            # exception in later code (e.g. scheduled.append or the
+            # logger.debug below, unlikely but possible) would leave the
+            # tracker pointing at a request now in self.running, and
+            # _reschedule_running_requests would double-bump its retry
+            # counter (once via the peek-tracker path, once via the
+            # running-loop path).
+            self.waiting.popleft()
+            self.request_id_to_uid[request.request_id] = uid
+            self.uid_to_request_id[uid] = request.request_id
+            request.batch_uid = uid
+            request.status = RequestStatus.RUNNING
+            self.running[request.request_id] = request
+            self._scheduling_request = None
+            scheduled.append(request)
+
+            # Register per-UID rope_delta for mRoPE decode.
+            if hasattr(self.model, "register_rope_delta"):
+                self.model.register_rope_delta(uid, request.rope_deltas)
+
+            self.total_prompt_tokens += request.num_prompt_tokens
+            cache_info = f", {request.cached_tokens} cached" if request.cached_tokens > 0 else ""
+            cache_used = "with cache" if cache_to_use else "no cache"
+            logger.debug(
+                f"Scheduled request {request.request_id} (uid={uid}) "
+                f"with {len(tokens_to_process)} tokens to process "
+                f"({request.num_prompt_tokens} total){cache_info}, {cache_used}"
+            )
+
+        # Normal loop exit (empty waiting, batch full, or deferral break).
+        # Clear the peek tracker.  If we exited via an exception instead,
+        # this line does not run and step()'s except handler sees the
+        # field still set so it can bump cache_corruption_retries on the
+        # failing request via _reschedule_running_requests.
+        self._scheduling_request = None
 
         return scheduled, rejected_outputs
 
@@ -3637,6 +3897,36 @@ class Scheduler:
             if self._deferred_clear_at is None or target > self._deferred_clear_at:
                 self._deferred_clear_at = target
 
+    def _restore_vlm_position_state(
+        self,
+        vlm_embeds: Optional[Tuple[mx.array, Dict[str, Any], int]],
+    ) -> None:
+        """Restore mRoPE position state on the model from per-request data.
+
+        During VLM encoding, ``_position_ids`` and ``_rope_deltas`` are
+        stored on the model's ``_language_model`` as global state.  If a
+        cache-corruption recovery clears that state and an intervening
+        text-only request overwrites it, a VLM retry would pick up the
+        wrong positions (short text grid for a long VLM chunk) and hit a
+        broadcast_shapes error.
+
+        The VLM engine now saves position data in ``vlm_extra_kwargs``
+        (keys ``_vlm_position_ids`` / ``_vlm_rope_deltas``), which
+        survive recovery because they live on the ``Request`` object.
+        This method restores them on the model before each prefill.
+        """
+        if vlm_embeds is None:
+            return
+        _, extra_kwargs, _ = vlm_embeds
+        pos_ids = extra_kwargs.get("_vlm_position_ids") if extra_kwargs else None
+        if pos_ids is None:
+            return
+        lm = getattr(self.model, "_language_model", None)
+        if lm is None:
+            return
+        lm._position_ids = pos_ids
+        lm._rope_deltas = extra_kwargs.get("_vlm_rope_deltas")
+
     def _is_cache_corruption_error(self, error: Exception) -> bool:
         """Check if an error indicates cache corruption."""
         return is_cache_corruption_error(error)
@@ -3693,7 +3983,53 @@ class Scheduler:
         """
         failed_ids: List[str] = []
         count = 0
+
+        # Peek-and-commit: if _schedule_waiting was interrupted by a cache
+        # corruption error mid-attempt, the failing request is tracked in
+        # self._scheduling_request.  It is still at the head of self.waiting
+        # (peek-and-commit never popped it), and it is NOT in self.running,
+        # so the loop below won't see it.  Handle it here: bump its retry
+        # counter, and fail it terminally if it has exhausted the budget.
+        # Without this, a request that repeatedly triggers corruption during
+        # its own prefill would be re-peeked on every step() forever.
+        sched_req = self._scheduling_request
+        self._scheduling_request = None
+        if is_corruption and sched_req is not None:
+            sched_req.cache_corruption_retries += 1
+            if sched_req.cache_corruption_retries > max_corruption_retries:
+                try:
+                    self.waiting.remove(sched_req)
+                except ValueError:
+                    pass  # already removed by another path
+                req = self.requests.pop(sched_req.request_id, None)
+                if req is not None:
+                    req._extracted_cache = None
+                    req.prompt_cache = None
+                # Release SpecPrefill RoPE patch if this request was
+                # holding it.  Idempotent — only acts when sched_req is
+                # the current holder.
+                self._cleanup_specprefill(sched_req.request_id)
+                failed_ids.append(sched_req.request_id)
+            else:
+                # Leave sched_req at the head of self.waiting so it gets
+                # retried on the next step() after _recover_from_cache_error
+                # has cleared the paged cache.  Its retry counter is now
+                # incremented, so persistent corruption will eventually
+                # fail out.  Also release any SpecPrefill RoPE patch this
+                # request partially installed — the retry will reinstall
+                # cleanly via _schedule_waiting's SpecPrefill block.
+                self._cleanup_specprefill(sched_req.request_id)
+
         for request_id, request in list(self.running.items()):
+            # Skip requests that already have a pending abort — they will
+            # be cleaned up by _process_pending_aborts() on the next step().
+            # Rescheduling them would just put them back in waiting only to
+            # be immediately removed, and wastes a prefill cycle if the
+            # abort processing races with _schedule_waiting().
+            if request_id in self._pending_abort_ids:
+                del self.running[request_id]
+                continue
+
             if is_corruption:
                 request.cache_corruption_retries += 1
                 if request.cache_corruption_retries > max_corruption_retries:
@@ -3704,6 +4040,8 @@ class Scheduler:
                     if req is not None:
                         req._extracted_cache = None
                         req.prompt_cache = None
+                    # Release SpecPrefill lock if held.
+                    self._cleanup_specprefill(request_id)
                     continue
 
             # Reset scheduling state
@@ -3728,6 +4066,11 @@ class Scheduler:
 
             # Reset reasoning model state
             request.think_prefix_sent = False
+
+            # Release SpecPrefill RoPE patch if this request was holding
+            # it.  The retry will reinstall it in _schedule_waiting's
+            # SpecPrefill block.  Idempotent.
+            self._cleanup_specprefill(request_id)
 
             # Move to waiting queue (at front for priority)
             self.waiting.appendleft(request)
@@ -3776,6 +4119,12 @@ class Scheduler:
             if self.batch_generator is not None and self.running:
                 responses = self.batch_generator.next_generated()
                 output.has_work = True
+
+                # Check for aborts that arrived during the blocking next()
+                # call. Process them now so aborted UIDs are removed before
+                # _process_batch_responses, avoiding wasted post-processing.
+                if self._pending_abort_ids:
+                    self._process_pending_aborts()
 
                 if responses:
                     outputs, finished_ids = self._process_batch_responses(responses)
@@ -3838,6 +4187,18 @@ class Scheduler:
                 f"{traceback.format_exc()}"
             )
             raise
+
+        finally:
+            # Belt-and-suspenders: clear the peek-and-commit tracker so a
+            # stale reference from an aborted _schedule_waiting attempt
+            # cannot bleed into the next step().  _schedule_waiting clears
+            # it on normal exit, and _reschedule_running_requests clears it
+            # when bumping the retry counter, so this finally is mostly a
+            # safety net for uncaught exceptions in later phases
+            # (next_generated, _process_batch_responses) that would
+            # otherwise leave the tracker pointing at a request that was
+            # already committed to self.running.
+            self._scheduling_request = None
 
         # Clear finished tracking for next step
         self.finished_req_ids = set()
@@ -3971,13 +4332,24 @@ class Scheduler:
         """
         Graceful shutdown.
 
-        Flushes hot cache to SSD and closes the background writer.
+        Flushes hot cache to SSD, closes the background writer, and releases
+        model/tokenizer references so MLX tensors can be garbage collected.
         paged SSD cache files are NOT cleared to allow reuse on reload.
         """
         logger.info("Scheduler shutdown initiated...")
         if self.paged_ssd_cache_manager is not None:
             self.paged_ssd_cache_manager.close()
             self.paged_ssd_cache_manager = None
+
+        # Deep reset clears all cache state including model-level caches
+        self.deep_reset()
+
+        # Release model and tokenizer references so MLX tensors can be
+        # freed by gc.collect() + mx.clear_cache().
+        self.model = None
+        self.tokenizer = None
+
+        mx.clear_cache()
         logger.info("Scheduler shutdown completed")
 
     # =========================================================================
@@ -3990,10 +4362,34 @@ class Scheduler:
             return
 
         try:
-            # Try to get model config
+            # Resolve a config-like object that has flat transformer fields
+            # (num_hidden_layers, num_attention_heads, etc.).
+            #
+            # For VLM adapters, .config returns the VLM wrapper config which
+            # has nested text_config / vision_config and does NOT expose flat
+            # transformer fields. The adapter's .args proxies to the language
+            # model's args, which DOES expose them. Try .args first.
+            #
+            # For LM models, .args may be missing — fall back to .config.
+            # If .config has nested text_config, drill into it.
+            def _has_flat_fields(c: Any) -> bool:
+                if c is None:
+                    return False
+                return (
+                    getattr(c, 'num_hidden_layers', None) is not None
+                    or getattr(c, 'n_layer', None) is not None
+                )
+
             config = None
-            if hasattr(self.model, 'config'):
+            if hasattr(self.model, 'args') and _has_flat_fields(self.model.args):
+                config = self.model.args
+            elif hasattr(self.model, 'config'):
                 config = self.model.config
+                if not _has_flat_fields(config):
+                    # Drill into text_config (Qwen3-VL, Gemma3, Pixtral, etc.)
+                    text_config = getattr(config, 'text_config', None)
+                    if _has_flat_fields(text_config):
+                        config = text_config
             elif hasattr(self.model, 'args'):
                 config = self.model.args
 

@@ -11,7 +11,7 @@ import logging
 import threading
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from .model_profiles import (
     filter_profile_fields,
@@ -92,6 +92,7 @@ class ModelSettings:
     thinking_budget_enabled: bool = False
     thinking_budget_tokens: Optional[int] = None
     reasoning_parser: Optional[str] = None  # xgrammar builtin name: "qwen", "harmony", "llama", etc.
+    aliases: Optional[List[str]] = None  # API-visible names (alternatives to directory name)
 
     # TurboQuant KV cache (mlx-vlm backend)
     turboquant_kv_enabled: bool = False
@@ -109,9 +110,17 @@ class ModelSettings:
     dflash_draft_model: Optional[str] = None  # Path/repo for DFlash draft checkpoint
     dflash_draft_quant_bits: Optional[int] = None  # Draft model quantization (None=bf16, 4)
 
+    # Audio-specific settings (TTS/ASR)
+    default_voice: Optional[str] = None  # Default TTS speaker/voice name
+    default_instruct: Optional[str] = None  # Default TTS instruct text
+    default_language: Optional[str] = None  # Default ASR language ("auto", "en", etc.)
+    default_response_format: Optional[str] = None  # Default audio output format ("wav", "mp3", etc.)
+
     # Model management flags
     is_pinned: bool = False
     is_default: bool = False  # Only one model can be default
+    exclusive: bool = False  # When True + is_pinned, evict all non-pinned models on request
+    exclusive_max_hold: int = 0  # Max seconds of continuous exclusive hold (0 = unlimited)
 
     # Security: opt-in per model. When True, mlx-lm/mlx-vlm/mlx-embeddings/reranker
     # loaders are allowed to execute custom Python from the model repository
@@ -195,7 +204,8 @@ class ModelSettingsManager:
         If the file doesn't exist or is invalid, starts with empty settings.
         """
         if not self.settings_file.exists():
-            logger.debug(f"Settings file not found: {self.settings_file}")
+            if __debug__:
+                logger.debug(f"Settings file not found: {self.settings_file}")
             self._settings = {}
             return
 
@@ -251,7 +261,8 @@ class ModelSettingsManager:
                 json.dump(data, f, indent=2, ensure_ascii=False)
 
             temp_file.replace(self.settings_file)
-            logger.debug(f"Saved settings for {len(self._settings)} models")
+            if __debug__:
+                logger.debug(f"Saved settings for {len(self._settings)} models")
 
         except Exception as e:
             logger.error(f"Failed to save settings file: {e}")

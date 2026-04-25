@@ -1581,6 +1581,89 @@ class TestCacheCorruptionRecovery:
         scheduler.block_aware_cache.clear.assert_not_called()
 
 
+class TestVLMPositionStateContamination:
+    """Regression test for VLM mRoPE position contamination during retry.
+
+    Reproduces the bug where:
+    1. VLM request sets _position_ids on the model (shape (3, 1, N))
+    2. Cache corruption → recovery → clears _position_ids
+    3. Intervening text-only request sets _position_ids to (3, 1, 73)
+    4. VLM retry picks up the short text-only positions for a 2048-token
+       chunk → broadcast_shapes error
+
+    The fix stores VLM position_ids in request.vlm_extra_kwargs so
+    _do_external_prefill can restore them before each retry, regardless
+    of what intervening requests did to the model's global state.
+    """
+
+    def test_vlm_position_ids_stored_in_extra_kwargs(self, mock_model, mock_tokenizer):
+        """VLM encoding should store position_ids in vlm_extra_kwargs on the request."""
+        # The _encode_and_tokenize_vlm method returns (token_ids, embeds, extra_kwargs, hash).
+        # After the fix, extra_kwargs must contain _vlm_position_ids and _vlm_rope_deltas.
+        # We can't easily test the full VLM engine here, but we can test that
+        # _do_external_prefill restores position state from extra_kwargs.
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        # Simulate: model has a _language_model with _position_ids
+        lang_model = MagicMock()
+        lang_model._position_ids = None
+        lang_model._rope_deltas = None
+        mock_model._language_model = lang_model
+
+        # Simulate VLM position_ids stored in vlm_extra_kwargs
+        vlm_positions = mx.zeros((3, 1, 500))
+        vlm_deltas = mx.array([42])
+
+        req = Request(
+            request_id="vlm-req",
+            prompt="describe this image",
+            sampling_params=SamplingParams(),
+            prompt_token_ids=list(range(500)),
+            num_prompt_tokens=500,
+            vlm_inputs_embeds=mx.zeros((1, 500, 128)),
+            vlm_extra_kwargs={
+                "_vlm_position_ids": vlm_positions,
+                "_vlm_rope_deltas": vlm_deltas,
+            },
+        )
+
+        # Simulate: LLM request contaminated model position state
+        lang_model._position_ids = mx.zeros((3, 1, 73))  # wrong!
+        lang_model._rope_deltas = mx.array([0])  # wrong!
+
+        # The vlm_embeds tuple passed to _do_external_prefill
+        vlm_embeds = (req.vlm_inputs_embeds, req.vlm_extra_kwargs, 0)
+
+        # Verify _restore_vlm_position_state restores correct state
+        scheduler._restore_vlm_position_state(vlm_embeds)
+
+        assert lang_model._position_ids is vlm_positions
+        assert lang_model._rope_deltas is vlm_deltas
+
+    def test_restore_is_noop_for_text_only(self, mock_model, mock_tokenizer):
+        """_restore_vlm_position_state does nothing when vlm_embeds is None."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        lang_model = MagicMock()
+        lang_model._position_ids = "original"
+        mock_model._language_model = lang_model
+
+        scheduler._restore_vlm_position_state(None)
+        assert lang_model._position_ids == "original"
+
+    def test_restore_is_noop_without_saved_positions(self, mock_model, mock_tokenizer):
+        """_restore_vlm_position_state does nothing when extra_kwargs has no position data."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        lang_model = MagicMock()
+        lang_model._position_ids = "original"
+        mock_model._language_model = lang_model
+
+        vlm_embeds = (mx.zeros((1, 100, 128)), {}, 0)
+        scheduler._restore_vlm_position_state(vlm_embeds)
+        assert lang_model._position_ids == "original"
+
+
 class TestDetectNeedsThinkPrefix:
     """Tests for _detect_needs_think_prefix() method.
 

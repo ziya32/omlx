@@ -5,6 +5,7 @@ Pytest configuration and fixtures for oMLX tests.
 This module provides common fixtures used across test files.
 """
 
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock
@@ -12,6 +13,16 @@ from unittest.mock import MagicMock
 import pytest
 
 from omlx.request import Request, SamplingParams
+
+# Cap Metal memory to 75% of physical RAM so runaway tests cannot OOM the machine.
+# Applied once at import time for the entire test session.
+try:
+    import mlx.core as mx
+
+    _total_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    mx.metal.set_memory_limit(int(_total_bytes * 0.75))
+except Exception:
+    pass
 
 
 class MockTokenizer:

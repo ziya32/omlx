@@ -84,6 +84,11 @@ class EmbeddingEngine(BaseNonStreamingEngine):
             return
 
         logger.info(f"Stopping embedding engine: {self._model_name}")
+        # Mark terminal BEFORE clearing the model ref so any handler
+        # racing with stop() sees RequestAbortedError via
+        # _raise_if_aborted instead of a RuntimeError from the model
+        # guard. See docs/enforcer-eviction-review.md #4.
+        self._mark_stopped()
         self._model = None
 
         gc.collect()
@@ -99,6 +104,7 @@ class EmbeddingEngine(BaseNonStreamingEngine):
         max_length: int = 512,
         padding: bool = True,
         truncation: bool = True,
+        instruction: str | None = None,
     ) -> EmbeddingOutput:
         """
         Generate embeddings for input texts.
@@ -108,12 +114,24 @@ class EmbeddingEngine(BaseNonStreamingEngine):
             max_length: Maximum token length for each text
             padding: Whether to pad shorter sequences
             truncation: Whether to truncate longer sequences
+            instruction: Task instruction for instruction-aware models
+                (e.g. Qwen3-Embedding). When provided, inputs are formatted
+                as 'Instruct: {instruction}\\nQuery:{text}'. Use for queries
+                only — documents should be embedded without instruction.
 
         Returns:
             EmbeddingOutput with embeddings and token count
         """
+        # Check abort FIRST so a handler racing with stop() sees the
+        # typed RequestAbortedError (→ HTTP 503) rather than the plain
+        # RuntimeError from the model guard (→ HTTP 500).
+        self._raise_if_aborted()
         if self._model is None:
             raise RuntimeError("Engine not started. Call start() first.")
+
+        # Apply instruction prefix for instruction-aware embedding models
+        if instruction:
+            texts = [f"Instruct: {instruction}\nQuery:{text}" for text in texts]
 
         model = self._model
 
@@ -129,7 +147,11 @@ class EmbeddingEngine(BaseNonStreamingEngine):
             self._active_count += 1
         try:
             loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(get_mlx_executor(), _embed_sync)
+            result = await loop.run_in_executor(get_mlx_executor(), _embed_sync)
+            # Discard result if the enforcer aborted us while the MLX
+            # kernel was running on the executor thread.
+            self._raise_if_aborted()
+            return result
         finally:
             if self._decrement_active():
                 loop = asyncio.get_running_loop()

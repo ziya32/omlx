@@ -15,9 +15,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import TYPE_CHECKING
 
 import mlx.core as mx
+
+from .engine_pool import EngineState
 
 if TYPE_CHECKING:
     from .engine_pool import EnginePool
@@ -69,6 +72,13 @@ class ProcessMemoryEnforcer:
         self._global_settings = global_settings
         self._task: asyncio.Task | None = None
         self._running = False
+        # Diagnostic counters (readable via get_status / debug endpoints)
+        self._peak_memory_bytes: int = 0
+        self._overage_count: int = 0
+        self._last_overage_log: float = 0.0  # monotonic timestamp
+        self._tick_count: int = 0
+        self._last_baseline_log: float = 0.0  # monotonic timestamp
+        self._last_no_candidate_log: float = 0.0
 
     @property
     def max_bytes(self) -> int:
@@ -158,6 +168,11 @@ class ProcessMemoryEnforcer:
                     scheduler._memory_limit_bytes = self._max_bytes
                     scheduler._memory_hard_limit_bytes = hard_limit
                     scheduler._prefill_memory_guard = self._prefill_memory_guard
+                    # Plumb the model weight size for the per-request
+                    # estimate in the generation memory guard.
+                    scheduler._model_size_bytes = int(
+                        getattr(entry, "estimated_size", 0) or 0
+                    )
                     bg = getattr(scheduler, "batch_generator", None)
                     if bg is not None and hasattr(bg, "_memory_limit_bytes"):
                         bg._memory_limit_bytes = self._max_bytes
@@ -202,110 +217,207 @@ class ProcessMemoryEnforcer:
     async def _check_and_enforce(self) -> None:
         """Check current memory and enforce limit if exceeded.
 
-        Handles three scenarios via the while loop:
-        1. Multiple models, one inferring: evict LRU (idle) model,
-           inference on the other continues.
-        2. Single model: abort all requests, keep model loaded.
-           Short-context requests can be served afterward.
-        3. Multiple models, both inferring: first iteration evicts LRU
-           (aborting its requests), second iteration aborts remaining
-           single model's requests.
+        When Metal memory exceeds the soft process limit, abort all
+        active requests on the LRU non-pinned model and unload it.
+        Pinned models are never evicted.
+
+        Eviction is one-victim-per-tick: Metal memory reclamation is
+        asynchronous (EnginePool._unload_engine only clears the engine
+        reference and schedules _deferred_engine_cleanup; the heavy
+        mx.synchronize() + mx.clear_cache() runs on the MLX executor
+        after we release the lock), so re-checking mx.get_active_memory()
+        inside a loop would cascade-evict every non-pinned model in a
+        single tick. If memory is still over the limit after this
+        unload, the next _enforcement_loop iteration will re-check and
+        pick another victim. See docs/enforcer-eviction-review.md #1.
+
+        Eviction is immediate and does not wait for drain — clients
+        receive errors via abort_all_requests() rather than a silent
+        disconnect. A victim's active_uses count does NOT protect it:
+        when process memory is exhausted, aborting in-flight handlers
+        is preferable to OOM.
         """
         if self._max_bytes <= 0:
             return
 
         current = mx.get_active_memory()
+        if current > self._peak_memory_bytes:
+            self._peak_memory_bytes = current
+
+        self._tick_count += 1
+        now_bl = time.monotonic()
+        if now_bl - self._last_baseline_log >= 10.0:
+            self._last_baseline_log = now_bl
+            # Option C: MLX memory pool stats (active vs cache vs peak)
+            try:
+                mlx_cache = mx.get_cache_memory()
+                mlx_peak = mx.get_peak_memory()
+            except AttributeError:
+                mlx_cache = 0
+                mlx_peak = 0
+            logger.info(
+                "Memory enforcer tick: active=%.1fGB, limit=%.1fGB, "
+                "utilization=%.0f%%, peak=%.1fGB, "
+                "mlx_cache=%.1fGB, mlx_peak=%.1fGB, reserved=%.1fGB",
+                current / 1024**3,
+                self._max_bytes / 1024**3,
+                (current / self._max_bytes * 100) if self._max_bytes > 0 else 0,
+                self._peak_memory_bytes / 1024**3,
+                mlx_cache / 1024**3,
+                mlx_peak / 1024**3,
+                (current + mlx_cache) / 1024**3,
+            )
+            # Per-engine state: scheduler queues + vision feature cache
+            # (paged cache metadata counts were removed — CacheBlock is
+            # pure metadata in paged-SSD-only mode, so paged_allocated
+            # does NOT correspond to GPU memory. Confirmed findings 2026-04-09.)
+            for entry in self._engine_pool._entries.values():
+                if entry.engine is None:
+                    continue
+                sched = getattr(entry.engine, "scheduler", None)
+                waiting_n = len(getattr(sched, "waiting", [])) if sched else 0
+                running_n = len(getattr(sched, "running", {})) if sched else 0
+
+                # In-flight prefill: requests popped from `waiting` and
+                # currently inside `_do_external_prefill`. These are NOT
+                # in `self.running` yet (they're added only after prefill
+                # completes and `batch_generator.insert()` succeeds), but
+                # they ARE in `request_id_to_uid` because the scheduler
+                # assigns a temp_uid before calling _do_external_prefill.
+                # Surfacing this count makes the "stuck waiting=1 running=0"
+                # case obvious — it means a long prefill is in progress
+                # for a request that's in neither queue.
+                prefilling_n = 0
+                if sched is not None:
+                    rid_to_uid = getattr(sched, "request_id_to_uid", {})
+                    running_dict = getattr(sched, "running", {})
+                    if rid_to_uid and running_dict is not None:
+                        prefilling_n = sum(
+                            1 for rid in rid_to_uid
+                            if rid not in running_dict
+                        )
+
+                # Vision feature cache (in-memory LRU of encoder outputs).
+                # Primary leak suspect: ~200 MB per unique-image entry,
+                # hardcoded max_memory_entries=20 → up to ~4 GB held.
+                vfc = getattr(entry.engine, "_vision_cache", None)
+                vfc_entries = 0
+                vfc_bytes = 0
+                if vfc is not None:
+                    try:
+                        ms = vfc.memory_stats()
+                        vfc_entries = ms.get("entries", 0)
+                        vfc_bytes = ms.get("bytes", 0)
+                    except Exception:
+                        pass
+
+                logger.info(
+                    "Engine state: model=%s waiting=%d prefilling=%d "
+                    "running=%d vfc_entries=%d vfc_mem=%.2fGB",
+                    entry.model_id,
+                    waiting_n, prefilling_n, running_n,
+                    vfc_entries, vfc_bytes / 1024**3,
+                )
+
         if current <= self._max_bytes:
             return
 
+        self._overage_count += 1
         overage = current - self._max_bytes
-        logger.warning(
-            f"Process memory limit exceeded: "
-            f"{_format_gb(current)} / {_format_gb(self._max_bytes)} "
-            f"(over by {_format_gb(overage)})"
-        )
+        now = time.monotonic()
+        if now - self._last_overage_log >= 5.0:
+            self._last_overage_log = now
+            logger.warning(
+                f"⚠️ Process memory limit exceeded: "
+                f"{_format_gb(current)} / {_format_gb(self._max_bytes)} "
+                f"(over by {_format_gb(overage)})"
+            )
 
-        # Acquire EnginePool lock and unload LRU models until under limit.
-        # Note: prefill loops self-check via _memory_limit_bytes (same thread,
-        # no GIL issue), so they will abort independently of this enforcer.
-        async with self._engine_pool._lock:
-            while mx.get_active_memory() > self._max_bytes:
-                victim = self._engine_pool._find_lru_victim()
-                if victim is not None:
-                    # Count loaded non-pinned models
-                    loaded_non_pinned = [
-                        mid
-                        for mid, e in self._engine_pool._entries.items()
-                        if e.engine is not None and not e.is_pinned
-                    ]
-                    if len(loaded_non_pinned) > 1:
-                        # Multiple models: evict LRU victim.
-                        # First abort active requests so clients receive
-                        # error messages — EngineCore.stop() only cancels
-                        # the engine loop silently without notifying collectors.
-                        entry = self._engine_pool._entries.get(victim)
-                        if entry and entry.engine is not None:
-                            if hasattr(entry.engine, "abort_all_requests"):
-                                aborted = await entry.engine.abort_all_requests()
-                                if aborted > 0:
-                                    logger.warning(
-                                        f"Aborted {aborted} requests on "
-                                        f"'{victim}' before eviction"
-                                    )
+        # Acquire EnginePool lock and evict one non-pinned LRU victim.
+        # Active requests are aborted before unload so clients see a
+        # proper error — EngineCore.stop() only cancels the engine loop
+        # silently without notifying collectors. Note: prefill loops
+        # self-check via _memory_limit_bytes (same thread, no GIL
+        # issue), so they abort independently of this enforcer.
+        async with self._engine_pool._tracked_lock("process_memory_enforcer"):
+            victim = self._engine_pool._find_drain_or_evict_candidate()
+            if victim is not None:
+                entry = self._engine_pool._entries.get(victim)
+                # Defensive: _find_drain_or_evict_candidate already
+                # filters engine=None, and we hold the pool lock, so
+                # this should not trigger. If it does, fall through to
+                # the no-candidate diagnostic path below.
+                if entry is not None and entry.engine is not None:
+                    # Every engine (BatchedEngine/VLMBatchedEngine via
+                    # EngineCore, BaseNonStreamingEngine subclasses via
+                    # their cooperative abort flag) implements
+                    # abort_all_requests, so we no longer special-case
+                    # non-abortable engines.
+                    aborted = await entry.engine.abort_all_requests()
+                    if aborted > 0:
                         logger.warning(
-                            f"Evicting model '{victim}' to enforce "
-                            f"process memory limit"
+                            f"Aborted {aborted} requests on "
+                            f"'{victim}' before eviction"
                         )
-                        await self._engine_pool._unload_engine(victim)
-                        continue
-                    else:
-                        # Single model: abort all requests, keep model
-                        # loaded. This frees KV cache blocks internally
-                        # so short-context requests can be served without
-                        # new Metal allocation.
-                        entry = self._engine_pool._entries.get(victim)
-                        if entry and entry.engine is not None:
-                            if hasattr(entry.engine, "abort_all_requests"):
-                                aborted = await entry.engine.abort_all_requests()
-                                if aborted > 0:
-                                    logger.warning(
-                                        f"Aborted {aborted} requests on "
-                                        f"'{victim}' due to memory pressure "
-                                        f"(model kept loaded)"
-                                    )
-                        break
-
-                # No loaded non-pinned model to evict.
-                # Check if any model is currently loading — request abort.
-                aborted_any = False
-                for entry in self._engine_pool._entries.values():
-                    if entry.is_loading and not entry.abort_loading:
-                        logger.warning(
-                            f"Requesting abort of loading model "
-                            f"'{entry.model_id}' — process memory "
-                            f"limit exceeded"
-                        )
-                        entry.abort_loading = True
-                        aborted_any = True
-
-                if not aborted_any:
-                    # Nothing we can do — all models are either pinned
-                    # or there are no loaded/loading models
-                    has_loaded = any(
-                        e.engine is not None
-                        for e in self._engine_pool._entries.values()
+                    logger.warning(
+                        f"Evicting non-pinned model '{victim}' to enforce "
+                        f"process memory limit (active_uses="
+                        f"{entry.active_uses})"
                     )
-                    if has_loaded:
-                        logger.warning(
-                            "Process memory limit exceeded but all "
-                            "loaded models are pinned — cannot evict."
-                        )
-                    else:
-                        logger.warning(
-                            "Process memory limit exceeded but no "
-                            "models are loaded to evict."
-                        )
-                break
+                    await self._engine_pool._unload_engine(victim)
+                    return
+
+            # No eviction candidate — throttle this diagnostic to
+            # once per 5 seconds (it can repeat every poll cycle).
+            now = time.monotonic()
+            if now - self._last_no_candidate_log < 5.0:
+                return
+
+            self._last_no_candidate_log = now
+
+            loading = [
+                e.model_id
+                for e in self._engine_pool._entries.values()
+                if e.is_loading
+            ]
+            if loading:
+                logger.warning(
+                    f"Memory limit exceeded while loading "
+                    f"{loading} — waiting for load to complete "
+                    f"and deferred cleanup to free Metal memory."
+                )
+                return
+
+            draining = [
+                e.model_id
+                for e in self._engine_pool._entries.values()
+                if e.state == EngineState.DRAINING
+            ]
+            pinned = [
+                e.model_id
+                for e in self._engine_pool._entries.values()
+                if e.engine is not None and e.is_pinned
+            ]
+            if draining:
+                logger.warning(
+                    f"Memory limit exceeded while draining "
+                    f"{draining} — waiting for active requests "
+                    f"to finish."
+                )
+            elif pinned:
+                logger.warning(
+                    f"Memory limit exceeded but all loaded "
+                    f"models are pinned ({pinned}) — cannot evict."
+                )
+            else:
+                snapshot = self._engine_pool.get_crash_diagnostic_snapshot()
+                logger.warning(
+                    "🚨 Memory limit exceeded but no models are loaded to evict "
+                    "(metal=%s, limit=%s, snapshot=%s)",
+                    _format_gb(mx.get_active_memory()),
+                    _format_gb(self._max_bytes),
+                    snapshot,
+                )
 
     def get_status(self) -> dict:
         """Get enforcer status for monitoring endpoints."""
@@ -319,4 +431,12 @@ class ProcessMemoryEnforcer:
             "utilization": (
                 current / self._max_bytes if self._max_bytes > 0 else 0.0
             ),
+            "peak_memory_bytes": self._peak_memory_bytes,
+            "peak_memory_formatted": _format_gb(self._peak_memory_bytes),
+            "overage_count": self._overage_count,
         }
+
+    def reset_peak(self) -> None:
+        """Reset peak memory and overage counter (for tests)."""
+        self._peak_memory_bytes = 0
+        self._overage_count = 0

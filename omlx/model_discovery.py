@@ -105,7 +105,6 @@ EMBEDDING_ARCHITECTURES = {
     "XLMRobertaForMaskedLM",
     "ModernBertModel",
     "ModernBertForMaskedLM",
-    "Qwen3ForTextEmbedding",
     "SiglipModel",
     "SiglipVisionModel",
     "SiglipTextModel",
@@ -304,6 +303,7 @@ def _is_unsupported_model(model_path: Path) -> bool:
     model_type = config.get("model_type", "")
     normalized = model_type.lower().replace("-", "_")
     return normalized in UNSUPPORTED_MODEL_TYPES or model_type in UNSUPPORTED_MODEL_TYPES
+
 
 
 def _is_causal_lm_reranker(model_path: Path) -> bool:
@@ -809,10 +809,11 @@ def discover_models(model_dir: Path) -> dict[str, DiscoveredModel]:
                     _register_model(models, child, child.name)
 
             if not has_children:
-                logger.debug(
-                    f"Skipping {subdir.name}: no config.json found "
-                    f"(not a model or organization folder)"
-                )
+                if __debug__:
+                    logger.debug(
+                        f"Skipping {subdir.name}: no config.json found "
+                        f"(not a model or organization folder)"
+                    )
 
     # Fallback: if no models found and the directory itself is a model, register it.
     # This supports pointing directly at a single model folder, e.g.:

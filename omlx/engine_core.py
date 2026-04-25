@@ -22,6 +22,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple, Union
 
 import mlx.core as mx
 
+from .exceptions import RequestAbortedError
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .scheduler import Scheduler, SchedulerConfig, SchedulerOutput
 from .output_collector import RequestOutputCollector, RequestStreamState
@@ -152,12 +153,23 @@ class EngineCore:
         self._start_time: Optional[float] = None
         self._steps_executed = 0
 
+        # True while scheduler.step() is running on the MLX executor thread.
+        # Checked by has_active_requests() to prevent the drain monitor
+        # from unloading the model while GPU work is in flight.
+        self._step_in_flight = False
+
+        # Deferred cleanup: request IDs whose _cleanup_request() is deferred
+        # until the current engine loop step completes. Keeps _output_collectors
+        # non-empty so the drain monitor sees active work during abort.
+        self._pending_cleanups: Set[str] = set()
+
         # Global single-thread executor shared across ALL engines.
         # mlx-lm uses a module-level Metal stream, so concurrent MLX calls
         # from different engine threads cause segfaults. See issue #85.
         self._mlx_executor = get_mlx_executor()
 
-        logger.debug(f"Engine {self._engine_id} initialized")
+        if __debug__:
+            logger.debug(f"Engine {self._engine_id} initialized")
 
     async def start(self) -> None:
         """Start the engine loop."""
@@ -167,10 +179,10 @@ class EngineCore:
         self._running = True
         self._start_time = time.time()
         self._task = asyncio.create_task(self._engine_loop())
-        logger.info("Engine started")
+        logger.info("Engine started: %s", self.config.model_name)
 
     async def stop(self) -> None:
-        """Stop the engine loop."""
+        """Stop the engine loop and release model references."""
         self._running = False
         if self._task:
             self._task.cancel()
@@ -179,7 +191,15 @@ class EngineCore:
             except asyncio.CancelledError:
                 pass
             self._task = None
-        logger.info("Engine stopped")
+
+        # Release scheduler and model references so MLX tensors can be
+        # garbage collected. Without this, model weights stay in Metal
+        # memory until the engine object itself is collected.
+        if hasattr(self, 'scheduler') and self.scheduler is not None:
+            self.scheduler.shutdown()
+            self.scheduler = None
+
+        logger.info("Engine stopped: %s", self.config.model_name)
 
     def is_running(self) -> bool:
         """Check if engine is running."""
@@ -202,9 +222,13 @@ class EngineCore:
         while self._running:
             try:
                 if self.scheduler.has_requests():
-                    output = await loop.run_in_executor(
-                        self._mlx_executor, self.scheduler.step
-                    )
+                    self._step_in_flight = True
+                    try:
+                        output = await loop.run_in_executor(
+                            self._mlx_executor, self.scheduler.step
+                        )
+                    finally:
+                        self._step_in_flight = False
                     self._steps_executed += 1
 
                     # Fast path: distribute outputs to collectors
@@ -243,7 +267,20 @@ class EngineCore:
                         # request still in scheduler) block the entire event loop,
                         # making the server unresponsive to all HTTP requests.
                         await asyncio.sleep(0)
+
+                    # Process deferred cleanups from abort_request() now that
+                    # the step has completed and outputs have been distributed.
+                    if self._pending_cleanups:
+                        for rid in list(self._pending_cleanups):
+                            self._cleanup_request(rid)
+                        self._pending_cleanups.clear()
                 else:
+                    # No work — still process any pending cleanups from aborts
+                    # that arrived while idle.
+                    if self._pending_cleanups:
+                        for rid in list(self._pending_cleanups):
+                            self._cleanup_request(rid)
+                        self._pending_cleanups.clear()
                     # No work, yield control
                     await asyncio.sleep(step_interval)
 
@@ -272,6 +309,12 @@ class EngineCore:
                     if event:
                         event.set()
                 await asyncio.sleep(0.1)
+
+        # Process any remaining deferred cleanups on loop exit.
+        if self._pending_cleanups:
+            for rid in list(self._pending_cleanups):
+                self._cleanup_request(rid)
+            self._pending_cleanups.clear()
 
     async def add_request(
         self,
@@ -368,9 +411,9 @@ class EngineCore:
         the same execution context as generation (no race conditions).
 
         Signals the consumer (stream_outputs/generate) with an abort error
-        so it can exit gracefully. Cleanup is handled by the consumer's
-        finally block, NOT here -- calling _cleanup_request() immediately
-        after put() would clear the output before the consumer can drain it.
+        so it can exit gracefully. Cleanup of _output_collectors is deferred
+        to the engine loop (after the current step completes) so that the
+        drain monitor sees active work while GPU is still computing.
         """
         result = self.scheduler.abort_request(request_id)
 
@@ -391,6 +434,11 @@ class EngineCore:
         if event is not None:
             event.set()
 
+        # Defer cleanup to the engine loop — keeps _output_collectors
+        # non-empty so has_active_requests() returns True until the
+        # in-flight step finishes.
+        self._pending_cleanups.add(request_id)
+
         return result
 
     async def abort_all_requests(self) -> int:
@@ -399,31 +447,49 @@ class EngineCore:
         Sends error output to all active collectors and marks requests
         for deferred abort in the scheduler. Cleanup is handled by
         the consumer (stream_outputs/generate).
+
+        The ``error`` field on the error RequestOutput carries a
+        sanitized, client-facing message — no internal flag names or
+        operator-only hints. Streaming handlers raise this as a typed
+        exception and translate to an SSE error chunk; non-streaming
+        handlers raise it via RequestAbortedError and the FastAPI
+        handler maps to HTTP 503. The ``new_text`` field is left
+        empty so handlers that still iterate the output (e.g. legacy
+        consumers) don't accidentally leak the error into assistant
+        content.
         """
         request_ids = list(self._output_collectors.keys())
+        # Client-facing error message — intentionally brief and
+        # operator-detail-free. Operators get the full story from the
+        # server logs; clients only see "retry, the server is under
+        # pressure".
+        public_error = (
+            "Request aborted due to server memory pressure. "
+            "Please retry the request."
+        )
         for rid in request_ids:
             self.scheduler.abort_request(rid)
             collector = self._output_collectors.get(rid)
             if collector is not None:
-                error_msg = (
-                    "Request aborted: process memory limit exceeded. "
-                    "Increase --max-process-memory or reduce context size."
-                )
                 collector.put(
                     RequestOutput(
                         request_id=rid,
                         finished=True,
                         finish_reason="error",
-                        new_text=f"\n\n[Error: {error_msg}]",
-                        error=error_msg,
+                        new_text="",
+                        error=public_error,
                     )
                 )
             event = self._finished_events.get(rid)
             if event is not None:
                 event.set()
+        # Defer cleanup so _output_collectors stays non-empty until
+        # the engine loop processes it (same pattern as abort_request).
+        self._pending_cleanups.update(request_ids)
         if request_ids:
             logger.warning(
-                f"Aborted {len(request_ids)} requests due to memory pressure"
+                f"Aborted {len(request_ids)} requests due to memory pressure: "
+                f"{list(request_ids)}"
             )
         return len(request_ids)
 
@@ -450,7 +516,8 @@ class EngineCore:
         """
         await asyncio.sleep(delay)
         if request_id in self._output_collectors:
-            logger.debug(f"Delayed cleanup for request {request_id}")
+            if __debug__:
+                logger.debug(f"Delayed cleanup for request {request_id}")
             self._cleanup_request(request_id)
 
     async def stream_outputs(
@@ -491,10 +558,28 @@ class EngineCore:
                     else:
                         output = collector.get_nowait() or await collector.get()
 
-                    yield output
-
                     if output.error:
-                        raise RuntimeError(output.error)
+                        # Raise a typed exception that the FastAPI
+                        # streaming handlers catch in their async-for
+                        # wrapping `except Exception:` blocks (e.g.
+                        # stream_chat_completion, stream_completion,
+                        # stream_anthropic_messages, stream_responses_api).
+                        # Those handlers then emit a proper SSE error
+                        # chunk + `data: [DONE]` and return cleanly —
+                        # the client sees a typed error object rather
+                        # than the raw error text embedded as assistant
+                        # content, and the final chunk carries a valid
+                        # OpenAI finish_reason.
+                        #
+                        # Note: we do NOT yield `output` before raising.
+                        # Yielding would let the handler emit the error
+                        # text as a content delta before the except
+                        # block runs, which is exactly the leak we are
+                        # avoiding here. The error payload travels
+                        # solely through the exception.
+                        raise RequestAbortedError(output.error)
+
+                    yield output
 
                     if output.finished:
                         break
@@ -527,28 +612,33 @@ class EngineCore:
         Returns:
             Final RequestOutput with complete text
         """
-        request_id = await self.add_request(
-            prompt=prompt,
-            sampling_params=sampling_params,
-            request_id=request_id,
-            **kwargs,
-        )
-
-        # Wait for completion using event instead of streaming
-        # This avoids the waiting_consumer tracking overhead
-        event = self._finished_events.get(request_id)
-        if event is None:
-            raise RuntimeError(f"No event for request {request_id}")
-
+        submitted = False
         try:
+            request_id = await self.add_request(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                request_id=request_id,
+                **kwargs,
+            )
+            submitted = True
+
+            # Wait for completion using event instead of streaming
+            # This avoids the waiting_consumer tracking overhead
+            event = self._finished_events.get(request_id)
+            if event is None:
+                raise RuntimeError(f"No event for request {request_id}")
+
             # Wait for the request to finish
             await event.wait()
         except asyncio.CancelledError:
             # Client disconnected or task was cancelled - abort the request
-            # to free scheduler/GPU resources (prevents orphaned requests)
-            logger.info(f"Request {request_id} cancelled, aborting")
-            await self.abort_request(request_id)
-            self._cleanup_request(request_id)
+            # to free scheduler/GPU resources (prevents orphaned requests).
+            # The cancel can arrive during add_request() (run_in_executor)
+            # after the scheduler has already accepted the request, so we
+            # must abort whenever the request was submitted.
+            if submitted:
+                logger.info(f"Request {request_id} cancelled, aborting")
+                await self.abort_request(request_id)
             raise
 
         # Get the final output from collector
@@ -571,7 +661,11 @@ class EngineCore:
             raise RuntimeError(f"No output for request {request_id}")
 
         if final_output.error:
-            raise RuntimeError(final_output.error)
+            # Propagate as a typed exception so the FastAPI exception
+            # handler can translate to HTTP 503 instead of falling
+            # through to the generic 500 handler. Typical trigger:
+            # process memory enforcer called abort_all_requests().
+            raise RequestAbortedError(final_output.error)
 
         return final_output
 
@@ -651,7 +745,8 @@ class EngineCore:
             registry = get_registry()
             registry.release(self.model, self._engine_id)
             self._owns_model = False
-            logger.debug(f"Engine {self._engine_id} released model ownership")
+            if __debug__:
+                logger.debug(f"Engine {self._engine_id} released model ownership")
 
     def close(self) -> None:
         """
@@ -669,15 +764,15 @@ class EngineCore:
             registry = get_registry()
             registry.release(self.model, self._engine_id)
             self._owns_model = False
-            logger.debug(f"Engine {self._engine_id} released model ownership")
+            if __debug__:
+                logger.debug(f"Engine {self._engine_id} released model ownership")
 
         self._closed = True
 
         # Shutdown scheduler (clears paged SSD cache if configured)
-        self.scheduler.shutdown()
-
-        # Reset scheduler to clear BatchGenerator and all caches
-        self.scheduler.deep_reset()
+        if self.scheduler is not None:
+            self.scheduler.shutdown()
+            self.scheduler = None
 
         # Clear output collectors
         for collector in self._output_collectors.values():
@@ -691,7 +786,8 @@ class EngineCore:
         self.tokenizer = None
         self.scheduler = None
 
-        logger.debug(f"Engine {self._engine_id} closed")
+        if __debug__:
+            logger.debug(f"Engine {self._engine_id} closed")
 
     def __del__(self):
         """Cleanup on destruction."""
@@ -730,6 +826,11 @@ class AsyncEngineCore:
     def _mlx_executor(self):
         """Expose the MLX executor for VLM vision encoding."""
         return self.engine._mlx_executor
+
+    @property
+    def scheduler(self):
+        """Expose the inner EngineCore's scheduler (may be None after stop)."""
+        return self.engine.scheduler if self.engine is not None else None
 
     async def __aenter__(self) -> "AsyncEngineCore":
         await self.engine.start()

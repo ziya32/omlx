@@ -448,3 +448,4 @@ class TestRequestOutput:
         )
         assert output.tool_calls == tool_calls
         assert len(output.tool_calls) == 2
+

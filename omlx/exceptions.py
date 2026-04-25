@@ -391,12 +391,74 @@ class InsufficientMemoryError(EnginePoolError):
         super().__init__(message)
 
 
-class ModelLoadingError(EnginePoolError):
-    """Raised when a model is already being loaded."""
+class EngineEvictedError(EnginePoolError):
+    """Raised when an engine reference held by a request handler was
+    evicted by the process memory enforcer while the handler was still
+    using it.
+
+    Handlers see this after a get_engine() call when, during the
+    surrounding await, the enforcer aborted and unloaded the model to
+    stay under the soft memory limit. The request cannot continue on
+    the stale engine reference; the client should retry, at which
+    point the model will be reloaded.
+    """
 
     def __init__(self, model_id: str):
         self.model_id = model_id
-        super().__init__(f"Model '{model_id}' is already being loaded")
+        super().__init__(
+            f"Engine for '{model_id}' was evicted due to memory "
+            f"pressure. Please retry the request."
+        )
+
+
+class ModelLoadingError(EnginePoolError):
+    """Raised when a model load fails, times out, or is in cooldown."""
+
+    def __init__(self, model_id_or_message: str | None = None, *, model_id: str | None = None):
+        if model_id is not None and model_id_or_message is not None:
+            # Explicit model_id + custom message
+            self.model_id = model_id
+            super().__init__(model_id_or_message)
+        elif model_id is not None:
+            # Keyword-only: model_id=...
+            self.model_id = model_id
+            super().__init__(f"Model '{model_id}' is already being loaded")
+        elif model_id_or_message is not None:
+            # Legacy: single positional arg is the model_id
+            self.model_id = model_id_or_message
+            super().__init__(f"Model '{model_id_or_message}' is already being loaded")
+        else:
+            self.model_id = ""
+            super().__init__("Model loading error")
+
+
+# =============================================================================
+# Audio Errors
+# =============================================================================
+
+
+class AudioError(OMLXError):
+    """Base exception for audio-related errors."""
+
+    pass
+
+
+class InvalidAudioFormatError(AudioError):
+    """Unsupported or corrupt audio file."""
+
+    pass
+
+
+class VoiceCloningError(AudioError):
+    """Voice cloning failed (missing ref_audio, invalid format, etc.)."""
+
+    pass
+
+
+class UnsupportedOutputFormatError(AudioError):
+    """Requested output format is not supported."""
+
+    pass
 
 
 # =============================================================================

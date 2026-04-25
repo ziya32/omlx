@@ -26,6 +26,7 @@ Usage:
 import asyncio
 import copy
 import logging
+import math
 from collections.abc import AsyncIterator
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -34,6 +35,7 @@ import mlx.core as mx
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..cache.vision_feature_cache import VisionFeatureSSDCache
+from ..exceptions import RequestAbortedError
 from ..models.vlm import VLMModelAdapter
 from ..patches.gated_delta_advance import apply_gated_delta_advance_patch
 from ..patches.qwen3_5_attention import apply_qwen3_5_attention_patch
@@ -135,7 +137,8 @@ def _patch_video_processor_bug():
         mapping = MODALITY_TO_AUTOPROCESSOR_MAPPING._MAPPING_NAMES
         if "video_processor" in mapping:
             del mapping["video_processor"]
-            logger.debug("Removed video_processor from MODALITY_TO_AUTOPROCESSOR_MAPPING")
+            if __debug__:
+                logger.debug("Removed video_processor from MODALITY_TO_AUTOPROCESSOR_MAPPING")
     except (ImportError, AttributeError):
         pass
 
@@ -227,6 +230,7 @@ class VLMBatchedEngine(BaseEngine):
         stream_interval: int = 1,
         enable_thinking: bool | None = None,
         model_settings: Any | None = None,
+        process_memory_max_bytes: int = 0,
     ):
         self._model_name = model_name
         self._trust_remote_code = trust_remote_code
@@ -234,6 +238,7 @@ class VLMBatchedEngine(BaseEngine):
         self._stream_interval = stream_interval
         self._enable_thinking = enable_thinking
         self._model_settings = model_settings
+        self._process_memory_max_bytes = process_memory_max_bytes
 
         self._vlm_model = None
         self._processor = None
@@ -245,6 +250,7 @@ class VLMBatchedEngine(BaseEngine):
         self._grammar_compiler_init_attempted = False
         self._vision_cache = None
         self._vision_cache_enabled = True
+        self._stopped = False
 
     @property
     def model_name(self) -> str:
@@ -253,6 +259,39 @@ class VLMBatchedEngine(BaseEngine):
     @property
     def tokenizer(self) -> Any:
         return self._tokenizer
+
+    @property
+    def scheduler(self):
+        """Get the scheduler via AsyncEngineCore (may be None before start)."""
+        return self._engine.scheduler if self._engine is not None else None
+
+    @property
+    def max_context_window(self) -> int | None:
+        """Get model's max context window from config.
+
+        VLM models store it in text_config.max_position_embeddings.
+        Falls back to root-level fields.
+        """
+        try:
+            config = getattr(self._vlm_model, "config", None)
+            if config is None:
+                return None
+            # VLM models: check text_config first (Qwen-VL, etc.)
+            text_config = getattr(config, "text_config", None)
+            if text_config is not None:
+                for attr in ("max_position_embeddings", "max_seq_len"):
+                    val = getattr(text_config, attr, None)
+                    if isinstance(val, int) and val > 0:
+                        return val
+            # Fallback to root-level
+            for attr in ("max_position_embeddings", "max_seq_len",
+                         "seq_length", "n_positions"):
+                val = getattr(config, attr, None)
+                if isinstance(val, int) and val > 0:
+                    return val
+        except Exception:
+            pass
+        return None
 
     @property
     def model_type(self) -> str | None:
@@ -344,11 +383,14 @@ class VLMBatchedEngine(BaseEngine):
 
         self._ocr_stop_ids_cache = ids
         if ids:
-            logger.debug(f"OCR stop token IDs resolved: {ids}")
+            if __debug__:
+                logger.debug(f"OCR stop token IDs resolved: {ids}")
         return ids
 
     async def start(self) -> None:
         """Load VLM model and processor via mlx-vlm, create engine with VLMModelAdapter."""
+        if self._stopped:
+            raise RuntimeError(f"VLMBatchedEngine for {self._model_name} has been stopped and cannot be restarted")
         if self._loaded:
             return
 
@@ -473,10 +515,62 @@ class VLMBatchedEngine(BaseEngine):
         self._inject_tool_calling(self._tokenizer)
 
         self._loaded = True
+
+        # Compute vision encoding limits from memory headroom.
+        # These are set once at load time and used per-request.
+        self._init_vision_limits()
+
         logger.info(f"VLMBatchedEngine loaded: {self._model_name}")
 
+    def _init_vision_limits(self) -> None:
+        """Compute vision chunk budget and token limit from real memory state.
+
+        Called once after the VLM model finishes loading, when
+        ``mx.get_active_memory()`` reflects the actual committed state.
+        """
+        from ..engine_pool import EnginePool
+        ctx = self.max_context_window or 0
+        self.max_vision_tokens: int = int(ctx * EnginePool._VISION_MAX_CONTEXT_FRACTION) if ctx else 0
+
+        # Derive chunk budget from actual Metal memory headroom.
+        # Clear cache first so active_mem reflects real committed memory,
+        # not stale allocations from recently-unloaded models.
+        try:
+            mx.clear_cache()
+            active_mem = mx.get_active_memory()
+        except Exception:
+            active_mem = 0
+
+        max_bytes = self._process_memory_max_bytes
+        headroom = max(0, max_bytes - active_mem) if max_bytes else 0
+
+        self.vision_chunk_budget_pixels: int = int(
+            headroom * EnginePool._VISION_SAFETY_FACTOR
+            / EnginePool._VISION_BYTES_PER_PIXEL
+        ) if headroom > 0 else 0
+
+        logger.info(
+            "Vision limits: max_vision_tokens=%d, chunk_budget_pixels=%d "
+            "(headroom=%.1fGB, active=%.1fGB, limit=%.1fGB)",
+            self.max_vision_tokens,
+            self.vision_chunk_budget_pixels,
+            headroom / 1e9,
+            active_mem / 1e9,
+            max_bytes / 1e9,
+        )
+
     async def stop(self) -> None:
-        """Stop the engine and cleanup resources."""
+        """Stop the engine and cleanup resources.
+
+        Sets _stopped=True first so that any concurrent or subsequent
+        calls to generate/stream_generate/chat/stream_chat raise
+        RuntimeError instead of silently restarting the engine.
+        This is defense-in-depth — the primary protection is
+        acquire_engine/release_engine in the server endpoints which
+        prevents the drain monitor from calling stop() while requests
+        are in-flight.
+        """
+        self._stopped = True
         if self._engine:
             await self._engine.stop()
             if hasattr(self._engine, 'engine') and self._engine.engine is not None:
@@ -845,10 +939,11 @@ class VLMBatchedEngine(BaseEngine):
                 messages, num_images=num_images
             )
         except Exception as e:
-            logger.debug(
-                "Falling back to mlx-vlm apply_chat_template for VLM formatting: %s",
-                e,
-            )
+            if __debug__:
+                logger.debug(
+                    "Falling back to mlx-vlm apply_chat_template for VLM formatting: %s",
+                    e,
+                )
             # Fallback to upstream formatter for unknown model/format edge cases.
             formatted_messages = apply_chat_template(
                 self._processor,
@@ -919,6 +1014,18 @@ class VLMBatchedEngine(BaseEngine):
                     )
             else:
                 raise
+
+        # Pre-encoding resize: cap individual images to the chunk budget
+        # so no single image can exceed the vision encoder's memory limit.
+        budget = getattr(self, "vision_chunk_budget_pixels", 0)
+        if budget > 0:
+            for i, img in enumerate(images):
+                px = img.width * img.height
+                if px > budget:
+                    scale = math.sqrt(budget / px)
+                    images[i] = img.resize(
+                        (int(img.width * scale), int(img.height * scale)),
+                    )
 
         # Tokenize text and preprocess images
         inputs = prepare_inputs(
@@ -999,114 +1106,246 @@ class VLMBatchedEngine(BaseEngine):
         }
 
         if pixel_values is not None and num_images > 0:
-            # Compute whole-request image hash (used for KV prefix cache keying)
-            image_hash = compute_image_hash(images)
+            grid_thw = extra_model_inputs.get("image_grid_thw")
+            if grid_thw is None:
+                grid_thw = extra_model_inputs.get("video_grid_thw")
 
-            # Build call kwargs from extra_model_inputs
-            call_kwargs = dict(extra_model_inputs)
-
-            # Try per-image vision feature cache
-            if self._vision_cache is not None and self._vision_cache_enabled:
-                per_hashes = compute_per_image_hashes(images)
-                cached_per_image = [
-                    self._vision_cache.get(h, self._model_name) for h in per_hashes
-                ]
-
-                if all(f is not None for f in cached_per_image):
-                    # All images cached individually — combine and use
-                    combined = mx.concatenate(cached_per_image, axis=0)
-                    call_kwargs["cached_image_features"] = combined
-                    logger.debug(
-                        "Vision feature cache hit (per-image): all %d images cached",
-                        num_images,
+            # ── Context window guard ──────────────────────────────────
+            if grid_thw is not None and self.max_vision_tokens > 0:
+                vision_tokens = sum(
+                    int(grid_thw[i, 0]) * int(grid_thw[i, 1]) * int(grid_thw[i, 2])
+                    for i in range(grid_thw.shape[0])
+                ) // 4  # spatial_merge_size=2 → merge by 4
+                if vision_tokens > self.max_vision_tokens:
+                    ctx = self.max_context_window or 0
+                    safe = int(self.max_vision_tokens / (vision_tokens / num_images))
+                    from fastapi import HTTPException
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"vision_token_limit_exceeded: "
+                            f"~{vision_tokens} vision tokens, limit is "
+                            f"{self.max_vision_tokens} (80% of {ctx} context). "
+                            f"Reduce frame count to ~{safe}."
+                        ),
                     )
-                else:
-                    # Some or all uncached — compute all, then cache per-image
-                    try:
-                        features = self._compute_vision_features(
-                            pixel_values, extra_model_inputs
-                        )
-                        if features is not None:
-                            mx.eval(features)
-                            call_kwargs["cached_image_features"] = features
-                            # Split and cache each image individually
-                            per_features = self._split_vision_features(
-                                features, num_images, extra_model_inputs
+
+            # ── Decide: fast path vs chunked path ─────────────────────
+            budget = getattr(self, "vision_chunk_budget_pixels", 0)
+            total_pixels = sum(img.width * img.height for img in images)
+            needs_chunking = budget > 0 and total_pixels > budget
+
+            if not needs_chunking:
+                # Fast path — single pass through get_input_embeddings,
+                # optionally reusing cached vision features for repeated images.
+                image_hash = compute_image_hash(images)
+                call_kwargs = dict(extra_model_inputs)
+
+                # Try vision feature cache
+                if self._vision_cache is not None and self._vision_cache_enabled and image_hash:
+                    cached_features = self._vision_cache.get(image_hash, self._model_name)
+                    if cached_features is not None:
+                        call_kwargs["cached_image_features"] = cached_features
+                        logger.debug("Vision feature cache hit: %s", image_hash[:16])
+                    else:
+                        try:
+                            features = self._compute_vision_features(
+                                pixel_values, extra_model_inputs
                             )
-                            if per_features is not None:
-                                for h, f in zip(per_hashes, per_features):
-                                    self._vision_cache.put(h, self._model_name, f)
-                                logger.debug(
-                                    "Vision feature cache miss, stored %d per-image entries",
-                                    len(per_features),
-                                )
-                            else:
-                                # Split unsupported for this model — store whole-request
+                            if features is not None:
+                                mx.eval(features)
                                 self._vision_cache.put(
                                     image_hash, self._model_name, features
                                 )
+                                call_kwargs["cached_image_features"] = features
                                 logger.debug(
-                                    "Vision feature cache miss, stored whole-request: %s",
+                                    "Vision feature cache miss, stored: %s",
                                     image_hash[:16],
                                 )
-                    except Exception:
-                        logger.debug(
-                            "Vision feature computation failed, using full pipeline",
-                            exc_info=True,
-                        )
+                        except Exception:
+                            logger.debug(
+                                "Vision feature computation failed, using full pipeline",
+                                exc_info=True,
+                            )
 
-            # Run vision encoder + embedding merge.
-            # Pass attention_mask as 'mask' — mlx-vlm models (e.g. Gemma 3)
-            # expect it as a positional/keyword arg named 'mask'.
-            try:
-                embed_features = self._vlm_model.get_input_embeddings(
-                    input_ids, pixel_values, mask=attention_mask, **call_kwargs
+                # Run vision encoder + embedding merge.
+                # Pass attention_mask as 'mask' — mlx-vlm models (e.g. Gemma 3)
+                # expect it as a positional/keyword arg named 'mask'.
+                active_before = mx.get_active_memory()
+                logger.info(
+                    "VLM vision encode start: %d images, "
+                    "pixel_values=%s, active_memory=%.1fGB",
+                    num_images,
+                    list(pixel_values.shape) if pixel_values is not None else None,
+                    active_before / 1024**3,
                 )
-            except TypeError:
-                # cached_image_features kwarg not supported — disable and retry
-                if "cached_image_features" in call_kwargs:
-                    logger.warning(
-                        "cached_image_features not supported by %s, "
-                        "disabling vision feature cache",
-                        self.model_type,
-                    )
-                    self._vision_cache_enabled = False
-                    call_kwargs.pop("cached_image_features")
+                try:
                     embed_features = self._vlm_model.get_input_embeddings(
                         input_ids, pixel_values, mask=attention_mask, **call_kwargs
                     )
-                else:
-                    raise
-            mx.eval(embed_features.inputs_embeds)
+                except TypeError:
+                    # cached_image_features kwarg not supported — disable and retry
+                    if "cached_image_features" in call_kwargs:
+                        logger.warning(
+                            "cached_image_features not supported by %s, "
+                            "disabling vision feature cache",
+                            self.model_type,
+                        )
+                        self._vision_cache_enabled = False
+                        call_kwargs.pop("cached_image_features")
+                        embed_features = self._vlm_model.get_input_embeddings(
+                            input_ids, pixel_values, mask=attention_mask, **call_kwargs
+                        )
+                    else:
+                        raise
+                mx.eval(embed_features.inputs_embeds)
+                active_after = mx.get_active_memory()
+                logger.info(
+                    "VLM vision encode done: embeds_shape=%s, "
+                    "memory_delta=%.1fGB (%.1fGB -> %.1fGB)",
+                    list(embed_features.inputs_embeds.shape),
+                    (active_after - active_before) / 1024**3,
+                    active_before / 1024**3,
+                    active_after / 1024**3,
+                )
 
-            # Convert InputEmbeddingsFeatures to dict for extra kwargs
-            extra_kwargs = {}
-            if hasattr(embed_features, "to_dict"):
-                feat_dict = embed_features.to_dict()
-                for k, v in feat_dict.items():
-                    if k != "inputs_embeds" and v is not None:
-                        extra_kwargs[k] = v
+                extra_kwargs = {}
+                if hasattr(embed_features, "to_dict"):
+                    feat_dict = embed_features.to_dict()
+                    for k, v in feat_dict.items():
+                        if k != "inputs_embeds" and v is not None:
+                            extra_kwargs[k] = v
 
-            # Capture per-request mRoPE state set by
-            # get_input_embeddings(). The language model stores these as
-            # global state that gets overwritten by subsequent calls.
-            # Storing per-request ensures correct position computation
-            # when multiple VLM requests are batched.
-            lm = getattr(self._vlm_model, "language_model", None)
-            if lm is not None:
-                pid = getattr(lm, "_position_ids", None)
-                if pid is not None and "position_ids" not in extra_kwargs:
-                    extra_kwargs["position_ids"] = pid
-                rd = getattr(lm, "_rope_deltas", None)
-                if rd is not None:
-                    extra_kwargs["_captured_rope_deltas"] = rd
+                token_ids = input_ids[0].tolist() if input_ids.ndim > 1 else input_ids.tolist()
+                return (
+                    token_ids,
+                    embed_features.inputs_embeds,
+                    extra_kwargs,
+                    image_hash,
+                    image_cache_key_start,
+                    image_cache_key_ranges,
+                )
 
-            # Extract token IDs as list
+            # ── Chunked vision encoding ───────────────────────────────
+            # Bypass get_input_embeddings and call vision_tower + merge
+            # directly so we can mx.eval per chunk.
+            logger.info(
+                "Chunked vision encoding: %d images, %dM total pixels, "
+                "%dM budget → splitting",
+                num_images,
+                total_pixels // 1_000_000,
+                budget // 1_000_000,
+            )
+
+            vision_tower = self._vlm_model.vision_tower
+            merge_fn = self._vlm_model.merge_input_ids_with_image_features
+            embed_tokens = self._vlm_model.language_model.model.embed_tokens
+            get_rope = self._vlm_model.language_model.get_rope_index
+
+            dtype = vision_tower.patch_embed.proj.weight.dtype
+            pixel_values = pixel_values.astype(dtype)
+
+            # Compute per-image patch counts from grid_thw
+            patches_per_image = [
+                int(grid_thw[i, 0]) * int(grid_thw[i, 1]) * int(grid_thw[i, 2])
+                for i in range(grid_thw.shape[0])
+            ]
+
+            # Group images into chunks respecting pixel budget
+            chunks: list[list[int]] = []
+            cur_indices: list[int] = []
+            cur_pixels = 0
+            for i in range(num_images):
+                px = images[i].width * images[i].height
+                if cur_indices and cur_pixels + px > budget:
+                    chunks.append(cur_indices)
+                    cur_indices, cur_pixels = [], 0
+                cur_indices.append(i)
+                cur_pixels += px
+            if cur_indices:
+                chunks.append(cur_indices)
+
+            # Run vision encoder per chunk
+            all_hidden: list[mx.array] = []
+            patch_offset = 0
+            for chunk_idx, chunk_indices in enumerate(chunks):
+                chunk_grid = grid_thw[chunk_indices]
+                n_patches = sum(patches_per_image[i] for i in chunk_indices)
+                chunk_pv = pixel_values[patch_offset : patch_offset + n_patches]
+                patch_offset += n_patches
+
+                active_before_chunk = mx.get_active_memory()
+                hidden, deepstack_features = vision_tower(chunk_pv, chunk_grid)
+                # Chunked path only supports models without deepstack
+                # (Qwen3.5).  Qwen3-VL deepstack would need concatenation.
+                if deepstack_features:
+                    raise RuntimeError(
+                        f"Chunked vision encoding does not support deepstack "
+                        f"(got {len(deepstack_features)} features)"
+                    )
+                mx.eval(hidden)
+                active_after_chunk = mx.get_active_memory()
+                logger.info(
+                    "Vision chunk %d/%d: %d images, %d patches, "
+                    "hidden=%s, memory_delta=%.1fGB (%.1fGB -> %.1fGB)",
+                    chunk_idx + 1, len(chunks),
+                    len(chunk_indices), n_patches,
+                    list(hidden.shape),
+                    (active_after_chunk - active_before_chunk) / 1024**3,
+                    active_before_chunk / 1024**3,
+                    active_after_chunk / 1024**3,
+                )
+                mx.clear_cache()
+                all_hidden.append(hidden)
+
+            hidden_states = (
+                mx.concatenate(all_hidden, axis=0)
+                if len(all_hidden) > 1
+                else all_hidden[0]
+            )
+
+            # Merge vision features into text embeddings
+            inputs_embeds = embed_tokens(input_ids)
+            inputs_embeds, _ = merge_fn(
+                hidden_states,
+                inputs_embeds,
+                input_ids,
+                self._vlm_model.config.image_token_index,
+                self._vlm_model.config.video_token_index,
+            )
+
+            # Position IDs for RoPE
+            image_grid_thw = extra_model_inputs.get("image_grid_thw")
+            video_grid_thw = extra_model_inputs.get("video_grid_thw")
+            position_ids, rope_deltas = get_rope(
+                input_ids, image_grid_thw, video_grid_thw, attention_mask,
+            )
+            # Set on model for the initial prefill and subsequent decode.
+            self._vlm_model.language_model._position_ids = position_ids
+            self._vlm_model.language_model._rope_deltas = rope_deltas
+
+            mx.eval(inputs_embeds)
+            logger.info(
+                "VLM chunked encode done: embeds_shape=%s, "
+                "active_memory=%.1fGB",
+                list(inputs_embeds.shape),
+                mx.get_active_memory() / 1024**3,
+            )
+
             token_ids = input_ids[0].tolist() if input_ids.ndim > 1 else input_ids.tolist()
-
+            image_hash = compute_image_hash(images)
+            # Store mRoPE position state in extra_kwargs so the scheduler
+            # can restore it before retries.  Without this, a cache-corruption
+            # recovery followed by an intervening text-only request overwrites
+            # the model's _position_ids with a short text grid, and the VLM
+            # retry hits a broadcast_shapes error (the root cause of #131).
+            extra_kwargs = {
+                "_vlm_position_ids": position_ids,
+                "_vlm_rope_deltas": rope_deltas,
+            }
             return (
                 token_ids,
-                embed_features.inputs_embeds,
+                inputs_embeds,
                 extra_kwargs,
                 image_hash,
                 image_cache_key_start,
@@ -1162,6 +1401,7 @@ class VLMBatchedEngine(BaseEngine):
         repetition_penalty: float = 1.0,
         presence_penalty: float = 0.0,
         stop: list[str] | None = None,
+        request_id: str | None = None,
         vlm_inputs_embeds: Any = None,
         vlm_extra_kwargs: dict[str, Any] | None = None,
         vlm_image_hash: str | None = None,
@@ -1170,6 +1410,16 @@ class VLMBatchedEngine(BaseEngine):
         **kwargs,
     ) -> GenerationOutput:
         """Generate a complete response (non-streaming)."""
+        if self._stopped:
+            # Narrow race with ProcessMemoryEnforcer: a handler captured
+            # this engine reference before the enforcer's abort + unload,
+            # and ensure_engine_alive may not have tripped. Raise the
+            # typed exception so the FastAPI request_aborted_handler
+            # translates to HTTP 503 instead of falling through to 500.
+            raise RequestAbortedError(
+                f"Engine for {self._model_name} has been stopped "
+                f"due to memory pressure. Please retry the request."
+            )
         if not self._loaded:
             await self.start()
 
@@ -1203,6 +1453,7 @@ class VLMBatchedEngine(BaseEngine):
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
+            request_id=request_id,
             vlm_inputs_embeds=vlm_inputs_embeds,
             vlm_extra_kwargs=vlm_extra_kwargs,
             vlm_image_hash=vlm_image_hash,
@@ -1232,6 +1483,7 @@ class VLMBatchedEngine(BaseEngine):
         repetition_penalty: float = 1.0,
         presence_penalty: float = 0.0,
         stop: list[str] | None = None,
+        request_id: str | None = None,
         vlm_inputs_embeds: Any = None,
         vlm_extra_kwargs: dict[str, Any] | None = None,
         vlm_image_hash: str | None = None,
@@ -1240,6 +1492,16 @@ class VLMBatchedEngine(BaseEngine):
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """Stream generation token by token."""
+        if self._stopped:
+            # Narrow race with ProcessMemoryEnforcer: a handler captured
+            # this engine reference before the enforcer's abort + unload,
+            # and ensure_engine_alive may not have tripped. Raise the
+            # typed exception so the FastAPI request_aborted_handler
+            # translates to HTTP 503 instead of falling through to 500.
+            raise RequestAbortedError(
+                f"Engine for {self._model_name} has been stopped "
+                f"due to memory pressure. Please retry the request."
+            )
         if not self._loaded:
             await self.start()
 
@@ -1281,19 +1543,22 @@ class VLMBatchedEngine(BaseEngine):
         if kwargs.get("specprefill_system_end") is not None:
             specprefill_kwargs["specprefill_system_end"] = kwargs.pop("specprefill_system_end")
 
-        request_id = await self._engine.add_request(
-            prompt=prompt,
-            sampling_params=sampling_params,
-            vlm_inputs_embeds=vlm_inputs_embeds,
-            vlm_extra_kwargs=vlm_extra_kwargs,
-            vlm_image_hash=vlm_image_hash,
-            vlm_cache_key_start=vlm_cache_key_start,
-            vlm_cache_key_ranges=vlm_cache_key_ranges,
-            **specprefill_kwargs,
-        )
-
+        submitted = False
         finished_normally = False
         try:
+            request_id = await self._engine.add_request(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                request_id=request_id,
+                vlm_inputs_embeds=vlm_inputs_embeds,
+                vlm_extra_kwargs=vlm_extra_kwargs,
+                vlm_image_hash=vlm_image_hash,
+                vlm_cache_key_start=vlm_cache_key_start,
+                vlm_cache_key_ranges=vlm_cache_key_ranges,
+                **specprefill_kwargs,
+            )
+            submitted = True
+
             async for output in self._engine.stream_outputs(request_id):
                 text = clean_special_tokens(output.output_text)
 
@@ -1312,8 +1577,10 @@ class VLMBatchedEngine(BaseEngine):
                 )
         except GeneratorExit:
             logger.info(f"[vlm_stream_generate] GeneratorExit for request {request_id}")
+        except asyncio.CancelledError:
+            logger.info(f"[vlm_stream_generate] CancelledError for request {request_id}")
         finally:
-            if not finished_normally:
+            if submitted and not finished_normally:
                 logger.info(f"[vlm_stream_generate] Aborting request {request_id}")
                 await self._engine.abort_request(request_id)
 
@@ -1328,9 +1595,20 @@ class VLMBatchedEngine(BaseEngine):
         repetition_penalty: float = 1.0,
         presence_penalty: float = 0.0,
         tools: list[dict] | None = None,
+        request_id: str | None = None,
         **kwargs,
     ) -> GenerationOutput:
         """Chat completion with vision support (non-streaming)."""
+        if self._stopped:
+            # Narrow race with ProcessMemoryEnforcer: a handler captured
+            # this engine reference before the enforcer's abort + unload,
+            # and ensure_engine_alive may not have tripped. Raise the
+            # typed exception so the FastAPI request_aborted_handler
+            # translates to HTTP 503 instead of falling through to 500.
+            raise RequestAbortedError(
+                f"Engine for {self._model_name} has been stopped "
+                f"due to memory pressure. Please retry the request."
+            )
         if not self._loaded:
             await self.start()
 
@@ -1339,6 +1617,15 @@ class VLMBatchedEngine(BaseEngine):
             self._engine._mlx_executor,
             self._process_chat_messages, messages, tools, kwargs,
         )
+
+        # Test-only capture (no-op unless OMLX_DEBUG_CAPTURE=1).
+        # When images are present, the prompt is token IDs (list[int]) from the
+        # vision pipeline, so it can't be captured as text.  Text-only messages
+        # (where tool definitions live) always produce a str prompt and are
+        # captured here.
+        if isinstance(prompt, str):
+            from ..debug_capture import capture_prompt
+            capture_prompt(prompt)
 
         return await self.generate(
             prompt=prompt,
@@ -1349,6 +1636,7 @@ class VLMBatchedEngine(BaseEngine):
             min_p=min_p,
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
+            request_id=request_id,
             vlm_inputs_embeds=vlm_embeds,
             vlm_extra_kwargs=vlm_kwargs,
             vlm_image_hash=image_hash,
@@ -1368,9 +1656,20 @@ class VLMBatchedEngine(BaseEngine):
         repetition_penalty: float = 1.0,
         presence_penalty: float = 0.0,
         tools: list[dict] | None = None,
+        request_id: str | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """Stream chat completion with vision support."""
+        if self._stopped:
+            # Narrow race with ProcessMemoryEnforcer: a handler captured
+            # this engine reference before the enforcer's abort + unload,
+            # and ensure_engine_alive may not have tripped. Raise the
+            # typed exception so the FastAPI request_aborted_handler
+            # translates to HTTP 503 instead of falling through to 500.
+            raise RequestAbortedError(
+                f"Engine for {self._model_name} has been stopped "
+                f"due to memory pressure. Please retry the request."
+            )
         if not self._loaded:
             await self.start()
 
@@ -1383,6 +1682,15 @@ class VLMBatchedEngine(BaseEngine):
             self._engine._mlx_executor,
             self._process_chat_messages, messages, tools, kwargs,
         )
+
+        # Test-only capture (no-op unless OMLX_DEBUG_CAPTURE=1).
+        # When images are present, the prompt is token IDs (list[int]) from the
+        # vision pipeline, so it can't be captured as text.  Text-only messages
+        # (where tool definitions live) always produce a str prompt and are
+        # captured here.
+        if isinstance(prompt, str):
+            from ..debug_capture import capture_prompt
+            capture_prompt(prompt)
 
         # SpecPrefill: compute system prompt token count for protection.
         # Can't template system-only messages (most templates require user),
@@ -1412,6 +1720,7 @@ class VLMBatchedEngine(BaseEngine):
             min_p=min_p,
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
+            request_id=request_id,
             vlm_inputs_embeds=vlm_embeds,
             vlm_extra_kwargs=vlm_kwargs,
             vlm_image_hash=image_hash,
@@ -1529,20 +1838,46 @@ class VLMBatchedEngine(BaseEngine):
         tools: list[dict] | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
     ) -> int:
-        """Count prompt tokens for chat messages (text-only approximation).
+        """Count prompt tokens for chat messages including image token estimates.
 
-        For VLM messages with images, this counts only the text tokens.
-        Image tokens are added during vision encoding and vary by model.
+        Strips image parts from messages without loading them via PIL, then
+        estimates image tokens from the base64 header dimensions using the
+        model's vision config (patch_size, merge_size).
         """
-        # Extract text-only version for token counting
-        from ..utils.image import extract_images_from_messages
-        text_messages, _ = extract_images_from_messages(messages)
+        from ..utils.image import strip_images_and_estimate_tokens
+
+        # Read vision config from the loaded model
+        patch_size = 14
+        merge_size = 2
+        min_pixels = 56 * 56
+        max_pixels = 14 * 14 * 4 * 1280
+        if self._vlm_model is not None and hasattr(self._vlm_model, "config"):
+            vc = getattr(self._vlm_model.config, "vision_config", None)
+            if vc is not None:
+                patch_size = getattr(vc, "patch_size", patch_size)
+                merge_size = getattr(vc, "spatial_merge_size",
+                                     getattr(vc, "merge_size", merge_size))
+        # Read pixel bounds from processor if available
+        if self._processor is not None:
+            ip = getattr(self._processor, "image_processor", None)
+            if ip is not None:
+                min_pixels = getattr(ip, "min_pixels", min_pixels)
+                max_pixels = getattr(ip, "max_pixels", max_pixels)
+
+        text_messages, image_tokens = strip_images_and_estimate_tokens(
+            messages,
+            patch_size=patch_size,
+            merge_size=merge_size,
+            min_pixels=min_pixels,
+            max_pixels=max_pixels,
+        )
 
         template_tools = convert_tools_for_template(tools) if tools else None
         prompt = self._apply_chat_template(
             text_messages, template_tools, chat_template_kwargs=chat_template_kwargs
         )
-        return len(self._tokenizer.encode(prompt))
+        text_tokens = len(self._tokenizer.encode(prompt))
+        return text_tokens + image_tokens
 
     def has_active_requests(self) -> bool:
         """Check if the engine has active in-flight requests."""
@@ -1550,8 +1885,10 @@ class VLMBatchedEngine(BaseEngine):
         if engine_core is not None:
             inner = getattr(engine_core, "engine", None)
             if inner is not None:
-                collectors = getattr(inner, "_output_collectors", {})
-                return len(collectors) > 0
+                if len(getattr(inner, "_output_collectors", {})) > 0:
+                    return True
+                if getattr(inner, "_step_in_flight", False):
+                    return True
         return False
 
     def get_stats(self) -> dict[str, Any]:

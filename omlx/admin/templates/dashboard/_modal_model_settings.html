@@ -477,6 +477,30 @@
                                 </div>
                             </div>
 
+                            <!-- Exclusive Mode -->
+                            <div class="p-4 bg-neutral-50 rounded-xl space-y-3">
+                                <div class="flex items-start justify-between gap-3">
+                                    <div class="min-w-0">
+                                        <span class="text-sm font-medium text-neutral-700">Exclusive</span>
+                                        <p class="text-xs text-neutral-500 mt-0.5">Evict non-pinned models when this model receives a request</p>
+                                        <p x-show="!selectedModel?.pinned" class="text-xs text-amber-600 mt-1">Requires model to be pinned</p>
+                                    </div>
+                                    <button type="button" @click="modelSettings.exclusive = !modelSettings.exclusive; if (!modelSettings.exclusive) modelSettings.exclusive_max_hold = 0;"
+                                            :class="modelSettings.exclusive ? 'bg-black' : 'bg-neutral-200'"
+                                            :disabled="!selectedModel?.pinned"
+                                            class="relative flex-shrink-0 w-11 h-6 mt-0.5 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black disabled:opacity-40 disabled:cursor-not-allowed">
+                                        <span :class="modelSettings.exclusive ? 'translate-x-5' : 'translate-x-0'"
+                                              class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                    </button>
+                                </div>
+                                <div x-show="modelSettings.exclusive" x-transition class="pt-1">
+                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">Max Hold (seconds)</label>
+                                    <input type="number" x-model.number="modelSettings.exclusive_max_hold" placeholder="0 = unlimited" min="0" step="60"
+                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                    <p class="text-xs text-neutral-400 mt-1">Maximum continuous exclusive hold time before allowing non-pinned models to coexist</p>
+                                </div>
+                            </div>
+
                             <!-- Chat Template Kwargs -->
                             <div class="p-4 bg-neutral-50 rounded-xl space-y-3">
                                 <div class="flex items-center justify-between">
@@ -571,6 +595,44 @@
                                 <!-- Empty state -->
                                 <p x-show="modelSettings.ctKwargEntries.length === 0" class="text-xs text-neutral-400 text-center py-1">{{ t('modal.model_settings.no_kwargs') }}</p>
                             </div>
+
+                            <!-- Audio Settings (shown for TTS/ASR models) -->
+                            <template x-if="selectedModel?.model_type === 'tts' || selectedModel?.model_type === 'asr' || modelSettings.model_type_override === 'tts' || modelSettings.model_type_override === 'asr'">
+                                <div>
+                                    <h4 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mt-2 mb-3">{{ t('modal.model_settings.audio_label') }}</h4>
+                                    <div class="p-4 bg-neutral-50 rounded-xl space-y-4">
+                                        <p class="text-xs text-neutral-400">{{ t('modal.model_settings.audio_hint') }}</p>
+
+                                        <!-- Default Voice (TTS only) -->
+                                        <template x-if="selectedModel?.model_type === 'tts' || modelSettings.model_type_override === 'tts'">
+                                            <div class="space-y-3">
+                                                <div>
+                                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.default_voice') }}</label>
+                                                    <input type="text" x-model="modelSettings.default_voice"
+                                                           placeholder="{{ t('modal.model_settings.default_voice_placeholder') }}"
+                                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                </div>
+                                                <div>
+                                                    <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.default_instruct') }}</label>
+                                                    <input type="text" x-model="modelSettings.default_instruct"
+                                                           placeholder="{{ t('modal.model_settings.default_instruct_placeholder') }}"
+                                                           class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                </div>
+                                            </div>
+                                        </template>
+
+                                        <!-- Default Language (ASR only) -->
+                                        <template x-if="selectedModel?.model_type === 'asr' || modelSettings.model_type_override === 'asr'">
+                                            <div>
+                                                <label class="block text-xs font-bold uppercase tracking-wider text-neutral-500 mb-2">{{ t('modal.model_settings.default_language') }}</label>
+                                                <input type="text" x-model="modelSettings.default_language"
+                                                       placeholder="{{ t('modal.model_settings.default_language_placeholder') }}"
+                                                       class="w-full px-4 py-2.5 border border-neutral-200 rounded-xl text-sm focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                            </div>
+                                        </template>
+                                    </div>
+                                </div>
+                            </template>
 
                             <!-- Experimental Features -->
                             <h4 class="text-xs font-bold uppercase tracking-widest text-neutral-400 mb-3">{{ t('modal.model_settings.experimental_label') }}</h4>

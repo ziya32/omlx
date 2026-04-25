@@ -215,11 +215,12 @@ class MCPClient:
 
         # Initialize with capabilities
         result = await self._session.initialize()
-        logger.debug(
-            f"MCP server '{self.name}' initialized: "
-            f"protocol={result.protocolVersion}, "
-            f"server={result.serverInfo.name if result.serverInfo else 'unknown'}"
-        )
+        if __debug__:
+            logger.debug(
+                f"MCP server '{self.name}' initialized: "
+                f"protocol={result.protocolVersion}, "
+                f"server={result.serverInfo.name if result.serverInfo else 'unknown'}"
+            )
 
     async def _discover_tools(self):
         """Discover available tools from the server."""
@@ -240,7 +241,8 @@ class MCPClient:
                     else {},
                 )
                 self._tools.append(mcp_tool)
-                logger.debug(f"Discovered tool: {mcp_tool.full_name}")
+                if __debug__:
+                    logger.debug(f"Discovered tool: {mcp_tool.full_name}")
 
         except Exception as e:
             logger.warning(f"Failed to discover tools from '{self.name}': {e}")

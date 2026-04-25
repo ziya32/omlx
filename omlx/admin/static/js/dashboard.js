@@ -93,7 +93,7 @@
             showModelSettingsModal: false,
             selectedModel: null,
             modelSettings: {
-                model_alias: '',
+                aliases: '',
                 model_type_override: '',
                 max_context_window: null,
                 max_tokens: null,
@@ -106,6 +106,8 @@
                 force_sampling: false,
                 enableToolResultLimit: false,
                 max_tool_result_tokens: null,
+                exclusive: false,
+                exclusive_max_hold: 0,
                 ctKwargEntries: [],
                 trust_remote_code: false,
             },
@@ -1520,7 +1522,7 @@
                 }
                 const isOcr = OCR_CONFIG_MODEL_TYPES.has(model.config_model_type || '');
                 this.modelSettings = {
-                    model_alias: settings.model_alias || '',
+                    aliases: (settings.aliases || []).join(', '),
                     model_type_override: settings.model_type_override || '',
                     max_context_window: settings.max_context_window || null,
                     max_tokens: settings.max_tokens || null,
@@ -1550,6 +1552,11 @@
                     dflash_enabled: settings.dflash_enabled || false,
                     dflash_draft_model: settings.dflash_draft_model || '',
                     dflash_draft_quant_bits: settings.dflash_draft_quant_bits ? String(settings.dflash_draft_quant_bits) : '',
+                    default_voice: settings.default_voice || '',
+                    default_instruct: settings.default_instruct || '',
+                    default_language: settings.default_language || '',
+                    exclusive: settings.exclusive || false,
+                    exclusive_max_hold: settings.exclusive_max_hold || 0,
                     ctKwargEntries,
                     trust_remote_code: settings.trust_remote_code || false,
                 };
@@ -1586,7 +1593,7 @@
                                 }
                             }
                             return {
-                                model_alias: this.modelSettings.model_alias?.trim() || null,
+                                aliases: this.modelSettings.aliases?.trim() ? this.modelSettings.aliases.split(',').map(s => s.trim()).filter(Boolean) : null,
                                 model_type_override: this.modelSettings.model_type_override || null,
                                 max_context_window: this.modelSettings.max_context_window || null,
                                 max_tokens: this.modelSettings.max_tokens || null,
@@ -1610,6 +1617,9 @@
                                 max_tool_result_tokens: this.modelSettings.enableToolResultLimit
                                     ? (this.modelSettings.max_tool_result_tokens || null)
                                     : 0,
+                                default_voice: this.modelSettings.default_voice?.trim() || null,
+                                default_instruct: this.modelSettings.default_instruct?.trim() || null,
+                                default_language: this.modelSettings.default_language?.trim() || null,
                                 chat_template_kwargs: Object.keys(chatTemplateKwargs).length > 0
                                     ? chatTemplateKwargs : null,
                                 forced_ct_kwargs: forcedCtKwargs.length > 0
@@ -1632,6 +1642,8 @@
                                     ? parseInt(this.modelSettings.dflash_draft_quant_bits)
                                     : null,
                                 trust_remote_code: this.modelSettings.trust_remote_code,
+                                exclusive: this.modelSettings.exclusive,
+                                exclusive_max_hold: this.modelSettings.exclusive_max_hold || null,
                             };
                         })()),
                     });

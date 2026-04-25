@@ -6,6 +6,7 @@ This engine wraps AsyncEngineCore to provide continuous batching
 for better throughput when serving multiple concurrent requests.
 """
 
+import asyncio
 import copy
 import logging
 from collections.abc import AsyncIterator
@@ -13,6 +14,7 @@ from typing import Any
 
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
+from ..exceptions import RequestAbortedError
 from ..utils.tokenizer import get_tokenizer_config
 from .base import BaseEngine, GenerationOutput
 
@@ -70,6 +72,7 @@ class BatchedEngine(BaseEngine):
         self._loaded = False
         self._grammar_compiler = None
         self._grammar_compiler_init_attempted = False
+        self._stopped = False
 
     @property
     def model_name(self) -> str:
@@ -80,6 +83,32 @@ class BatchedEngine(BaseEngine):
     def tokenizer(self) -> Any:
         """Get the tokenizer."""
         return self._tokenizer
+
+    @property
+    def scheduler(self):
+        """Get the scheduler via AsyncEngineCore (may be None before start)."""
+        return self._engine.scheduler if self._engine is not None else None
+
+    @property
+    def max_context_window(self) -> int | None:
+        """Get model's max context window from config."""
+        try:
+            config = getattr(self._model, "config", None)
+            if config is None:
+                return None
+            # Non-VLM models: max_position_embeddings at root
+            for attr in ("max_position_embeddings", "max_seq_len",
+                         "seq_length", "n_positions"):
+                val = getattr(config, attr, None)
+                if isinstance(val, int) and val > 0:
+                    return val
+                if isinstance(config, dict):
+                    val = config.get(attr)
+                    if isinstance(val, int) and val > 0:
+                        return val
+        except Exception:
+            pass
+        return None
 
     @property
     def model_type(self) -> str | None:
@@ -102,7 +131,8 @@ class BatchedEngine(BaseEngine):
                     model_type = args.model_type
                     return model_type if isinstance(model_type, str) else None
         except Exception as e:
-            logger.debug(f"Error getting model_type: {e}")
+            if __debug__:
+                logger.debug(f"Error getting model_type: {e}")
         return None
 
     @property
@@ -193,6 +223,8 @@ class BatchedEngine(BaseEngine):
 
     async def start(self) -> None:
         """Start the engine (load model if not loaded)."""
+        if self._stopped:
+            raise RuntimeError(f"BatchedEngine for {self._model_name} has been stopped and cannot be restarted")
         if self._loaded:
             return
 
@@ -289,7 +321,17 @@ class BatchedEngine(BaseEngine):
         logger.info(f"BatchedEngine loaded: {self._model_name}")
 
     async def stop(self) -> None:
-        """Stop the engine and cleanup resources."""
+        """Stop the engine and cleanup resources.
+
+        Sets _stopped=True first so that any concurrent or subsequent
+        calls to generate/stream_generate/chat/stream_chat raise
+        RuntimeError instead of silently restarting the engine.
+        This is defense-in-depth — the primary protection is
+        acquire_engine/release_engine in the server endpoints which
+        prevents the drain monitor from calling stop() while requests
+        are in-flight.
+        """
+        self._stopped = True
         if self._engine:
             await self._engine.stop()
             if hasattr(self._engine, 'engine') and self._engine.engine is not None:
@@ -388,6 +430,7 @@ class BatchedEngine(BaseEngine):
         repetition_penalty: float = 1.0,
         presence_penalty: float = 0.0,
         stop: list[str] | None = None,
+        request_id: str | None = None,
         **kwargs,
     ) -> GenerationOutput:
         """
@@ -408,6 +451,16 @@ class BatchedEngine(BaseEngine):
         Returns:
             GenerationOutput with complete text
         """
+        if self._stopped:
+            # Narrow race with ProcessMemoryEnforcer: a handler captured
+            # this engine reference before the enforcer's abort + unload,
+            # and ensure_engine_alive may not have tripped. Raise the
+            # typed exception so the FastAPI request_aborted_handler
+            # translates to HTTP 503 instead of falling through to 500.
+            raise RequestAbortedError(
+                f"Engine for {self._model_name} has been stopped "
+                f"due to memory pressure. Please retry the request."
+            )
         if not self._loaded:
             await self.start()
 
@@ -433,6 +486,7 @@ class BatchedEngine(BaseEngine):
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
+            request_id=request_id,
         )
 
         text = clean_special_tokens(output.output_text)
@@ -457,6 +511,7 @@ class BatchedEngine(BaseEngine):
         repetition_penalty: float = 1.0,
         presence_penalty: float = 0.0,
         stop: list[str] | None = None,
+        request_id: str | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """
@@ -477,6 +532,16 @@ class BatchedEngine(BaseEngine):
         Yields:
             GenerationOutput with incremental text
         """
+        if self._stopped:
+            # Narrow race with ProcessMemoryEnforcer: a handler captured
+            # this engine reference before the enforcer's abort + unload,
+            # and ensure_engine_alive may not have tripped. Raise the
+            # typed exception so the FastAPI request_aborted_handler
+            # translates to HTTP 503 instead of falling through to 500.
+            raise RequestAbortedError(
+                f"Engine for {self._model_name} has been stopped "
+                f"due to memory pressure. Please retry the request."
+            )
         if not self._loaded:
             await self.start()
 
@@ -510,14 +575,17 @@ class BatchedEngine(BaseEngine):
         if kwargs.get("specprefill_system_end") is not None:
             specprefill_kwargs["specprefill_system_end"] = kwargs.pop("specprefill_system_end")
 
-        request_id = await self._engine.add_request(
-            prompt=prompt,
-            sampling_params=sampling_params,
-            **specprefill_kwargs,
-        )
-
+        submitted = False
         finished_normally = False
         try:
+            request_id = await self._engine.add_request(
+                prompt=prompt,
+                sampling_params=sampling_params,
+                request_id=request_id,
+                **specprefill_kwargs,
+            )
+            submitted = True
+
             async for output in self._engine.stream_outputs(request_id):
                 text = clean_special_tokens(output.output_text)
 
@@ -541,13 +609,16 @@ class BatchedEngine(BaseEngine):
         except GeneratorExit:
             # Client disconnected
             logger.info(f"[stream_generate] GeneratorExit caught for request {request_id}")
+        except asyncio.CancelledError:
+            logger.info(f"[stream_generate] CancelledError for request {request_id}")
         finally:
             # Abort the request if client disconnected before completion
-            if not finished_normally:
+            if submitted and not finished_normally:
                 logger.info(f"[stream_generate] Aborting request {request_id} (finished_normally={finished_normally})")
                 await self._engine.abort_request(request_id)
-            else:
-                logger.debug(f"[stream_generate] Request {request_id} finished normally")
+            elif submitted:
+                if __debug__:
+                    logger.debug(f"[stream_generate] Request {request_id} finished normally")
 
     async def chat(
         self,
@@ -560,6 +631,7 @@ class BatchedEngine(BaseEngine):
         repetition_penalty: float = 1.0,
         presence_penalty: float = 0.0,
         tools: list[dict] | None = None,
+        request_id: str | None = None,
         **kwargs,
     ) -> GenerationOutput:
         """
@@ -580,6 +652,16 @@ class BatchedEngine(BaseEngine):
         Returns:
             GenerationOutput with assistant response
         """
+        if self._stopped:
+            # Narrow race with ProcessMemoryEnforcer: a handler captured
+            # this engine reference before the enforcer's abort + unload,
+            # and ensure_engine_alive may not have tripped. Raise the
+            # typed exception so the FastAPI request_aborted_handler
+            # translates to HTTP 503 instead of falling through to 500.
+            raise RequestAbortedError(
+                f"Engine for {self._model_name} has been stopped "
+                f"due to memory pressure. Please retry the request."
+            )
         if not self._loaded:
             await self.start()
 
@@ -595,6 +677,10 @@ class BatchedEngine(BaseEngine):
             messages, template_tools, chat_template_kwargs=ct_kwargs
         )
 
+        # Test-only capture (no-op unless OMLX_DEBUG_CAPTURE=1)
+        from ..debug_capture import capture_prompt
+        capture_prompt(prompt)
+
         return await self.generate(
             prompt=prompt,
             max_tokens=max_tokens,
@@ -604,6 +690,7 @@ class BatchedEngine(BaseEngine):
             min_p=min_p,
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
+            request_id=request_id,
             **kwargs,
         )
 
@@ -618,6 +705,7 @@ class BatchedEngine(BaseEngine):
         repetition_penalty: float = 1.0,
         presence_penalty: float = 0.0,
         tools: list[dict] | None = None,
+        request_id: str | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """
@@ -638,6 +726,16 @@ class BatchedEngine(BaseEngine):
         Yields:
             GenerationOutput with incremental text
         """
+        if self._stopped:
+            # Narrow race with ProcessMemoryEnforcer: a handler captured
+            # this engine reference before the enforcer's abort + unload,
+            # and ensure_engine_alive may not have tripped. Raise the
+            # typed exception so the FastAPI request_aborted_handler
+            # translates to HTTP 503 instead of falling through to 500.
+            raise RequestAbortedError(
+                f"Engine for {self._model_name} has been stopped "
+                f"due to memory pressure. Please retry the request."
+            )
         if not self._loaded:
             await self.start()
 
@@ -652,6 +750,10 @@ class BatchedEngine(BaseEngine):
         prompt = self._apply_chat_template(
             messages, template_tools, chat_template_kwargs=ct_kwargs
         )
+
+        # Test-only capture (no-op unless OMLX_DEBUG_CAPTURE=1)
+        from ..debug_capture import capture_prompt
+        capture_prompt(prompt)
 
         # SpecPrefill: compute system prompt token count for protection.
         # Can't template system-only messages (most templates require user),
@@ -681,6 +783,7 @@ class BatchedEngine(BaseEngine):
             min_p=min_p,
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
+            request_id=request_id,
             **kwargs,
         ):
             yield output
@@ -691,8 +794,13 @@ class BatchedEngine(BaseEngine):
         if engine_core is not None:
             inner = getattr(engine_core, "engine", None)
             if inner is not None:
-                collectors = getattr(inner, "_output_collectors", {})
-                return len(collectors) > 0
+                if len(getattr(inner, "_output_collectors", {})) > 0:
+                    return True
+                # A scheduler step may be in flight on the MLX executor
+                # even though _output_collectors is empty (narrow window
+                # between final step completion and collector cleanup).
+                if getattr(inner, "_step_in_flight", False):
+                    return True
         return False
 
     def get_stats(self) -> dict[str, Any]:

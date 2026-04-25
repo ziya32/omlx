@@ -300,6 +300,47 @@ omlx serve --model-dir ~/models --api-key your-secret-key
 
 All settings can also be configured from the web admin panel at `/admin`. Settings are persisted to `~/.omlx/settings.json`, and CLI flags take precedence.
 
+### Network Discovery
+
+oMLX can advertise itself on your local network so other machines can find and connect to it automatically — no manual IP/port configuration needed.
+
+**How it works:** When bound to a non-loopback address (the default is `0.0.0.0`), oMLX publishes a Bonjour/mDNS service. Clients (like [MyEmee](https://github.com/jundot/myemee) gateways) discover the server via mDNS on the LAN or via Tailscale peer probing.
+
+**Auto-generated API key:** If no API key is configured when binding to a non-loopback address, oMLX automatically generates a secure key, saves it to `~/.omlx/settings.json`, and writes it to the MyEmee config (`~/.myemee/config.json`) if present. This ensures the server is never exposed without authentication.
+
+```bash
+# Just start the server — discoverable and secured by default
+omlx serve --model-dir ~/models
+
+# The generated API key is printed on first start:
+#   Generated API key: <key>
+#   Saved to omlx settings.json
+#   Updated nanobot config at ~/.myemee/config.json
+```
+
+To use a specific key instead of auto-generating:
+
+```bash
+omlx serve --model-dir ~/models --api-key your-secret-key
+```
+
+To restrict to localhost only (disables discovery):
+
+```bash
+omlx serve --model-dir ~/models --host 127.0.0.1
+```
+
+Discovery can also be disabled via settings while keeping the server network-accessible:
+
+```bash
+OMLX_DISCOVERY_ENABLED=false omlx serve --model-dir ~/models
+```
+
+**Typical setup — GPU machine shares models with other devices:**
+
+1. On the GPU machine: `omlx serve --model-dir ~/models` (binds to `0.0.0.0`, auto-generates key, publishes mDNS)
+2. On other machines: set `"location": "discover"` in MyEmee's config — it finds the server automatically
+
 <details>
 <summary>Architecture</summary>
 

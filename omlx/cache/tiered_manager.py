@@ -108,7 +108,8 @@ class TieredCacheManager:
             return None
 
         if not paged_ssd_cache_dir:
-            logger.debug("Paged paged SSD cache not configured (no --paged-ssd-cache-dir specified)")
+            if __debug__:
+                logger.debug("Paged paged SSD cache not configured (no --paged-ssd-cache-dir specified)")
             return None
 
         try:
@@ -186,7 +187,8 @@ class TieredCacheManager:
         evictable = self.paged_cache_manager.get_evictable_blocks(num_blocks_to_evict)
 
         if not evictable:
-            logger.debug("No evictable blocks found for permanent eviction")
+            if __debug__:
+                logger.debug("No evictable blocks found for permanent eviction")
             return 0
 
         freed = 0
@@ -238,7 +240,8 @@ class TieredCacheManager:
         evictable = self.paged_cache_manager.get_evictable_blocks(num_blocks_to_evict)
 
         if not evictable:
-            logger.debug("No evictable blocks found")
+            if __debug__:
+                logger.debug("No evictable blocks found")
             return 0
 
         evicted_count = 0
@@ -293,9 +296,10 @@ class TieredCacheManager:
             if block:
                 block.touch()
 
-        logger.debug(
-            f"Block {block_id} verified on paged SSD (hash={block_hash.hex()[:16]}...)"
-        )
+        if __debug__:
+            logger.debug(
+                f"Block {block_id} verified on paged SSD (hash={block_hash.hex()[:16]}...)"
+            )
         return True
 
     def restore_cold_blocks_for_request(self, request_id: str) -> int:

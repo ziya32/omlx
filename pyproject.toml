@@ -53,6 +53,8 @@ dependencies = [
     "tabulate>=0.9.0",
     # Resource monitoring
     "psutil>=5.9.0",
+    # mDNS/Bonjour service discovery
+    "zeroconf>=0.131.0",
     # Server
     "fastapi>=0.108.0",
     "uvicorn>=0.23.0",
@@ -65,6 +67,7 @@ dependencies = [
     "Pillow>=9.0.0",
     # dflash-mlx v0.1.3 (814c4a1) — block diffusion speculative decoding + temperature sampling
     "dflash-mlx @ git+https://github.com/jundot/dflash-mlx@814c4a1",
+    "pillow-heif>=0.16.0",
 ]
 
 [project.optional-dependencies]
@@ -72,6 +75,9 @@ grammar = [
     # Grammar-constrained decoding for structured output (requires torch ~2GB)
     "xgrammar>=0.1.32",
 ]
+# audio: mlx-audio>=0.4.0 is required for ASR/TTS engines.
+# Not listed here due to transitive dependency conflict with transformers.
+# Install separately: pip install mlx-audio>=0.4.0
 mcp = [
     "mcp>=1.0.0",
 ]

@@ -95,7 +95,7 @@ class CacheProbeRequest(BaseModel):
 class ModelSettingsRequest(BaseModel):
     """Request model for updating per-model settings."""
 
-    model_alias: Optional[str] = None
+    aliases: Optional[list[str]] = None
     model_type_override: Optional[str] = None
     max_context_window: Optional[int] = None
     max_tokens: Optional[int] = None
@@ -127,10 +127,16 @@ class ModelSettingsRequest(BaseModel):
     dflash_draft_model: Optional[str] = None
     dflash_draft_quant_bits: Optional[int] = None
     reasoning_parser: Optional[str] = None
+    default_voice: Optional[str] = None
+    default_instruct: Optional[str] = None
+    default_language: Optional[str] = None
+    default_response_format: Optional[str] = None
     is_pinned: Optional[bool] = None
     is_default: Optional[bool] = None
     # Security: per-model opt-in for trust_remote_code (issue #926)
     trust_remote_code: Optional[bool] = None
+    exclusive: Optional[bool] = None
+    exclusive_max_hold: Optional[int] = None
 
 
 class CreateProfileRequest(BaseModel):
@@ -245,7 +251,6 @@ class GlobalSettingsRequest(BaseModel):
 
     # Auth settings
     api_key: Optional[str] = None
-    skip_api_key_verification: Optional[bool] = None
 
 
 class HFDownloadRequest(BaseModel):
@@ -387,16 +392,16 @@ async def _apply_model_dirs_runtime(model_dirs: list[str]) -> tuple[bool, str]:
         pinned_models = _server_state.settings_manager.get_pinned_model_ids()
 
     # Unload all loaded models
-    loaded_models = pool.get_loaded_model_ids()
-    for model_id in loaded_models:
-        try:
-            await pool._unload_engine(model_id)
-        except Exception as e:
-            logger.warning(f"Error unloading {model_id}: {e}")
+    async with pool._tracked_lock("admin_rediscover"):
+        loaded_models = pool.get_loaded_model_ids()
+        for model_id in loaded_models:
+            try:
+                await pool._unload_engine(model_id)
+            except Exception as e:
+                logger.warning(f"Error unloading {model_id}: {e}")
 
-    # Clear entries
-    pool._entries.clear()
-    pool._current_model_memory = 0
+        # Clear entries
+        pool._entries.clear()
 
     # Update downloader model directories
     global _hf_downloader, _ms_downloader
@@ -495,13 +500,14 @@ async def _apply_max_model_memory_runtime(
 
     # If current usage exceeds new limit, unload LRU models
     unloaded = []
-    while pool._current_model_memory > max_memory_bytes:
-        victim = pool._find_lru_victim()
-        if not victim:
-            # All models are pinned, can't free more memory
-            break
-        await pool._unload_engine(victim)
-        unloaded.append(victim)
+    async with pool._tracked_lock("admin_max_memory"):
+        while pool._committed_memory() > max_memory_bytes:
+            victim = pool._find_drain_or_evict_candidate()
+            if not victim:
+                # All models are pinned, can't free more memory
+                break
+            await pool._unload_engine(victim)
+            unloaded.append(victim)
 
     msg = f"Max model memory changed: {old_display} -> {format_size(max_memory_bytes)}"
     if unloaded:
@@ -652,12 +658,13 @@ async def _apply_cache_settings_runtime(
         )
 
     # Unload all loaded models so they use new config when reloaded
-    loaded_models = pool.get_loaded_model_ids()
-    for model_id in loaded_models:
-        try:
-            await pool._unload_engine(model_id)
-        except Exception as e:
-            logger.warning(f"Error unloading {model_id}: {e}")
+    async with pool._tracked_lock("admin_cache_settings"):
+        loaded_models = pool.get_loaded_model_ids()
+        for model_id in loaded_models:
+            try:
+                await pool._unload_engine(model_id)
+            except Exception as e:
+                logger.warning(f"Error unloading {model_id}: {e}")
 
     return True, f"Cache settings updated. Unloaded {len(loaded_models)} models."
 
@@ -1401,41 +1408,8 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         # Add settings if available
         if settings:
             model_data["settings"] = {
-                "model_alias": settings.model_alias,
-                "model_type_override": settings.model_type_override,
-                "max_context_window": settings.max_context_window,
-                "max_tokens": settings.max_tokens,
-                "temperature": settings.temperature,
-                "top_p": settings.top_p,
-                "top_k": settings.top_k,
-                "repetition_penalty": settings.repetition_penalty,
-                "min_p": settings.min_p,
-                "presence_penalty": settings.presence_penalty,
-                "force_sampling": settings.force_sampling,
-                "max_tool_result_tokens": settings.max_tool_result_tokens,
-                "enable_thinking": settings.enable_thinking,
-                "thinking_budget_enabled": settings.thinking_budget_enabled,
-                "thinking_budget_tokens": settings.thinking_budget_tokens,
-                "reasoning_parser": settings.reasoning_parser,
-                "chat_template_kwargs": settings.chat_template_kwargs,
-                "forced_ct_kwargs": settings.forced_ct_kwargs,
-                "ttl_seconds": settings.ttl_seconds,
-                "index_cache_freq": settings.index_cache_freq,
-                "turboquant_kv_enabled": settings.turboquant_kv_enabled,
-                "turboquant_kv_bits": settings.turboquant_kv_bits,
-                "specprefill_enabled": settings.specprefill_enabled,
-                "specprefill_draft_model": settings.specprefill_draft_model,
-                "specprefill_keep_pct": settings.specprefill_keep_pct,
-                "specprefill_threshold": settings.specprefill_threshold,
-                "dflash_enabled": settings.dflash_enabled,
-                "dflash_draft_model": settings.dflash_draft_model,
-                "dflash_draft_quant_bits": settings.dflash_draft_quant_bits,
-                "is_pinned": settings.is_pinned,
-                "is_default": settings.is_default,
-                "trust_remote_code": settings.trust_remote_code,
-                "display_name": settings.display_name,
-                "description": settings.description,
-                "active_profile_name": settings.active_profile_name,
+                f.name: getattr(settings, f.name)
+                for f in __import__("dataclasses").fields(settings)
             }
 
         models.append(model_data)
@@ -1459,7 +1433,8 @@ async def unload_model(
     if entry.engine is None:
         raise HTTPException(status_code=400, detail=f"Model not loaded: {model_id}")
 
-    await engine_pool._unload_engine(model_id)
+    async with engine_pool._tracked_lock("admin_unload"):
+        await engine_pool._unload_engine(model_id)
     logger.info(f"Manually unloaded model: {model_id}")
     return {"status": "ok", "model_id": model_id, "message": f"Unloaded {model_id}"}
 
@@ -1542,25 +1517,30 @@ async def update_model_settings(
     # (clear to default) from "not sent" (don't touch).
     sent = request.model_fields_set
     prev_engine_type = entry.engine_type  # Track for requires_reload check
-    if "model_alias" in sent:
-        alias_value = request.model_alias.strip() if request.model_alias else None
-        if alias_value == "":
-            alias_value = None
-        if alias_value is not None:
+    if "aliases" in sent:
+        # Normalize: strip whitespace, drop empty strings, deduplicate preserving order
+        raw = request.aliases
+        if raw is not None:
+            alias_list = list(dict.fromkeys(a.strip() for a in raw if a and a.strip()))
+            alias_values = alias_list if alias_list else None
+        else:
+            alias_values = None
+        if alias_values is not None:
             all_settings = settings_manager.get_all_settings()
-            for mid, ms in all_settings.items():
-                if mid != model_id and ms.model_alias == alias_value:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Alias '{alias_value}' is already used by model '{mid}'",
-                    )
-            for mid in engine_pool._entries:
-                if mid != model_id and mid == alias_value:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Alias '{alias_value}' conflicts with model directory name '{mid}'",
-                    )
-        current_settings.model_alias = alias_value
+            for alias_value in alias_values:
+                for mid, ms in all_settings.items():
+                    if mid != model_id and ms.aliases and alias_value in ms.aliases:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Alias '{alias_value}' is already used by model '{mid}'",
+                        )
+                for mid in engine_pool._entries:
+                    if mid != model_id and mid == alias_value:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Alias '{alias_value}' conflicts with model directory name '{mid}'",
+                        )
+        current_settings.aliases = alias_values
     if "model_type_override" in sent:
         valid_types = {"llm", "vlm", "embedding", "reranker", "audio_stt", "audio_tts", "audio_sts"}
         # Treat empty string as None (auto-detect)
@@ -1661,10 +1641,25 @@ async def update_model_settings(
 
     if "reasoning_parser" in sent:
         current_settings.reasoning_parser = request.reasoning_parser or None
+    if "default_voice" in sent:
+        current_settings.default_voice = request.default_voice or None
+    if "default_instruct" in sent:
+        current_settings.default_instruct = request.default_instruct or None
+    if "default_language" in sent:
+        current_settings.default_language = request.default_language or None
+    if "default_response_format" in sent:
+        current_settings.default_response_format = request.default_response_format or None
     if request.is_pinned is not None:
         current_settings.is_pinned = request.is_pinned
         # Also update the engine pool entry
         entry.is_pinned = request.is_pinned
+    if request.exclusive is not None:
+        current_settings.exclusive = request.exclusive
+        # Also update the engine pool entry
+        entry.exclusive = request.exclusive
+    if request.exclusive_max_hold is not None:
+        current_settings.exclusive_max_hold = request.exclusive_max_hold
+        entry.exclusive_max_hold = request.exclusive_max_hold
     if request.is_default is not None:
         current_settings.is_default = request.is_default
         # Update server_state.default_model if setting as default
@@ -2219,7 +2214,6 @@ async def get_global_settings(is_admin: bool = Depends(require_admin)):
         "auth": {
             "api_key_set": bool(global_settings.auth.api_key),
             "api_key": global_settings.auth.api_key or "",
-            "skip_api_key_verification": global_settings.auth.skip_api_key_verification,
             "sub_keys": [sk.to_dict() for sk in global_settings.auth.sub_keys],
         },
         "claude_code": {
@@ -2655,6 +2649,7 @@ async def update_global_settings(
     if request.skip_api_key_verification is not None:
         global_settings.auth.skip_api_key_verification = request.skip_api_key_verification
         runtime_applied.append("skip_api_key_verification")
+
 
     # Validate settings
     errors = global_settings.validate()
@@ -3798,7 +3793,8 @@ async def delete_hf_model(
         loaded_ids = engine_pool.get_loaded_model_ids()
         if model_name in loaded_ids:
             try:
-                await engine_pool._unload_engine(model_name)
+                async with engine_pool._tracked_lock("admin_delete"):
+                    await engine_pool._unload_engine(model_name)
                 logger.info(f"Unloaded model '{model_name}' before deletion")
             except Exception as e:
                 logger.warning(f"Failed to unload model '{model_name}': {e}")
@@ -3809,13 +3805,15 @@ async def delete_hf_model(
     # DeprecationWarning, with onerror fallback for older versions.
     def _handle_onexc(func, path, exc):
         if isinstance(exc, FileNotFoundError) and Path(path).name.startswith("._"):
-            logger.debug(f"Ignoring missing resource fork file: {path}")
+            if __debug__:
+                logger.debug(f"Ignoring missing resource fork file: {path}")
             return
         raise exc
 
     def _handle_onerror(func, path, exc_info):
         if exc_info[0] == FileNotFoundError and Path(path).name.startswith("._"):
-            logger.debug(f"Ignoring missing resource fork file: {path}")
+            if __debug__:
+                logger.debug(f"Ignoring missing resource fork file: {path}")
             return
         raise exc_info[1].with_traceback(exc_info[2])
 

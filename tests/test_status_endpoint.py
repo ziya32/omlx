@@ -8,10 +8,12 @@ from fastapi.testclient import TestClient
 
 from omlx.server import ServerState, app
 
+TEST_API_KEY = "test-api-key"
+
 
 @pytest.fixture
 def client():
-    return TestClient(app)
+    return TestClient(app, headers={"Authorization": f"Bearer {TEST_API_KEY}"})
 
 
 class TestStatusEndpoint:
@@ -21,6 +23,7 @@ class TestStatusEndpoint:
     def setup_server_state(self):
         """Set up a clean server state for each test."""
         state = ServerState()
+        state.api_key = TEST_API_KEY
         with patch("omlx.server._server_state", state):
             self._state = state
             yield

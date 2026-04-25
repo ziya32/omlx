@@ -296,15 +296,6 @@ class TestModelDiscoveryEmbedding:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "embedding"
 
-    def test_detect_qwen3_embedding_model(self, tmp_path):
-        """Test detection of Qwen3 embedding model."""
-        config = {
-            "model_type": "qwen3",
-            "architectures": ["Qwen3ForTextEmbedding"],
-        }
-        (tmp_path / "config.json").write_text(json.dumps(config))
-        assert detect_model_type(tmp_path) == "embedding"
-
     def test_detect_embedding_by_architecture_only(self, tmp_path):
         """Test detection by architecture when model_type is unknown."""
         config = {

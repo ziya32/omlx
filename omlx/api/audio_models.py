@@ -9,7 +9,16 @@ These models define the request and response schemas for:
 
 from typing import List, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+
+class TranscriptionSegment(BaseModel):
+    """A segment of transcribed audio with timestamps."""
+
+    id: int
+    start: float
+    end: float
+    text: str
 
 
 class AudioTranscriptionRequest(BaseModel):
@@ -29,11 +38,23 @@ class AudioTranscriptionResponse(BaseModel):
     segments: Optional[List[dict]] = None
 
 
+class VerboseTranscriptionResponse(BaseModel):
+    """Verbose response from audio transcription with segment timestamps."""
+
+    task: str = "transcribe"
+    language: str | None = None
+    duration: float | None = None
+    text: str
+    segments: list[TranscriptionSegment] = Field(default_factory=list)
+
+
 class AudioSpeechRequest(BaseModel):
     model: str
     input: str
     voice: Optional[str] = None
     instructions: Optional[str] = None
+    ref_audio: Optional[str] = None
+    ref_text: Optional[str] = None
     speed: Optional[float] = 1.0
     response_format: Optional[str] = "wav"
     ref_audio: Optional[str] = None
@@ -53,3 +74,20 @@ class AudioProcessRequest(BaseModel):
     """
 
     model: str
+
+
+class SpeakersResponse(BaseModel):
+    """Response listing available TTS speakers."""
+
+    speakers: list[str] = Field(default_factory=list)
+    """List of available speaker names."""
+
+
+class LanguagesResponse(BaseModel):
+    """Response listing supported ASR languages."""
+
+    languages: list[str] = Field(default_factory=list)
+    """List of supported ISO language codes."""
+
+    model: str | None = None
+    """The ASR model these languages are from."""

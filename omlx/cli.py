@@ -16,6 +16,7 @@ Usage:
 
 import argparse
 import faulthandler
+import os
 import sys
 
 
@@ -33,6 +34,7 @@ def _has_cli_overrides(args) -> bool:
         return True
     if hasattr(args, "max_process_memory") and args.max_process_memory is not None:
         return True
+    # host: argparse default is None; any non-None value means explicitly passed
     if hasattr(args, "host") and args.host is not None:
         return True
     if hasattr(args, "log_level") and args.log_level is not None:
@@ -54,10 +56,44 @@ def _has_cli_overrides(args) -> bool:
     return False
 
 
+def _push_api_key_to_nanobot(api_key: str) -> None:
+    """Write the omlx API key into nanobot's config file (if present)."""
+    import json
+    import logging
+    from pathlib import Path
+
+    logger = logging.getLogger(__name__)
+    config_path = Path.home() / ".myemee" / "config.json"
+
+    if not config_path.exists():
+        logger.warning(
+            "Nanobot config not found at %s — "
+            "if nanobot runs on another machine, set omlx.apiKey there manually",
+            config_path,
+        )
+        print(
+            f"Note: nanobot config not found at {config_path}. "
+            "If nanobot runs on another machine, set omlx.apiKey there manually."
+        )
+        return
+
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+        omlx_section = data.setdefault("omlx", {})
+        omlx_section["apiKey"] = api_key
+        config_path.write_text(
+            json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        print(f"Updated nanobot config at {config_path}")
+    except Exception as exc:
+        logger.warning("Failed to update nanobot config at %s: %s", config_path, exc)
+        print(f"Warning: could not update nanobot config: {exc}")
+
+
 def serve_command(args):
     """Start the OpenAI-compatible multi-model server."""
     import logging
-    import os
     import uvicorn
 
     from ._version import __version__
@@ -150,9 +186,23 @@ def serve_command(args):
     )
     print(f"Log directory: {log_dir}")
 
+    # When stderr is not a real terminal (e.g., subprocess pipe), remove the
+    # stderr StreamHandler to prevent pipe-buffer deadlocks.  If the parent
+    # process does not read the pipe fast enough, the pipe buffer fills up,
+    # the write() in the StreamHandler blocks while holding the logging lock,
+    # and the asyncio event loop deadlocks (nothing can log, serve, or respond
+    # to health checks).  File logging is always available for diagnostics.
+    if not sys.stderr.isatty():
+        root = logging.getLogger()
+        root.handlers = [
+            h for h in root.handlers
+            if not isinstance(h, logging.StreamHandler)
+            or isinstance(h, logging.FileHandler)
+        ]
+
     # Enable native crash diagnostics (SIGABRT, SIGSEGV, SIGFPE, SIGBUS).
     # On Metal/MLX crashes (#511, #520), this dumps all Python thread
-    # tracebacks to the server log before the process terminates.
+    # tracebacks to the crash log before the process terminates.
     crash_log_path = log_dir / "crash.log"
     _crash_file = open(crash_log_path, "a")
     faulthandler.enable(file=_crash_file, all_threads=True)
@@ -544,7 +594,7 @@ Example directory structure:
     )
 
     # Server options
-    serve_parser.add_argument("--host", type=str, default=None, help="Host to bind (default: 127.0.0.1)")
+    serve_parser.add_argument("--host", type=str, default=None, help="Host to bind (default: 0.0.0.0)")
     serve_parser.add_argument("--port", type=int, default=None, help="Port to bind (default: 8000)")
     serve_parser.add_argument(
         "--log-level",
@@ -560,6 +610,20 @@ Example directory structure:
         type=int,
         default=None,
         help="Max requests processed simultaneously. Higher values increase throughput but use more memory. (default: 8)",
+    )
+
+    # Model switching / drain options
+    serve_parser.add_argument(
+        "--drain-timeout",
+        type=float,
+        default=None,
+        help="Seconds before force-aborting a draining model (default: 120)",
+    )
+    serve_parser.add_argument(
+        "--max-wait-timeout",
+        type=float,
+        default=None,
+        help="Seconds before get_engine() gives up waiting for a model (default: 300)",
     )
 
     # paged SSD cache options

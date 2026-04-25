@@ -6,7 +6,9 @@ Provides multiple engine implementations:
 - BatchedEngine: Continuous batching for multiple concurrent users
 - VLMBatchedEngine: Vision-language model engine with image support
 - EmbeddingEngine: Batch embedding generation using mlx-embeddings
-- RerankerEngine: Document reranking using SequenceClassification models
+- RerankerEngine: Document reranking (SequenceClassification + CausalLM yes/no)
+- STTEngine: Speech-to-text transcription using mlx-audio
+- TTSEngine: Text-to-speech synthesis using Qwen3-TTS via mlx-audio
 
 Also re-exports core engine components for backwards compatibility.
 """

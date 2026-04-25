@@ -202,6 +202,31 @@ class VisionFeatureSSDCache:
         """Return a copy of cache statistics."""
         return dict(self._stats)
 
+    def memory_stats(self) -> Dict[str, int]:
+        """Return the in-memory LRU cache size as entries + bytes.
+
+        Walks every entry in ``_memory_cache`` and sums ``.nbytes`` across
+        the features (single mx.array or list[mx.array]). Used by the
+        process memory enforcer to track vision feature cache growth.
+        """
+        total_bytes = 0
+        with self._memory_lock:
+            entries = len(self._memory_cache)
+            for features in self._memory_cache.values():
+                try:
+                    if isinstance(features, list):
+                        for f in features:
+                            nbytes = getattr(f, "nbytes", 0)
+                            if nbytes:
+                                total_bytes += int(nbytes)
+                    else:
+                        nbytes = getattr(features, "nbytes", 0)
+                        if nbytes:
+                            total_bytes += int(nbytes)
+                except Exception:
+                    pass
+        return {"entries": entries, "bytes": total_bytes}
+
     # ── Memory LRU helpers ──────────────────────────────────────────
 
     def _memory_put(self, key: str, features: Any) -> None:
@@ -214,11 +239,37 @@ class VisionFeatureSSDCache:
             self._memory_cache[key] = features
             return
 
+        # Compute incoming bytes for diagnostic logging.
+        def _nbytes(f: Any) -> int:
+            if isinstance(f, list):
+                return sum(int(getattr(x, "nbytes", 0) or 0) for x in f)
+            return int(getattr(f, "nbytes", 0) or 0)
+
+        add_bytes = _nbytes(features)
+        evicted_count = 0
+        evicted_bytes = 0
+
         # Evict oldest if over limit
         while len(self._memory_cache) >= self._max_memory_entries:
-            self._memory_cache.popitem(last=False)
+            _, ev_features = self._memory_cache.popitem(last=False)
+            evicted_count += 1
+            evicted_bytes += _nbytes(ev_features)
 
         self._memory_cache[key] = features
+
+        # Current totals AFTER the put (holding the lock).
+        total_bytes = 0
+        for f in self._memory_cache.values():
+            total_bytes += _nbytes(f)
+
+        logger.info(
+            "VisionFeatureCache put: add=%.2fGB evicted=%d/%.2fGB "
+            "entries=%d/%d total=%.2fGB",
+            add_bytes / 1024**3,
+            evicted_count, evicted_bytes / 1024**3,
+            len(self._memory_cache), self._max_memory_entries,
+            total_bytes / 1024**3,
+        )
 
     # ── SSD persistence ─────────────────────────────────────────────
 

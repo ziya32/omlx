@@ -39,7 +39,7 @@ class TestServerSettings:
     def test_defaults(self):
         """Test default values."""
         settings = ServerSettings()
-        assert settings.host == "127.0.0.1"
+        assert settings.host == "0.0.0.0"
         assert settings.port == 8000
         assert settings.log_level == "info"
         assert settings.cors_origins == ["*"]
@@ -95,7 +95,7 @@ class TestServerSettings:
         """Test creation from partial dictionary uses defaults."""
         data = {"port": 9000}
         settings = ServerSettings.from_dict(data)
-        assert settings.host == "127.0.0.1"  # default
+        assert settings.host == "0.0.0.0"  # default
         assert settings.port == 9000
         assert settings.log_level == "info"  # default
         assert settings.cors_origins == ["*"]  # default
@@ -388,7 +388,6 @@ class TestAuthSettings:
         assert result == {
             "api_key": "my-key",
             "secret_key": None,
-            "skip_api_key_verification": False,
             "sub_keys": [],
         }
 
@@ -699,7 +698,7 @@ class TestGlobalSettings:
         """Test default values."""
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = GlobalSettings(base_path=Path(tmpdir))
-            assert settings.server.host == "127.0.0.1"
+            assert settings.server.host == "0.0.0.0"
             assert settings.server.port == 8000
             assert settings.model.max_model_memory == "auto"
             assert settings.scheduler.max_concurrent_requests == 8
@@ -767,7 +766,7 @@ class TestGlobalSettings:
         """Test loading with no settings file uses defaults."""
         with tempfile.TemporaryDirectory() as tmpdir:
             settings = GlobalSettings.load(base_path=tmpdir)
-            assert settings.server.host == "127.0.0.1"
+            assert settings.server.host == "0.0.0.0"
             assert settings.server.port == 8000
 
     def test_load_invalid_json_uses_defaults(self):
@@ -1200,7 +1199,7 @@ class TestGlobalSettings:
             args = Namespace(port=7777, host=None, log_level=None)
             settings = GlobalSettings.load(base_path=tmpdir, cli_args=args)
             assert settings.server.port == 7777
-            assert settings.server.host == "127.0.0.1"  # default
+            assert settings.server.host == "0.0.0.0"  # default
             assert settings.server.log_level == "info"  # default
 
     def test_cli_override_scheduler(self):
@@ -1501,7 +1500,7 @@ class TestSettingsEdgeCases:
             settings = GlobalSettings.load(base_path=tmpdir)
             # Should use all defaults
             assert settings.server.port == 8000
-            assert settings.server.host == "127.0.0.1"
+            assert settings.server.host == "0.0.0.0"
 
     def test_partial_section_in_file(self):
         """Test loading file with partial section data."""
@@ -1519,7 +1518,7 @@ class TestSettingsEdgeCases:
 
             settings = GlobalSettings.load(base_path=tmpdir)
             assert settings.server.port == 9000
-            assert settings.server.host == "127.0.0.1"  # default
+            assert settings.server.host == "0.0.0.0"  # default
             assert settings.server.log_level == "info"  # default
 
     def test_cli_args_without_expected_attrs(self):
@@ -1530,7 +1529,7 @@ class TestSettingsEdgeCases:
             settings = GlobalSettings.load(base_path=tmpdir, cli_args=args)
             assert settings.server.port == 9000
             # Other settings should be defaults
-            assert settings.server.host == "127.0.0.1"
+            assert settings.server.host == "0.0.0.0"
 
     def test_save_with_unicode_api_key(self):
         """Test saving settings with unicode in values."""

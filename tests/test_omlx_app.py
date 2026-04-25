@@ -172,7 +172,7 @@ class TestServerConfig:
         assert args == ["serve", "--base-path", base, "--port", "8000"]
 
     def test_build_serve_args_with_model_dir(self):
-        """Test build_serve_args does not include model_dir (server reads settings.json)."""
+        """Test build_serve_args does NOT include model_dir (read from settings.json)."""
         config = ServerConfig(
             base_path="/test/base",
             port=9000,
@@ -181,6 +181,8 @@ class TestServerConfig:
         args = config.build_serve_args()
 
         base = str(Path("/test/base").expanduser())
+        # model_dir is intentionally not passed via CLI args — the server
+        # reads model_dirs from settings.json to support multi-directory configs.
         assert args == [
             "serve",
             "--base-path", base,
@@ -454,23 +456,27 @@ class TestServerManager:
     def test_check_health_success(self, mock_session_cls, manager: ServerManager):
         """Test successful health check."""
         mock_session = Mock()
+        mock_session_cls.return_value = mock_session
         mock_response = Mock()
         mock_response.status_code = 200
         mock_session.get.return_value = mock_response
-        mock_session_cls.return_value = mock_session
 
         assert manager.check_health() is True
-        mock_session.get.assert_called_once_with("http://127.0.0.1:8765/health", timeout=2)
+        # check_health() bypasses the env proxy by setting trust_env=False
+        # before calling session.get(url, timeout=2).
         assert mock_session.trust_env is False
+        mock_session.get.assert_called_once_with(
+            "http://127.0.0.1:8765/health", timeout=2
+        )
 
     @patch("omlx_app.server_manager.requests.Session")
     def test_check_health_failure(self, mock_session_cls, manager: ServerManager):
         """Test failed health check (non-200 status)."""
         mock_session = Mock()
+        mock_session_cls.return_value = mock_session
         mock_response = Mock()
         mock_response.status_code = 500
         mock_session.get.return_value = mock_response
-        mock_session_cls.return_value = mock_session
 
         assert manager.check_health() is False
 
@@ -479,8 +485,8 @@ class TestServerManager:
         """Test health check with connection error."""
         import requests
         mock_session = Mock()
-        mock_session.get.side_effect = requests.RequestException("Connection refused")
         mock_session_cls.return_value = mock_session
+        mock_session.get.side_effect = requests.RequestException("Connection refused")
 
         assert manager.check_health() is False
 

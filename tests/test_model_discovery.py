@@ -275,15 +275,6 @@ class TestDetectModelType:
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "llm"
 
-    def test_detect_qwen3_embedding_by_architecture(self, tmp_path):
-        """Qwen3 with TextEmbedding architecture should be embedding."""
-        config = {
-            "model_type": "qwen3",
-            "architectures": ["Qwen3ForTextEmbedding"],
-        }
-        (tmp_path / "config.json").write_text(json.dumps(config))
-        assert detect_model_type(tmp_path) == "embedding"
-
     def test_detect_qwen3_no_architecture_defaults_to_llm(self, tmp_path):
         """Qwen3 without architectures field should default to LLM."""
         config = {
@@ -367,6 +358,42 @@ class TestDetectModelType:
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert detect_model_type(tmp_path) == "llm"
+
+    def test_detect_tts_by_architecture(self, tmp_path):
+        """Test detection of TTS model by architecture."""
+        config = {
+            "model_type": "qwen3_tts",
+            "architectures": ["Qwen3TTSForConditionalGeneration"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "audio_tts"
+
+    def test_detect_tts_by_model_type(self, tmp_path):
+        """Test detection of TTS model by model_type only."""
+        config = {
+            "model_type": "qwen3_tts",
+            "architectures": ["SomeUnknownArch"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "audio_tts"
+
+    def test_detect_asr_by_model_type_whisper(self, tmp_path):
+        """Test detection of ASR model (whisper)."""
+        config = {
+            "model_type": "whisper",
+            "architectures": ["WhisperForConditionalGeneration"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "audio_stt"
+
+    def test_detect_asr_by_model_type_qwen3(self, tmp_path):
+        """Test detection of ASR model (qwen3_asr)."""
+        config = {
+            "model_type": "qwen3_asr",
+            "architectures": ["Qwen3ASRForConditionalGeneration"],
+        }
+        (tmp_path / "config.json").write_text(json.dumps(config))
+        assert detect_model_type(tmp_path) == "audio_stt"
 
 
 class TestEstimateModelSize:
@@ -896,6 +923,7 @@ class TestUnsupportedModels:
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert _is_unsupported_model(tmp_path) is False
+        assert detect_model_type(tmp_path) == "audio_stt"
 
     def test_whisper_model_type_not_unsupported(self, tmp_path):
         """Whisper by model_type alone is not unsupported."""
@@ -905,6 +933,7 @@ class TestUnsupportedModels:
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert _is_unsupported_model(tmp_path) is False
+        assert detect_model_type(tmp_path) == "audio_stt"
 
     def test_tts_not_unsupported(self, tmp_path):
         """qwen3_tts is now an audio_tts model, not unsupported."""
@@ -914,9 +943,10 @@ class TestUnsupportedModels:
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
         assert _is_unsupported_model(tmp_path) is False
+        assert detect_model_type(tmp_path) == "audio_tts"
 
-    def test_multimodal_with_audio_not_unsupported(self, tmp_path):
-        """Multimodal model with nested audio_config is NOT unsupported."""
+    def test_multimodal_with_audio_is_vlm(self, tmp_path):
+        """Multimodal model with nested audio_config is VLM, not audio."""
         config = {
             "model_type": "minicpmo",
             "architectures": ["MiniCPMO"],
@@ -925,16 +955,17 @@ class TestUnsupportedModels:
             "tts_config": {"model_type": "minicpmtts"},
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
-        assert _is_unsupported_model(tmp_path) is False
+        # Should be detected as VLM (has vision_config), not audio
+        assert detect_model_type(tmp_path) == "vlm"
 
-    def test_llm_not_unsupported(self, tmp_path):
-        """Regular LLM is not unsupported."""
+    def test_llm_not_audio(self, tmp_path):
+        """Regular LLM is detected as LLM."""
         config = {
             "model_type": "llama",
             "architectures": ["LlamaForCausalLM"],
         }
         (tmp_path / "config.json").write_text(json.dumps(config))
-        assert _is_unsupported_model(tmp_path) is False
+        assert detect_model_type(tmp_path) == "llm"
 
     def test_audio_models_included_in_discovery(self, tmp_path):
         """Audio models are now discovered (not skipped) with correct types."""
@@ -963,13 +994,17 @@ class TestUnsupportedModels:
         tts_dir = tmp_path / "Qwen3-TTS"
         tts_dir.mkdir()
         (tts_dir / "config.json").write_text(
-            json.dumps({"model_type": "qwen3_tts"})
+            json.dumps({
+                "model_type": "qwen3_tts",
+                "architectures": ["Qwen3TTSForConditionalGeneration"],
+            })
         )
         (tts_dir / "model.safetensors").write_bytes(b"0" * 1500)
 
         models = discover_models(tmp_path)
         assert len(models) == 3
         assert "llama-3b" in models
+        assert models["llama-3b"].model_type == "llm"
         assert "whisper-large-v3" in models
         assert models["whisper-large-v3"].model_type == "audio_stt"
         assert "Qwen3-TTS" in models

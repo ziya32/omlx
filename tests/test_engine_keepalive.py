@@ -16,12 +16,15 @@ class TestTryCompile:
 
         model = MLXEmbeddingModel("test-model")
         model.model = MagicMock()
+        model.processor = MagicMock(spec=[])  # no _tokenizer attr
 
-        with patch("omlx.models.embedding.mx") as mock_mx:
+        with (
+            patch("omlx.models.embedding.mx") as mock_mx,
+            patch("omlx.models.embedding.MLXEmbeddingModel._extract_embeddings_array", return_value=MagicMock()),
+            patch("mlx_embeddings.utils.prepare_inputs", return_value={"input_ids": MagicMock()}) as mock_prep,
+        ):
             mock_compiled_fn = MagicMock(return_value=MagicMock())
             mock_mx.compile.return_value = mock_compiled_fn
-            mock_mx.zeros.return_value = MagicMock()
-            mock_mx.int32 = "int32"
             result = model._try_compile()
 
         assert result is True

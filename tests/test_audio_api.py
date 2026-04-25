@@ -111,12 +111,16 @@ class TestModelsListAudio:
             mock_state.hf_downloader = None
             mock_state.ms_downloader = None
             mock_state.mcp_manager = None
-            mock_state.api_key = None
+            mock_state.api_key = "test-key"
             mock_state.settings_manager = MagicMock()
             mock_state.settings_manager.get_settings.return_value = MagicMock(
-                model_alias=None
+                model_alias=None, aliases=None
             )
-            with TestClient(app, raise_server_exceptions=False) as client:
+            with TestClient(
+                app,
+                raise_server_exceptions=False,
+                headers={"Authorization": "Bearer test-key"},
+            ) as client:
                 yield client, mock_pool
 
     @pytest.fixture
@@ -132,12 +136,16 @@ class TestModelsListAudio:
             mock_state.hf_downloader = None
             mock_state.ms_downloader = None
             mock_state.mcp_manager = None
-            mock_state.api_key = None
+            mock_state.api_key = "test-key"
             mock_state.settings_manager = MagicMock()
             mock_state.settings_manager.get_settings.return_value = MagicMock(
-                model_alias=None
+                model_alias=None, aliases=None
             )
-            with TestClient(app, raise_server_exceptions=False) as client:
+            with TestClient(
+                app,
+                raise_server_exceptions=False,
+                headers={"Authorization": "Bearer test-key"},
+            ) as client:
                 yield client, mock_pool
 
     def test_models_list_returns_200(self, client_with_stt):

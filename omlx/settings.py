@@ -73,10 +73,10 @@ def get_system_memory() -> int:
 
 
 def _adaptive_system_reserve(total: int) -> int:
-    """Adaptive system reservation: 20% of total, clamped to [2GB, 8GB]."""
-    reserve = int(total * 0.20)
+    """Adaptive system reservation: 25% of total, clamped to [2GB, 16GB]."""
+    reserve = int(total * 0.25)
     min_reserve = 2 * 1024**3
-    max_reserve = 8 * 1024**3
+    max_reserve = 16 * 1024**3
     return max(min_reserve, min(reserve, max_reserve))
 
 
@@ -110,7 +110,7 @@ def get_ssd_capacity(path: str | Path) -> int:
 class ServerSettings:
     """Server configuration settings."""
 
-    host: str = "127.0.0.1"
+    host: str = "0.0.0.0"
     port: int = 8000
     log_level: str = "info"
     cors_origins: list[str] = field(default_factory=lambda: ["*"])
@@ -124,7 +124,7 @@ class ServerSettings:
     def from_dict(cls, data: dict[str, Any]) -> ServerSettings:
         """Create from dictionary."""
         return cls(
-            host=data.get("host", "127.0.0.1"),
+            host=data.get("host", "0.0.0.0"),
             port=data.get("port", 8000),
             log_level=data.get("log_level", "info"),
             cors_origins=data.get("cors_origins", ["*"]),
@@ -406,16 +406,16 @@ class AuthSettings:
 
     api_key: str | None = None
     secret_key: str | None = None
-    skip_api_key_verification: bool = False
     sub_keys: list[SubKeyEntry] = field(default_factory=list)
+    skip_api_key_verification: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary."""
         return {
             "api_key": self.api_key,
             "secret_key": self.secret_key,
-            "skip_api_key_verification": self.skip_api_key_verification,
             "sub_keys": [sk.to_dict() for sk in self.sub_keys],
+            "skip_api_key_verification": self.skip_api_key_verification,
         }
 
     @classmethod
@@ -424,10 +424,10 @@ class AuthSettings:
         return cls(
             api_key=data.get("api_key"),
             secret_key=data.get("secret_key"),
-            skip_api_key_verification=data.get("skip_api_key_verification", False),
             sub_keys=[
                 SubKeyEntry.from_dict(sk) for sk in data.get("sub_keys", [])
             ],
+            skip_api_key_verification=data.get("skip_api_key_verification", False),
         )
 
 
@@ -634,6 +634,29 @@ class ClaudeCodeSettings:
 
 
 @dataclass
+class DiscoverySettings:
+    """mDNS/Bonjour service discovery settings."""
+
+    enabled: bool = True  # Auto-publish when host != 127.0.0.1
+    service_name: str = ""  # Override mDNS instance name (default: hostname)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "enabled": self.enabled,
+            "service_name": self.service_name,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> DiscoverySettings:
+        """Create from dictionary."""
+        return cls(
+            enabled=data.get("enabled", True),
+            service_name=data.get("service_name", ""),
+        )
+
+
+@dataclass
 class IntegrationSettings:
     """Other integrations settings (Codex, OpenCode, OpenClaw, Pi)."""
 
@@ -691,9 +714,14 @@ class GlobalSettings:
     sampling: SamplingSettings = field(default_factory=SamplingSettings)
     logging: LoggingSettings = field(default_factory=LoggingSettings)
     claude_code: ClaudeCodeSettings = field(default_factory=ClaudeCodeSettings)
+    discovery: DiscoverySettings = field(default_factory=DiscoverySettings)
     integrations: IntegrationSettings = field(default_factory=IntegrationSettings)
     ui: UISettings = field(default_factory=UISettings)
     idle_timeout: ModelIdleTimeoutSettings = field(default_factory=ModelIdleTimeoutSettings)
+
+    # Engine pool drain/wait timeouts (CLI-only, not persisted to settings.json)
+    drain_timeout: float | None = None      # None = use EnginePool default (120s)
+    max_wait_timeout: float | None = None   # None = use EnginePool default (300s)
 
     @classmethod
     def load(
@@ -724,7 +752,8 @@ class GlobalSettings:
         settings_file = resolved_base / "settings.json"
         if settings_file.exists():
             settings._load_from_file(settings_file)
-            logger.debug(f"Loaded settings from {settings_file}")
+            if __debug__:
+                logger.debug(f"Loaded settings from {settings_file}")
 
         # Apply environment variable overrides
         settings._apply_env_overrides()
@@ -781,6 +810,8 @@ class GlobalSettings:
                 self.logging = LoggingSettings.from_dict(data["logging"])
             if "claude_code" in data:
                 self.claude_code = ClaudeCodeSettings.from_dict(data["claude_code"])
+            if "discovery" in data:
+                self.discovery = DiscoverySettings.from_dict(data["discovery"])
             if "integrations" in data:
                 self.integrations = IntegrationSettings.from_dict(
                     data["integrations"]
@@ -856,6 +887,10 @@ class GlobalSettings:
         # MCP settings
         if mcp_config := os.getenv("OMLX_MCP_CONFIG"):
             self.mcp.config_path = mcp_config
+
+        # Discovery settings
+        if discovery_enabled := os.getenv("OMLX_DISCOVERY_ENABLED"):
+            self.discovery.enabled = discovery_enabled.lower() in ("true", "1", "yes")
 
         # HuggingFace settings
         if hf_endpoint := os.getenv("OMLX_HF_ENDPOINT"):
@@ -960,6 +995,12 @@ class GlobalSettings:
         if hasattr(args, "ca_bundle") and args.ca_bundle is not None:
             self.network.ca_bundle = args.ca_bundle
 
+        # Engine pool drain/wait timeouts
+        if hasattr(args, "drain_timeout") and args.drain_timeout is not None:
+            self.drain_timeout = args.drain_timeout
+        if hasattr(args, "max_wait_timeout") and args.max_wait_timeout is not None:
+            self.max_wait_timeout = args.max_wait_timeout
+
     def save(self) -> None:
         """Save current settings to the settings file."""
         self.ensure_directories()
@@ -980,6 +1021,7 @@ class GlobalSettings:
             "sampling": self.sampling.to_dict(),
             "logging": self.logging.to_dict(),
             "claude_code": self.claude_code.to_dict(),
+            "discovery": self.discovery.to_dict(),
             "integrations": self.integrations.to_dict(),
             "ui": self.ui.to_dict(),
             "idle_timeout": self.idle_timeout.to_dict(),
@@ -1006,7 +1048,8 @@ class GlobalSettings:
             if not directory.exists():
                 try:
                     directory.mkdir(parents=True, exist_ok=True)
-                    logger.debug(f"Created directory: {directory}")
+                    if __debug__:
+                        logger.debug(f"Created directory: {directory}")
                 except OSError as e:
                     logger.error(f"Failed to create directory {directory}: {e}")
                     raise
@@ -1019,7 +1062,8 @@ class GlobalSettings:
                 continue
             try:
                 directory.mkdir(parents=True, exist_ok=True)
-                logger.debug(f"Created directory: {directory}")
+                if __debug__:
+                    logger.debug(f"Created directory: {directory}")
                 valid_dirs.append(str(directory))
             except OSError as e:
                 logger.warning(
@@ -1212,6 +1256,7 @@ class GlobalSettings:
             "sampling": self.sampling.to_dict(),
             "logging": self.logging.to_dict(),
             "claude_code": self.claude_code.to_dict(),
+            "discovery": self.discovery.to_dict(),
             "integrations": self.integrations.to_dict(),
             "ui": self.ui.to_dict(),
             "idle_timeout": self.idle_timeout.to_dict(),

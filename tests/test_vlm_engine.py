@@ -74,14 +74,17 @@ def _make_loaded_engine(model_type=None, tokenizer=None, **overrides):
     """Create a VLMBatchedEngine with mocked internals (no actual model load)."""
     engine = _make_engine(**overrides)
 
-    # Set up mock model config
+    # Set up mock model config — use spec=[] so attribute access doesn't
+    # auto-create sub-mocks (count_chat_tokens reads vision_config attrs).
     mock_config = MagicMock()
     mock_config.model_type = model_type
+    mock_config.vision_config = None  # no vision config on plain mock
 
     mock_vlm_model = MagicMock()
     mock_vlm_model.config = mock_config
 
     engine._vlm_model = mock_vlm_model
+    engine._processor = None
     engine._tokenizer = tokenizer or MockVLMTokenizer()
     engine._loaded = True
     engine._engine = MagicMock()
@@ -160,8 +163,13 @@ class TestInjectToolCalling:
 
         assert getattr(tokenizer, "has_tool_calling", False) is False
 
-    def test_skips_when_mlx_lm_not_available(self):
-        """When neither parser backend is available, injection is skipped."""
+    def test_skips_when_tool_parsers_not_available(self):
+        """ImportError from both mlx_vlm.tool_parsers and mlx_lm → silently skipped.
+
+        _inject_tool_calling prefers mlx_vlm.tool_parsers (superset with
+        Gemma4 support) and falls back to mlx_lm.  Both must be unavailable
+        for injection to be skipped.
+        """
         engine = _make_engine()
         tokenizer = MockVLMTokenizer(
             chat_template="<tool_call> tool_call.name",
@@ -176,6 +184,7 @@ class TestInjectToolCalling:
                 "mlx_lm.tokenizer_utils": None,
             },
         ):
+            # Both imports will fail
             engine._inject_tool_calling(tokenizer)
 
         # Should not crash, attributes not set
@@ -892,11 +901,11 @@ class TestCountChatTokens:
 
         assert count == 2
 
-    def test_strips_images_from_count(self):
-        """Image parts are removed before counting tokens."""
+    def test_strips_images_and_adds_estimate(self):
+        """Image parts are stripped and estimated tokens are added to text count."""
         tokenizer = MagicMock()
         tokenizer.apply_chat_template.return_value = "Describe"
-        tokenizer.encode.return_value = [1]
+        tokenizer.encode.return_value = [1]  # 1 text token
 
         engine = _make_loaded_engine(tokenizer=tokenizer)
 
@@ -911,8 +920,8 @@ class TestCountChatTokens:
         ]
         count = engine.count_chat_tokens(messages)
 
-        # Should count text tokens only
-        assert count == 1
+        # Should include text tokens + estimated image tokens (> 1 text token alone)
+        assert count > 1, "Image tokens should be added to the text token count"
 
 
 # ---------------------------------------------------------------------------

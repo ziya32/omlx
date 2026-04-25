@@ -3,6 +3,7 @@
 Base engine interface for oMLX inference.
 """
 
+import asyncio
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -72,6 +73,7 @@ class BaseEngine(ABC):
         repetition_penalty: float = 1.0,
         presence_penalty: float = 0.0,
         stop: Optional[List[str]] = None,
+        request_id: Optional[str] = None,
         **kwargs,
     ) -> GenerationOutput:
         """
@@ -104,6 +106,7 @@ class BaseEngine(ABC):
         repetition_penalty: float = 1.0,
         presence_penalty: float = 0.0,
         stop: Optional[List[str]] = None,
+        request_id: Optional[str] = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """
@@ -136,6 +139,7 @@ class BaseEngine(ABC):
         repetition_penalty: float = 1.0,
         presence_penalty: float = 0.0,
         tools: Optional[List[dict]] = None,
+        request_id: Optional[str] = None,
         **kwargs,
     ) -> GenerationOutput:
         """
@@ -168,6 +172,7 @@ class BaseEngine(ABC):
         repetition_penalty: float = 1.0,
         presence_penalty: float = 0.0,
         tools: Optional[List[dict]] = None,
+        request_id: Optional[str] = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         """
@@ -187,6 +192,26 @@ class BaseEngine(ABC):
             GenerationOutput with incremental text
         """
         pass
+
+    @property
+    def scheduler(self) -> Optional[Any]:
+        """Get the engine's scheduler, if any.
+
+        Used by ProcessMemoryEnforcer to propagate memory limits for
+        inline prefill checking.  Returns None by default; overridden
+        by BatchedEngine / VLMBatchedEngine which have a scheduler via
+        their AsyncEngineCore.
+        """
+        return None
+
+    @property
+    def max_context_window(self) -> Optional[int]:
+        """Get the model's max context window from its config.
+
+        Returns max_position_embeddings (or equivalent) if available,
+        otherwise None. Subclasses may override for model-specific logic.
+        """
+        return None
 
     @property
     @abstractmethod
@@ -248,15 +273,38 @@ class BaseEngine(ABC):
 
 
 class BaseNonStreamingEngine(ABC):
-    """Base class for non-streaming engines (embedding, reranker).
+    """Base class for non-streaming engines (embedding, reranker, STT, TTS, STS).
 
-    These engines compute outputs in a single forward pass and don't
-    support streaming or chat completion interfaces.
+    These engines compute outputs by submitting work to the single-threaded
+    MLX executor via ``run_in_executor``. They don't support streaming or
+    chat completion interfaces.
+
+    Abort protocol
+    --------------
+    ``abort_all_requests`` signals in-flight operations to fail at their
+    next checkpoint with :class:`RequestAbortedError`. Python cannot
+    preempt an MLX kernel that is already running on the executor
+    thread, but the async wrapper that awaits the executor future can
+    discard the result and raise ``RequestAbortedError`` to the handler.
+    This matches the ``BatchedEngine`` / ``VLMBatchedEngine`` contract
+    so :class:`ProcessMemoryEnforcer` can treat every engine uniformly.
+
+    The abort is **terminal**: once fired, the engine refuses all new
+    and in-flight operations until ``stop()`` runs. The enforcer always
+    pairs ``abort_all_requests`` with ``_unload_engine``, so a fresh
+    request arriving after abort sees ``entry.engine is None`` via
+    ``EnginePool.ensure_engine_alive`` and receives HTTP 503 without
+    ever reaching this engine.
     """
 
     def __init__(self):
         self._active_count = 0
         self._active_lock = threading.Lock()
+        # Terminal abort flag set by abort_all_requests(). Checked by
+        # concrete engines via _raise_if_aborted at each run_in_executor
+        # boundary. asyncio.Event() is safe to construct without a
+        # running loop in Python 3.10+.
+        self._aborted = asyncio.Event()
 
     def has_active_requests(self) -> bool:
         """Check if the engine has active in-flight requests."""
@@ -267,6 +315,61 @@ class BaseNonStreamingEngine(ABC):
         with self._active_lock:
             self._active_count -= 1
             return self._active_count == 0
+
+    async def abort_all_requests(self) -> int:
+        """Signal all in-flight operations to abort at the next checkpoint.
+
+        Non-streaming engines run MLX work on the single-threaded MLX
+        executor via ``run_in_executor``. Python can't preempt an MLX
+        kernel mid-call, but it can cause the async wrapper to discard
+        the executor result and raise :class:`RequestAbortedError` to
+        the handler. Memory reclamation happens naturally after the
+        in-flight call finishes — the enforcer's subsequent
+        ``_unload_engine`` + deferred cleanup handles ``mx.clear_cache``.
+
+        Returns:
+            The number of in-flight operations observed at abort time.
+            Used only for logging by the enforcer.
+        """
+        count = self._active_count
+        self._aborted.set()
+        return count
+
+    def _mark_stopped(self) -> None:
+        """Mark the engine as terminal so post-stop calls raise typed errors.
+
+        Concrete ``stop()`` implementations must call this at the top of
+        their stop sequence, before clearing ``self._model``. It sets
+        ``_aborted`` so that any handler racing with stop — one that
+        captured an engine reference before the enforcer's abort +
+        unload and hasn't tripped ``EnginePool.ensure_engine_alive`` —
+        sees :class:`RequestAbortedError` at the next
+        ``_raise_if_aborted`` checkpoint instead of a plain
+        ``RuntimeError("Engine not started")`` from the
+        ``self._model is None`` guard.
+        """
+        self._aborted.set()
+
+    def _raise_if_aborted(self) -> None:
+        """Raise :class:`RequestAbortedError` if this engine has been aborted.
+
+        Concrete engines must call this:
+
+        1. **At each public entry point**, *before* the ``self._model
+           is None`` "engine started" guard, so a handler racing with
+           ``stop()`` observes the typed abort rather than the plain
+           RuntimeError.
+        2. **Immediately after each ``run_in_executor`` await**, so an
+           in-flight operation whose abort fired while its executor
+           future was running discards the result and raises instead
+           of returning stale output to the handler.
+        """
+        if self._aborted.is_set():
+            from ..exceptions import RequestAbortedError
+            raise RequestAbortedError(
+                f"Engine for {self.model_name} has been aborted "
+                f"due to memory pressure. Please retry the request."
+            )
 
     @property
     @abstractmethod

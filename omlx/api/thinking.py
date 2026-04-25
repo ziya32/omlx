@@ -259,6 +259,9 @@ class ThinkingBudgetProcessor:
 
         # In new mlx-lm API, tokens is the full history list.
         # Accept each genuinely generated token exactly once (see grammar.py).
+        # On the first call, tokens ends at the last prompt token (not a
+        # generated token), so start _accepted_up_to at n — the next call
+        # will process tokens[n], i.e. the first genuinely generated token.
         n = len(tokens)
         if not hasattr(self, "_accepted_up_to"):
             self._accepted_up_to = n  # skip prompt tokens

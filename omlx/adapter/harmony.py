@@ -96,7 +96,8 @@ def preprocess_harmony_messages(
                     msg = {**msg, "content": content}
             elif content is not None:
                 # Non-string content (e.g., list) - log but don't modify
-                logger.debug(f"Assistant message has non-string content: {type(content)}")
+                if __debug__:
+                    logger.debug(f"Assistant message has non-string content: {type(content)}")
 
             result.append(msg)
 
@@ -125,9 +126,11 @@ def _get_special_token_ids(tokenizer: Any) -> set[int]:
             if isinstance(token_id, int) and token_id >= 0:
                 special_ids.add(token_id)
             else:
-                logger.debug(f"Harmony special token '{token}' not found in tokenizer")
+                if __debug__:
+                    logger.debug(f"Harmony special token '{token}' not found in tokenizer")
         except Exception as e:
-            logger.debug(f"Failed to get ID for Harmony token '{token}': {e}")
+            if __debug__:
+                logger.debug(f"Failed to get ID for Harmony token '{token}': {e}")
     return special_ids
 
 
@@ -322,7 +325,8 @@ class HarmonyStreamingParser:
         except Exception as e:
             # Can fail if message is incomplete (e.g., missing <|end|>)
             # This is expected in some cases, so just log and continue
-            logger.debug(f"Harmony parser process_eos failed (expected for incomplete messages): {e}")
+            if __debug__:
+                logger.debug(f"Harmony parser process_eos failed (expected for incomplete messages): {e}")
 
         if self._in_think_tag:
             self._in_think_tag = False

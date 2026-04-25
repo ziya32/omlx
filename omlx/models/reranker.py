@@ -714,6 +714,7 @@ class MLXRerankerModel:
         query: "str | dict",
         documents: "list[str] | list[dict]",
         max_length: int | None = None,
+        instruction: str | None = None,
     ) -> RerankOutput:
         """
         Rerank documents by relevance to the query.
@@ -726,6 +727,8 @@ class MLXRerankerModel:
             max_length: Maximum token length for each query-document pair.
                 If None, uses model-appropriate default (512 for encoder,
                 8192 for CausalLM).
+            instruction: Task instruction for CausalLM rerankers. If None,
+                uses the default instruction.
 
         Returns:
             RerankOutput with scores, sorted indices, and token count
@@ -762,7 +765,9 @@ class MLXRerankerModel:
                 if max_length is not None
                 else self._DEFAULT_MAX_LENGTH_CAUSAL_LM
             )
-            return self._rerank_causal_lm(query_str, docs_str, effective_max_length)
+            return self._rerank_causal_lm(
+                query_str, docs_str, effective_max_length, instruction
+            )
         else:
             effective_max_length = (
                 max_length
@@ -778,6 +783,7 @@ class MLXRerankerModel:
         query: str,
         documents: list[str],
         max_length: int = 8192,
+        instruction: str | None = None,
     ) -> RerankOutput:
         """
         Rerank using CausalLM yes/no logit scoring (e.g., Qwen3-Reranker).
@@ -803,11 +809,13 @@ class MLXRerankerModel:
         # Compute max tokens available for the instruction content
         max_content_tokens = max_length - len(prefix_tokens) - len(suffix_tokens)
 
+        effective_instruction = instruction or self._CAUSAL_LM_DEFAULT_INSTRUCTION
+
         # Format and tokenize each query-document pair
         pairs_text = []
         for doc in documents:
             content = (
-                f"<Instruct>: {self._CAUSAL_LM_DEFAULT_INSTRUCTION}\n"
+                f"<Instruct>: {effective_instruction}\n"
                 f"<Query>: {query}\n"
                 f"<Document>: {doc}"
             )

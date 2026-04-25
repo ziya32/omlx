@@ -51,6 +51,12 @@ class RerankRequest(BaseModel):
     Currently not implemented.
     """
 
+    instruction: str | None = None
+    """
+    Task instruction for instruction-aware reranker models (e.g. Qwen3-Reranker).
+    If not provided, uses the model's default instruction.
+    """
+
 
 class RerankResult(BaseModel):
     """A single rerank result."""
