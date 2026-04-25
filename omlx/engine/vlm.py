@@ -1141,12 +1141,25 @@ class VLMBatchedEngine(BaseEngine):
                 image_hash = compute_image_hash(images)
                 call_kwargs = dict(extra_model_inputs)
 
-                # Try vision feature cache
+                # Try vision feature cache.  Prefer per-image keying so a
+                # request with [A, B] followed by [B, C] reuses image B's
+                # encoder output.  Falls back to whole-request keying when
+                # _split_vision_features doesn't support this model
+                # (returns None) — that branch loses partial-reuse but
+                # still avoids re-encoding identical full requests.
                 if self._vision_cache is not None and self._vision_cache_enabled and image_hash:
-                    cached_features = self._vision_cache.get(image_hash, self._model_name)
-                    if cached_features is not None:
-                        call_kwargs["cached_image_features"] = cached_features
-                        logger.debug("Vision feature cache hit: %s", image_hash[:16])
+                    per_hashes = compute_per_image_hashes(images)
+                    cached_per_image = [
+                        self._vision_cache.get(h, self._model_name) for h in per_hashes
+                    ]
+
+                    if all(f is not None for f in cached_per_image):
+                        combined = mx.concatenate(cached_per_image, axis=0)
+                        call_kwargs["cached_image_features"] = combined
+                        logger.debug(
+                            "Vision feature cache hit (per-image): all %d images cached",
+                            num_images,
+                        )
                     else:
                         try:
                             features = self._compute_vision_features(
@@ -1154,14 +1167,27 @@ class VLMBatchedEngine(BaseEngine):
                             )
                             if features is not None:
                                 mx.eval(features)
-                                self._vision_cache.put(
-                                    image_hash, self._model_name, features
-                                )
                                 call_kwargs["cached_image_features"] = features
-                                logger.debug(
-                                    "Vision feature cache miss, stored: %s",
-                                    image_hash[:16],
+                                per_features = self._split_vision_features(
+                                    features, num_images, extra_model_inputs
                                 )
+                                if per_features is not None:
+                                    for h, f in zip(per_hashes, per_features):
+                                        self._vision_cache.put(h, self._model_name, f)
+                                    logger.debug(
+                                        "Vision feature cache miss, stored %d per-image entries",
+                                        len(per_features),
+                                    )
+                                else:
+                                    # Split unsupported for this model — fall
+                                    # back to whole-request keying
+                                    self._vision_cache.put(
+                                        image_hash, self._model_name, features
+                                    )
+                                    logger.debug(
+                                        "Vision feature cache miss, stored whole-request: %s",
+                                        image_hash[:16],
+                                    )
                         except Exception:
                             logger.debug(
                                 "Vision feature computation failed, using full pipeline",
