@@ -499,7 +499,12 @@ async def create_speech(
         raise HTTPException(status_code=400, detail="'input' field must not be empty")
 
     # --- Validate and decode ref_audio (voice clone) ---
-    audio_bytes = None
+    # The client sends ref_audio as base64-encoded WAV; the engine wants
+    # a filesystem path.  We decode to bytes here (cheap) and defer
+    # tempfile creation to each branch (streaming/non-streaming) right
+    # before the engine call, so validation errors below cannot leak a
+    # tempfile.
+    ref_audio_bytes: Optional[bytes] = None
     if request.ref_audio is not None:
         if not request.ref_text:
             raise HTTPException(
@@ -517,12 +522,31 @@ async def create_speech(
                 ),
             )
         try:
-            audio_bytes = base64.b64decode(request.ref_audio, validate=True)
+            ref_audio_bytes = base64.b64decode(request.ref_audio, validate=True)
         except Exception:
             raise HTTPException(
                 status_code=400,
                 detail="Invalid base64 encoding in 'ref_audio' field",
             )
+
+    def _materialize_ref_audio() -> Optional[str]:
+        """Write the decoded ref_audio bytes to a tempfile, returning its path."""
+        if ref_audio_bytes is None:
+            return None
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+        path = tmp.name
+        try:
+            tmp.write(ref_audio_bytes)
+        finally:
+            tmp.close()
+        return path
+
+    def _unlink_ref_audio(path: Optional[str]) -> None:
+        if path and os.path.exists(path):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
     pool = _get_engine_pool()
     resolved_model = _resolve_model(request.model)
@@ -602,12 +626,16 @@ async def create_speech(
         # non-pinned model load (the same failure mode the nanobot
         # test suite hit with the chat-streaming handlers, fixed there
         # via the same weakref.finalize pattern).
+        # Materialize ref_audio tempfile only now — past all sync
+        # validation, so a 4xx raise above can't leak the tempfile.
+        stream_ref_audio_path = _materialize_ref_audio()
         released_flag = [False]
 
         def _release_once() -> None:
             if not released_flag[0]:
                 released_flag[0] = True
                 pool.release_engine(resolved)
+            _unlink_ref_audio(stream_ref_audio_path)
 
         async def _stream_pcm():
             try:
@@ -615,8 +643,13 @@ async def create_speech(
                     text=request.input,
                     voice=speaker,
                     instructions=instruct,
-                    ref_audio=request.ref_audio,
+                    ref_audio=stream_ref_audio_path,
                     ref_text=request.ref_text,
+                    temperature=request.temperature,
+                    top_k=request.top_k,
+                    top_p=request.top_p,
+                    repetition_penalty=request.repetition_penalty,
+                    max_tokens=request.max_tokens,
                 ):
                     yield chunk.audio_bytes
             finally:
@@ -638,24 +671,35 @@ async def create_speech(
 
     start_time = time.perf_counter()
 
-    async with _use_engine(request.model) as engine:
-        if not isinstance(engine, TTSEngine):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Model '{request.model}' is not a text-to-speech model",
-            )
-        try:
-            output = await engine.synthesize(
-                text=request.input,
-                voice=speaker,
-                instructions=instruct,
-                ref_audio=request.ref_audio,
-                ref_text=request.ref_text,
-            )
-        except VoiceCloningError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-        except AudioError as e:
-            raise HTTPException(status_code=422, detail=str(e))
+    # Materialize ref_audio tempfile only now — past all sync validation.
+    nonstream_ref_audio_path = _materialize_ref_audio()
+    try:
+        async with _use_engine(request.model) as engine:
+            if not isinstance(engine, TTSEngine):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Model '{request.model}' is not a text-to-speech model",
+                )
+            try:
+                output = await engine.synthesize(
+                    text=request.input,
+                    voice=speaker,
+                    instructions=instruct,
+                    speed=speed,
+                    ref_audio=nonstream_ref_audio_path,
+                    ref_text=request.ref_text,
+                    temperature=request.temperature,
+                    top_k=request.top_k,
+                    top_p=request.top_p,
+                    repetition_penalty=request.repetition_penalty,
+                    max_tokens=request.max_tokens,
+                )
+            except VoiceCloningError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            except AudioError as e:
+                raise HTTPException(status_code=422, detail=str(e))
+    finally:
+        _unlink_ref_audio(nonstream_ref_audio_path)
 
     elapsed = time.perf_counter() - start_time
 
