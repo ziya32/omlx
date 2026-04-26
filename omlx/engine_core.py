@@ -499,10 +499,17 @@ class EngineCore:
         Only cleans engine-core level state (collectors, events).
         Scheduler state is cleaned by _do_abort_request (deferred abort)
         or _cleanup_finished (normal completion).
+
+        Does NOT call ``collector.clear()`` — once popped from the dict
+        the engine no longer references it, but a consumer blocked in
+        ``stream_outputs()`` may still hold a local reference and be
+        about to drain a pending output (e.g. the abort error from
+        ``abort_request``). Clearing here would wipe that output and
+        the wake event, causing the consumer to deadlock until its own
+        ``wait_for`` timeout. The popped collector is GC'd once the
+        consumer is done.
         """
-        collector = self._output_collectors.pop(request_id, None)
-        if collector:
-            collector.clear()
+        self._output_collectors.pop(request_id, None)
         self._stream_states.pop(request_id, None)
         self._finished_events.pop(request_id, None)
 
