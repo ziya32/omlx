@@ -279,9 +279,67 @@ class VLMModelAdapter(nn.Module):
                         input_ids, cache=cache, **kwargs
                     )
             else:
-                if hasattr(self._vlm_model, "_set_position_state"):
-                    self._vlm_model._set_position_state(input_ids)
-                result = self._language_model(input_ids, cache=cache, **kwargs)
+                if self._uses_mrope and cache is not None:
+                    # mRoPE fallback: derive position_ids from cache offsets
+                    # instead of letting the language model recompute via
+                    # ``get_rope_index``, which (for text-only inputs with
+                    # ``_rope_deltas`` cleared) returns positions 0..L-1
+                    # regardless of cache_offset and corrupts attention
+                    # against any cached KV at offset > 0 — e.g. SSD prefix
+                    # cache hit on a partial prompt.  This path is hit when
+                    # ``_batch_rope_deltas`` is not yet set (e.g.
+                    # PromptProcessingBatch before first GenerationBatch._step,
+                    # or single-request prefill kickoff).
+                    offsets = None
+                    scalar_offset = None
+                    for c in cache:
+                        if not hasattr(c, "offset"):
+                            continue
+                        raw = c.offset
+                        if isinstance(raw, mx.array):
+                            if raw.ndim > 0:
+                                # Batched cache with per-request offsets.
+                                offsets = raw
+                                break
+                            scalar_offset = int(raw.item())
+                            break
+                        if isinstance(raw, int):
+                            scalar_offset = raw
+                            break
+                    B, L = input_ids.shape
+                    if offsets is not None:
+                        # Per-request batched: broadcast batch offsets to
+                        # all positions (existing behaviour).  Per-token
+                        # positions inside a chunk are recovered by mlx-vlm
+                        # when these are passed as the starting position.
+                        position_ids = mx.broadcast_to(
+                            offsets[None, :, None], (3, B, L)
+                        )
+                        result = self._language_model(
+                            input_ids, cache=cache, position_ids=position_ids, **kwargs
+                        )
+                    elif scalar_offset is not None and scalar_offset > 0:
+                        # Single-request prefill against a cache at offset > 0:
+                        # positions are sequential starting from cache_offset.
+                        # Without this, get_rope_index would return 0..L-1
+                        # and prefix-cache-hit prefills produce 0 tokens.
+                        positions = mx.arange(scalar_offset, scalar_offset + L)
+                        position_ids = mx.broadcast_to(
+                            positions[None, None, :], (3, B, L)
+                        )
+                        result = self._language_model(
+                            input_ids, cache=cache, position_ids=position_ids, **kwargs
+                        )
+                    else:
+                        # No cache offset (fresh prefill from position 0):
+                        # let the language model compute positions itself.
+                        result = self._language_model(
+                            input_ids, cache=cache, **kwargs
+                        )
+                else:
+                    if hasattr(self._vlm_model, "_set_position_state"):
+                        self._vlm_model._set_position_state(input_ids)
+                    result = self._language_model(input_ids, cache=cache, **kwargs)
 
         if hasattr(result, "logits"):
             return result.logits
