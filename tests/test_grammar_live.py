@@ -2,12 +2,19 @@
 """Live integration tests for grammar-constrained decoding.
 
 Tests grammar correctness and measures performance across model families
-(Qwen, Gemma, Harmony/OSS) against a running oMLX server.
+(Qwen, Gemma, Harmony/OSS) against a self-spawned oMLX server.
 
-Prerequisites:
-  - oMLX server running on OMLX_TEST_URL (default: http://127.0.0.1:8899)
-  - Models loaded: Qwen3.5-4B-4bit, gemma-3-4b-it-qat-4bit, gpt-oss-20b-MXFP4-Q4
-  - reasoning_parser set via admin UI: qwen, (none), harmony respectively
+By default the test bootstraps its own ``omlx serve`` subprocess on a
+free port using ``OMLX_MODEL_DIR`` for model discovery.  One model per
+family is auto-picked from the model directory; families without a
+local match skip individually.
+
+Override patterns (any combination):
+  * ``OMLX_TEST_URL`` / ``OMLX_TEST_API_KEY`` — connect to an existing
+    server instead of spawning one.
+  * ``OMLX_TEST_GRAMMAR_MODEL_QWEN`` / ``..._GEMMA`` / ``..._OSS`` —
+    pin a specific model name for that family (must exist in the model
+    directory the server uses).
 
 Run:
   pytest tests/test_grammar_live.py -v -s
@@ -15,25 +22,288 @@ Run:
 """
 
 import asyncio
+import atexit
 import json
 import os
+import signal
+import socket
 import statistics
+import subprocess
+import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import httpx
 import pytest
 
 pytestmark = [pytest.mark.slow, pytest.mark.integration]
 
-BASE_URL = os.environ.get("OMLX_TEST_URL", "http://127.0.0.1:8899")
-API_KEY = os.environ.get("OMLX_TEST_API_KEY", "1234")
 
-MODELS = {
-    "qwen": "Qwen3.5-4B-4bit",
-    "gemma": "gemma-3-4b-it-qat-4bit",
-    "oss": "gpt-oss-20b-MXFP4-Q4",
+def _load_omlx_settings() -> dict:
+    """Read ~/.omlx/settings.json if present.  Returns {} on any failure."""
+    base = Path(os.environ.get("OMLX_BASE_PATH") or Path.home() / ".omlx")
+    settings_path = base / "settings.json"
+    try:
+        return json.loads(settings_path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _resolve_base_url() -> str:
+    if env := os.environ.get("OMLX_TEST_URL"):
+        return env
+    cfg = _load_omlx_settings().get("server", {})
+    host = cfg.get("host") or "127.0.0.1"
+    # 0.0.0.0 binds all interfaces — connect via loopback.
+    if host in ("0.0.0.0", "::"):
+        host = "127.0.0.1"
+    port = cfg.get("port") or 8899
+    return f"http://{host}:{port}"
+
+
+def _resolve_api_key() -> str:
+    if env := os.environ.get("OMLX_TEST_API_KEY"):
+        return env
+    return _load_omlx_settings().get("auth", {}).get("api_key") or ""
+
+
+# ---------------------------------------------------------------------------
+# Model discovery — pick one local model per family
+# ---------------------------------------------------------------------------
+
+# Substrings (lowercased model directory name) that identify each family.
+# A model qualifies for the family if its name contains one of these AND
+# its model_type indicates a generic chat-capable LLM (i.e. not a TTS,
+# STT, embedding, or reranker variant).
+_FAMILY_NAME_HINTS = {
+    "qwen": ("qwen3", "qwen2"),
+    "gemma": ("gemma",),
+    "oss": ("gpt-oss", "gpt_oss"),
 }
+
+# Reasoning parser to set on each family's loaded model so the
+# structural-tag tests exercise the grammar-aware reasoning pathway.
+# Gemma family has no reasoning parser by design.
+_FAMILY_REASONING_PARSER = {
+    "qwen": "qwen",
+    "gemma": None,
+    "oss": "harmony",
+}
+
+
+def _discover_family_model(model_dir: Path, family: str) -> str | None:
+    """Pick the smallest model in ``model_dir`` matching ``family``.
+
+    Honours ``OMLX_TEST_GRAMMAR_MODEL_<FAMILY>`` env var as an override
+    (returned as-is, no existence check — server will surface missing
+    model errors at request time).
+    """
+    override = os.environ.get(f"OMLX_TEST_GRAMMAR_MODEL_{family.upper()}")
+    if override:
+        return override
+    if not model_dir.is_dir():
+        return None
+    hints = _FAMILY_NAME_HINTS.get(family, ())
+    candidates: list[tuple[int, str]] = []
+    for sub in sorted(model_dir.iterdir()):
+        if not sub.is_dir() or not (sub / "config.json").exists():
+            continue
+        lower = sub.name.lower()
+        # Exclude non-chat variants (audio, embedding, reranker).
+        if any(t in lower for t in ("embedding", "reranker", "asr", "tts", "sts")):
+            continue
+        if not any(h in lower for h in hints):
+            continue
+        try:
+            cfg = json.loads((sub / "config.json").read_text())
+        except Exception:
+            continue
+        # True VLMs (vision-conditional architectures) confuse the grammar
+        # tests, which assume text-only chat completions.  Require a
+        # non-vision architecture.
+        archs = " ".join(cfg.get("architectures") or []).lower()
+        if "vlforconditional" in archs or "visionforconditional" in archs:
+            continue
+        try:
+            size = sum(f.stat().st_size for f in sub.iterdir() if f.is_file())
+        except OSError:
+            size = 0
+        candidates.append((size, sub.name))
+    if not candidates:
+        return None
+    candidates.sort()
+    return candidates[0][1]
+
+
+def _model_dir_for_server() -> Path:
+    """Resolve the model directory the spawned server should serve from."""
+    return Path(
+        os.environ.get("OMLX_MODEL_DIR")
+        or Path.home() / ".myemee" / "models"
+    )
+
+
+def _pick_free_port(default: int = 18899) -> int:
+    """Pick a free TCP port; fall back to ``default`` if the OS won't bind."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+    except OSError:
+        return default
+
+
+# ---------------------------------------------------------------------------
+# Server bootstrap
+# ---------------------------------------------------------------------------
+
+# Resolved at module import: BASE_URL/API_KEY for the test session.  When
+# the user supplied OMLX_TEST_URL, we connect to that.  Otherwise the
+# session-scoped fixture below spawns a subprocess and overwrites these.
+BASE_URL = _resolve_base_url()
+API_KEY = _resolve_api_key()
+_OMLX_USE_EXISTING = bool(os.environ.get("OMLX_TEST_URL"))
+
+_SERVER_API_KEY = "test-grammar-live"
+_SERVER_STARTUP_TIMEOUT = 180
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _grammar_live_server():
+    """Spawn an ``omlx serve`` subprocess for this test module.
+
+    **Module-scoped** (not session-scoped): the spawned subprocess
+    holds 30+ GB of GPU memory after loading two model families.  A
+    session-scoped fixture would keep that memory pinned while later
+    test modules — most notably ``test_exclusive_live_server.py`` and
+    ``test_full_integration.py`` — spawn their own subprocesses or
+    load models in-process, easily blowing past 64 GB system RAM.
+    Module-scope guarantees teardown fires the moment the last
+    grammar_live test in this file completes, freeing the memory
+    before the next module starts.
+
+    Skipped when ``OMLX_TEST_URL`` is set — assumes the user pointed at
+    an externally-managed server with the right models pre-loaded.
+    """
+    global BASE_URL, API_KEY
+
+    if _OMLX_USE_EXISTING:
+        # External server — nothing to spawn, no models to configure.
+        yield None
+        return
+
+    model_dir = _model_dir_for_server()
+    if not model_dir.is_dir():
+        pytest.skip(f"OMLX_MODEL_DIR not found: {model_dir}")
+
+    port = _pick_free_port()
+    base_path = Path(tempfile.mkdtemp(prefix="omlx-grammar-live-"))
+    cmd = [
+        sys.executable, "-m", "omlx", "serve",
+        "--base-path", str(base_path),
+        "--model-dir", str(model_dir),
+        "--api-key", _SERVER_API_KEY,
+        "--port", str(port),
+    ]
+    log_file = base_path / "server.log"
+    log_fh = open(log_file, "w")
+    proc = subprocess.Popen(
+        cmd, stdout=log_fh, stderr=subprocess.STDOUT, text=True,
+    )
+
+    def _kill():
+        if proc.poll() is None:
+            proc.send_signal(signal.SIGTERM)
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        try:
+            log_fh.close()
+        except Exception:
+            pass
+        # Best-effort tempdir cleanup — leave it on failure for triage,
+        # nuke it on clean teardown to keep /tmp tidy across runs.
+        try:
+            import shutil
+            shutil.rmtree(base_path, ignore_errors=True)
+        except Exception:
+            pass
+
+    # Backup cleanup if pytest crashes / SIGKILL — atexit fires only
+    # on clean interpreter shutdown but at least covers normal exit.
+    atexit.register(_kill)
+
+    try:
+        BASE_URL = f"http://127.0.0.1:{port}"
+        API_KEY = _SERVER_API_KEY
+
+        deadline = time.monotonic() + _SERVER_STARTUP_TIMEOUT
+        healthy = False
+        while time.monotonic() < deadline:
+            try:
+                r = httpx.get(f"{BASE_URL}/health", timeout=2.0)
+                if r.status_code == 200:
+                    healthy = True
+                    break
+            except (httpx.ConnectError, httpx.ReadTimeout):
+                pass
+            if proc.poll() is not None:
+                log_text = log_file.read_text() if log_file.exists() else ""
+                _kill()
+                pytest.skip(
+                    f"omlx server exited with code {proc.returncode}: "
+                    f"{log_text[:500]}"
+                )
+            time.sleep(1)
+        if not healthy:
+            _kill()
+            pytest.skip(f"omlx server not healthy within {_SERVER_STARTUP_TIMEOUT}s")
+
+        # Configure reasoning_parser per family on the loaded models.  Done
+        # after health-check so the server is fully initialised.
+        for family, parser in _FAMILY_REASONING_PARSER.items():
+            if parser is None:
+                continue
+            model = MODELS.get(family)
+            if model is None or model == "<missing>":
+                continue
+            try:
+                httpx.put(
+                    f"{BASE_URL}/admin/api/models/{model}/settings",
+                    json={"reasoning_parser": parser},
+                    headers={"Authorization": f"Bearer {API_KEY}"},
+                    timeout=10.0,
+                )
+            except Exception:
+                pass
+
+        yield proc
+    finally:
+        # Module teardown — kills subprocess + frees GPU memory before
+        # the next test module starts loading its own models.
+        _kill()
+
+
+# Auto-discover one model per family at collection time.  Tests for
+# families without a local match skip via the per-test ``skipif`` below.
+_AUTO_MODEL_DIR = _model_dir_for_server()
+MODELS = {
+    family: _discover_family_model(_AUTO_MODEL_DIR, family) or "<missing>"
+    for family in _FAMILY_NAME_HINTS
+}
+
+
+def _skip_if_family_missing(family: str):
+    """pytest mark that skips when the family has no local model."""
+    return pytest.mark.skipif(
+        MODELS.get(family) in (None, "<missing>"),
+        reason=f"No local model for family={family!r} in OMLX_MODEL_DIR — "
+               f"set OMLX_TEST_GRAMMAR_MODEL_{family.upper()} to override.",
+    )
 
 JSON_SCHEMA = {
     "type": "object",
@@ -144,18 +414,11 @@ async def _complete_streaming(client, model, prompt, **kwargs):
     return "".join(chunks), ttft or total, total, final_tokens
 
 
-def _server_available():
-    try:
-        r = httpx.get(f"{BASE_URL}/v1/models", headers=_headers(), timeout=5)
-        return r.status_code == 200
-    except Exception:
-        return False
-
-
-pytestmark = pytest.mark.skipif(
-    not _server_available(),
-    reason=f"oMLX server not reachable at {BASE_URL}",
-)
+# Note: the old top-level "server reachable?" skip has been replaced by
+# the autouse ``_grammar_live_server`` fixture which either spawns a
+# subprocess or trusts an externally-managed server when
+# ``OMLX_TEST_URL`` is set.  Per-family skipif marks (below) handle the
+# case where a model for a given family isn't available locally.
 
 
 # =========================================================================
@@ -175,7 +438,11 @@ class TestGrammarJson:
         return httpx.AsyncClient()
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("family", ["qwen", "gemma", "oss"])
+    @pytest.mark.parametrize("family", [
+        pytest.param("qwen", marks=_skip_if_family_missing("qwen")),
+        pytest.param("gemma", marks=_skip_if_family_missing("gemma")),
+        pytest.param("oss", marks=_skip_if_family_missing("oss")),
+    ])
     async def test_json_schema(self, client, family):
         model = MODELS[family]
         content, dur = await _complete(
@@ -202,7 +469,11 @@ class TestGrammarRegex:
         return httpx.AsyncClient()
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("family", ["qwen", "gemma", "oss"])
+    @pytest.mark.parametrize("family", [
+        pytest.param("qwen", marks=_skip_if_family_missing("qwen")),
+        pytest.param("gemma", marks=_skip_if_family_missing("gemma")),
+        pytest.param("oss", marks=_skip_if_family_missing("oss")),
+    ])
     async def test_regex(self, client, family):
         import re
         model = MODELS[family]
@@ -227,7 +498,11 @@ class TestGrammarChoice:
         return httpx.AsyncClient()
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("family", ["qwen", "gemma", "oss"])
+    @pytest.mark.parametrize("family", [
+        pytest.param("qwen", marks=_skip_if_family_missing("qwen")),
+        pytest.param("gemma", marks=_skip_if_family_missing("gemma")),
+        pytest.param("oss", marks=_skip_if_family_missing("oss")),
+    ])
     async def test_choice(self, client, family):
         model = MODELS[family]
         choices = ["yes", "no", "maybe"]
@@ -252,7 +527,10 @@ class TestNoGrammar:
         return httpx.AsyncClient()
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("family", ["qwen", "gemma"])
+    @pytest.mark.parametrize("family", [
+        pytest.param("qwen", marks=_skip_if_family_missing("qwen")),
+        pytest.param("gemma", marks=_skip_if_family_missing("gemma")),
+    ])
     async def test_plain(self, client, family):
         model = MODELS[family]
         content, dur = await _complete(
@@ -263,6 +541,7 @@ class TestNoGrammar:
         assert len(content.strip()) > 5, "Expected non-trivial output"
 
     @pytest.mark.asyncio
+    @_skip_if_family_missing("oss")
     async def test_plain_oss(self, client):
         """OSS/Harmony needs more tokens; analysis channel may consume most of them."""
         model = MODELS["oss"]
@@ -427,7 +706,11 @@ class TestPerformance:
             await _complete(c, model, "Hi", max_tokens=5)
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("family", ["qwen", "gemma", "oss"])
+    @pytest.mark.parametrize("family", [
+        pytest.param("qwen", marks=_skip_if_family_missing("qwen")),
+        pytest.param("gemma", marks=_skip_if_family_missing("gemma")),
+        pytest.param("oss", marks=_skip_if_family_missing("oss")),
+    ])
     async def test_perf(self, family):
         model = MODELS[family]
 
