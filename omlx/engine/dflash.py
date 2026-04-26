@@ -13,6 +13,7 @@ import copy
 import gc
 import logging
 import os
+import threading
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -20,6 +21,7 @@ import mlx.core as mx
 
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
+from ..exceptions import RequestAbortedError
 from .base import BaseEngine, GenerationOutput
 
 logger = logging.getLogger(__name__)
@@ -46,6 +48,7 @@ class DFlashEngine(BaseEngine):
         model_settings: Any | None = None,
         fallback_engine_type: str = "batched",
         scheduler_config: Any | None = None,
+        process_memory_max_bytes: int = 0,
     ):
         self._model_name = model_name
         self._draft_model_path = draft_model_path
@@ -53,16 +56,31 @@ class DFlashEngine(BaseEngine):
         self._model_settings = model_settings
         self._fallback_engine_type = fallback_engine_type
         self._scheduler_config = scheduler_config
+        self._process_memory_max_bytes = process_memory_max_bytes
 
         self._target_model = None
         self._draft_model = None
         self._tokenizer_obj = None
         self._executor_tokenizer = None
         self._loaded = False
-        self._active_request = False
         self._model_type_str = None
         self._fallback_engine: BaseEngine | None = None
         self._in_fallback_mode = False
+
+        # Single-request tracking for has_active_requests / abort_request.
+        # DFlash processes one request at a time on the MLX executor; the
+        # active request id (or "<no_id>" when caller didn't supply one)
+        # lives here for the duration of generate / stream_generate.
+        # threading.Event is used (not asyncio.Event) so the executor-thread
+        # for-loop in _run_generate_streaming can poll is_set() safely
+        # without crossing the asyncio/thread boundary.
+        self._active_request_id: str | None = None
+        self._active_request_lock = threading.Lock()
+        self._abort_event = threading.Event()
+        # Terminal abort flag set by abort_all_requests — separate from the
+        # per-call abort_event so a memory-pressure abort persists past the
+        # current request and refuses new ones until stop().
+        self._aborted_terminal = False
 
         raw = os.environ.get("DFLASH_MAX_CTX", str(DEFAULT_MAX_DFLASH_CTX)).strip()
         try:
@@ -163,13 +181,16 @@ class DFlashEngine(BaseEngine):
         else:
             logger.warning("DFlash model eviction: memory settle timed out")
 
-        # Start fallback engine
+        # Start fallback engine.  For VLM, forward process_memory_max_bytes
+        # so the per-prefill enforcer check in scheduler still works once
+        # we cross the DFlash context cap; BatchedEngine doesn't take it.
         if self._fallback_engine_type == "vlm":
             from .vlm import VLMBatchedEngine
             self._fallback_engine = VLMBatchedEngine(
                 model_name=self._model_name,
                 scheduler_config=self._scheduler_config,
                 model_settings=self._model_settings,
+                process_memory_max_bytes=self._process_memory_max_bytes,
             )
         else:
             from .batched import BatchedEngine
@@ -185,6 +206,10 @@ class DFlashEngine(BaseEngine):
         )
 
     async def stop(self) -> None:
+        # Signal any in-flight executor loop to exit at its next event,
+        # then await the fallback shutdown so we don't tear down state
+        # under it.
+        self._abort_event.set()
         if self._fallback_engine is not None:
             await self._fallback_engine.stop()
             self._fallback_engine = None
@@ -194,6 +219,11 @@ class DFlashEngine(BaseEngine):
         self._executor_tokenizer = None
         self._in_fallback_mode = False
         self._loaded = False
+        # Reset abort state so a subsequent start() is a clean slate.
+        self._aborted_terminal = False
+        self._abort_event.clear()
+        with self._active_request_lock:
+            self._active_request_id = None
         logger.info("DFlashEngine stopped")
 
     def _apply_chat_template(
@@ -246,6 +276,33 @@ class DFlashEngine(BaseEngine):
     def _should_fallback(self, prompt_tokens: list[int]) -> bool:
         return len(prompt_tokens) >= self._max_dflash_ctx
 
+    def _enter_active(self, request_id: str | None) -> str:
+        """Mark this engine as actively processing one request.
+
+        Returns the request id we use internally — caller's id when
+        provided, else a synthesized "<no_id>" sentinel so abort_request
+        with a real id can never accidentally match an anonymous slot.
+        Clears any previous per-call abort flag before returning.
+        """
+        rid = request_id if request_id else "<no_id>"
+        with self._active_request_lock:
+            self._active_request_id = rid
+            self._abort_event.clear()
+        return rid
+
+    def _exit_active(self) -> None:
+        """Clear active-request tracking after a generate / stream call."""
+        with self._active_request_lock:
+            self._active_request_id = None
+
+    def _raise_if_terminally_aborted(self) -> None:
+        """Raise RequestAbortedError if abort_all_requests has fired."""
+        if self._aborted_terminal:
+            raise RequestAbortedError(
+                f"Engine for {self._model_name} has been aborted "
+                f"due to memory pressure. Please retry the request."
+            )
+
     def _run_generate_streaming(
         self,
         prompt_tokens: list[int],
@@ -269,7 +326,7 @@ class DFlashEngine(BaseEngine):
             except ImportError:
                 pass
 
-            for event in stream_dflash_generate(
+            generator = stream_dflash_generate(
                 target_model=self._target_model,
                 tokenizer=self._executor_tokenizer,
                 draft_model=self._draft_model,
@@ -278,7 +335,23 @@ class DFlashEngine(BaseEngine):
                 stop_token_ids=stop_ids,
                 prompt_tokens_override=prompt_tokens,
                 temperature=temperature,
-            ):
+            )
+            for event in generator:
+                # Abort check between events.  dflash-mlx's runtime is a
+                # synchronous generator running on the MLX executor thread —
+                # we can't preempt the in-flight verify pass, but we can
+                # break out of the loop at the next event boundary so
+                # client-disconnect / memory-pressure aborts surface within
+                # one cycle (~50-200ms) instead of waiting for the full
+                # generation to finish.
+                if self._abort_event.is_set():
+                    logger.info(
+                        "DFlash generation aborted (abort_event set)"
+                    )
+                    asyncio.run_coroutine_threadsafe(
+                        queue.put(("", [], True, {"aborted": True})), loop
+                    )
+                    return
                 event_type = event.get("event")
 
                 if event_type == "token":
@@ -338,8 +411,10 @@ class DFlashEngine(BaseEngine):
         repetition_penalty: float = 1.0,
         presence_penalty: float = 0.0,
         stop: list[str] | None = None,
+        request_id: str | None = None,
         **kwargs,
     ) -> GenerationOutput:
+        self._raise_if_terminally_aborted()
         if not self._loaded:
             await self.start()
 
@@ -357,7 +432,8 @@ class DFlashEngine(BaseEngine):
                 prompt=prompt, max_tokens=max_tokens, temperature=temperature,
                 top_p=top_p, top_k=top_k, min_p=min_p,
                 repetition_penalty=repetition_penalty,
-                presence_penalty=presence_penalty, stop=stop, **kwargs,
+                presence_penalty=presence_penalty, stop=stop,
+                request_id=request_id, **kwargs,
             )
 
         # Already in fallback mode but short context came in.
@@ -367,7 +443,8 @@ class DFlashEngine(BaseEngine):
                 prompt=prompt, max_tokens=max_tokens, temperature=temperature,
                 top_p=top_p, top_k=top_k, min_p=min_p,
                 repetition_penalty=repetition_penalty,
-                presence_penalty=presence_penalty, stop=stop, **kwargs,
+                presence_penalty=presence_penalty, stop=stop,
+                request_id=request_id, **kwargs,
             )
 
         from ..engine_core import get_mlx_executor
@@ -389,7 +466,17 @@ class DFlashEngine(BaseEngine):
                 temperature=temperature,
             )
 
-        summary = await loop.run_in_executor(get_mlx_executor(), _run)
+        self._enter_active(request_id)
+        try:
+            summary = await loop.run_in_executor(get_mlx_executor(), _run)
+            # Discard the result if abort fired while the executor was
+            # running — handler sees the typed abort instead of stale text.
+            if self._abort_event.is_set():
+                raise RequestAbortedError(
+                    f"Request aborted during DFlash generation"
+                )
+        finally:
+            self._exit_active()
 
         generated = summary.get("generated_token_ids", [])
         text = self._tokenizer_obj.decode(generated, skip_special_tokens=True)
@@ -414,8 +501,10 @@ class DFlashEngine(BaseEngine):
         repetition_penalty: float = 1.0,
         presence_penalty: float = 0.0,
         stop: list[str] | None = None,
+        request_id: str | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
+        self._raise_if_terminally_aborted()
         if not self._loaded:
             await self.start()
 
@@ -433,7 +522,8 @@ class DFlashEngine(BaseEngine):
                 prompt=prompt, max_tokens=max_tokens, temperature=temperature,
                 top_p=top_p, top_k=top_k, min_p=min_p,
                 repetition_penalty=repetition_penalty,
-                presence_penalty=presence_penalty, stop=stop, **kwargs,
+                presence_penalty=presence_penalty, stop=stop,
+                request_id=request_id, **kwargs,
             ):
                 yield output
             return
@@ -444,7 +534,8 @@ class DFlashEngine(BaseEngine):
                 prompt=prompt, max_tokens=max_tokens, temperature=temperature,
                 top_p=top_p, top_k=top_k, min_p=min_p,
                 repetition_penalty=repetition_penalty,
-                presence_penalty=presence_penalty, stop=stop, **kwargs,
+                presence_penalty=presence_penalty, stop=stop,
+                request_id=request_id, **kwargs,
             ):
                 yield output
             return
@@ -454,6 +545,7 @@ class DFlashEngine(BaseEngine):
         queue: asyncio.Queue = asyncio.Queue()
 
         from ..engine_core import get_mlx_executor
+        self._enter_active(request_id)
         loop.run_in_executor(
             get_mlx_executor(),
             self._run_generate_streaming,
@@ -467,30 +559,40 @@ class DFlashEngine(BaseEngine):
         total_text = ""
         total_completion = 0
 
-        while True:
-            new_text, new_tokens, finished, metrics = await queue.get()
+        try:
+            while True:
+                new_text, new_tokens, finished, metrics = await queue.get()
 
-            total_text += new_text
-            total_completion += len(new_tokens)
+                total_text += new_text
+                total_completion += len(new_tokens)
 
-            finish_reason = None
-            if finished:
-                finish_reason = "stop"
-                if metrics and metrics.get("error"):
-                    finish_reason = "error"
+                finish_reason = None
+                if finished:
+                    finish_reason = "stop"
+                    if metrics and metrics.get("error"):
+                        finish_reason = "error"
+                    elif metrics and metrics.get("aborted"):
+                        # Surface aborts as a typed exception so the FastAPI
+                        # streaming handlers convert into a proper SSE error
+                        # event instead of a silent close.
+                        raise RequestAbortedError(
+                            f"Request aborted during DFlash generation"
+                        )
 
-            yield GenerationOutput(
-                text=total_text,
-                new_text=new_text,
-                tokens=new_tokens,
-                prompt_tokens=prompt_len,
-                completion_tokens=total_completion,
-                finished=finished,
-                finish_reason=finish_reason,
-            )
+                yield GenerationOutput(
+                    text=total_text,
+                    new_text=new_text,
+                    tokens=new_tokens,
+                    prompt_tokens=prompt_len,
+                    completion_tokens=total_completion,
+                    finished=finished,
+                    finish_reason=finish_reason,
+                )
 
-            if finished:
-                break
+                if finished:
+                    break
+        finally:
+            self._exit_active()
 
     async def chat(
         self,
@@ -503,6 +605,7 @@ class DFlashEngine(BaseEngine):
         repetition_penalty: float = 1.0,
         presence_penalty: float = 0.0,
         tools: list[dict] | None = None,
+        request_id: str | None = None,
         **kwargs,
     ) -> GenerationOutput:
         if not self._loaded:
@@ -518,7 +621,8 @@ class DFlashEngine(BaseEngine):
             prompt=prompt, max_tokens=max_tokens, temperature=temperature,
             top_p=top_p, top_k=top_k, min_p=min_p,
             repetition_penalty=repetition_penalty,
-            presence_penalty=presence_penalty, **kwargs,
+            presence_penalty=presence_penalty,
+            request_id=request_id, **kwargs,
         )
 
     async def stream_chat(
@@ -532,6 +636,7 @@ class DFlashEngine(BaseEngine):
         repetition_penalty: float = 1.0,
         presence_penalty: float = 0.0,
         tools: list[dict] | None = None,
+        request_id: str | None = None,
         **kwargs,
     ) -> AsyncIterator[GenerationOutput]:
         if not self._loaded:
@@ -547,14 +652,84 @@ class DFlashEngine(BaseEngine):
             prompt=prompt, max_tokens=max_tokens, temperature=temperature,
             top_p=top_p, top_k=top_k, min_p=min_p,
             repetition_penalty=repetition_penalty,
-            presence_penalty=presence_penalty, **kwargs,
+            presence_penalty=presence_penalty,
+            request_id=request_id, **kwargs,
         ):
             yield output
 
+    @property
+    def scheduler(self):
+        """Expose the fallback scheduler when in fallback mode.
+
+        ProcessMemoryEnforcer uses ``engine.scheduler`` to propagate
+        memory limits for inline prefill checking.  DFlash itself
+        manages cache inside dflash-mlx and has no scheduler, so we
+        return ``None`` until the engine has fallen over to BatchedEngine
+        / VLMBatchedEngine — at which point the inner scheduler becomes
+        visible (and is the only one that needs the limit, since DFlash
+        prefill is capped at DFLASH_MAX_CTX).
+        """
+        if self._in_fallback_mode and self._fallback_engine is not None:
+            return self._fallback_engine.scheduler
+        return None
+
     def has_active_requests(self) -> bool:
-        if self._fallback_engine is not None and self._fallback_engine.has_active_requests():
+        """True if either the DFlash native path or the fallback engine
+        has work in flight.  Used by EnginePool's drain monitor and the
+        admin dashboard's busy gauge."""
+        if (self._fallback_engine is not None
+                and self._fallback_engine.has_active_requests()):
             return True
-        return self._active_request
+        with self._active_request_lock:
+            return self._active_request_id is not None
+
+    async def abort_request(self, request_id: str) -> bool:
+        """Abort the in-flight request matching this id, if any.
+
+        Forwarded to the fallback engine when in fallback mode (the
+        request id may live there).  In native DFlash mode we set the
+        per-call abort_event, which the executor-thread loop in
+        _run_generate_streaming polls between events.  Returns True if
+        a matching request was found and signalled.
+        """
+        if self._in_fallback_mode and self._fallback_engine is not None:
+            forward = getattr(self._fallback_engine, "abort_request", None)
+            if forward is not None:
+                return await forward(request_id)
+            return False
+
+        with self._active_request_lock:
+            if self._active_request_id == request_id:
+                self._abort_event.set()
+                return True
+        return False
+
+    async def abort_all_requests(self) -> int:
+        """Abort every in-flight request and refuse new ones (terminal).
+
+        Called by ProcessMemoryEnforcer on memory pressure.  Sets the
+        terminal abort flag so a request arriving after this call is
+        rejected at the entry-point check before touching dflash-mlx,
+        and signals the per-call abort_event so the executor loop
+        breaks out at its next checkpoint.  Forwards to the fallback
+        engine too — both surfaces may have requests.
+        """
+        count = 0
+        if (self._fallback_engine is not None
+                and hasattr(self._fallback_engine, "abort_all_requests")):
+            try:
+                count += await self._fallback_engine.abort_all_requests()
+            except Exception as exc:
+                logger.warning(
+                    f"DFlash fallback abort_all_requests failed: {exc}"
+                )
+
+        self._aborted_terminal = True
+        with self._active_request_lock:
+            if self._active_request_id is not None:
+                self._abort_event.set()
+                count += 1
+        return count
 
     def get_stats(self) -> dict[str, Any]:
         return {
