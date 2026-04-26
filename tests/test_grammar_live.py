@@ -122,9 +122,15 @@ def _discover_family_model(model_dir: Path, family: str) -> str | None:
             continue
         # True VLMs (vision-conditional architectures) confuse the grammar
         # tests, which assume text-only chat completions.  Require a
-        # non-vision architecture.
+        # non-vision architecture.  Also skip DFlash speculative-decoding
+        # drafts — they look like normal Qwen models by ``model_type`` but
+        # their ``DFlashDraftModel`` architecture isn't loadable as a
+        # standalone chat LLM (they only work paired with a target via
+        # the DFlash engine).
         archs = " ".join(cfg.get("architectures") or []).lower()
         if "vlforconditional" in archs or "visionforconditional" in archs:
+            continue
+        if "draftmodel" in archs:
             continue
         try:
             size = sum(f.stat().st_size for f in sub.iterdir() if f.is_file())

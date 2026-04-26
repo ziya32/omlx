@@ -112,6 +112,14 @@ def _discover_cache_consistency_models() -> Dict[str, Dict[str, object]]:
         cfg = _load_cfg(sub)
         if not cfg:
             continue
+        # Skip DFlash speculative-decoding draft models — they advertise a
+        # plausible model_type ("qwen3") but architectures=['DFlashDraftModel'],
+        # so mlx_lm.load fails with weight-name mismatch and the rest of
+        # the test crashes.  The draft is only meaningful when paired with
+        # its target via the DFlash engine; it is not a standalone LLM.
+        archs_lower = " ".join(cfg.get("architectures") or []).lower()
+        if "draftmodel" in archs_lower:
+            continue
         mt = (cfg.get("model_type") or "").lower()
         # Categorise — skip true VLMs from LLM buckets.  VLM bucket
         # accepts both, since the test loads via mlx_vlm.
