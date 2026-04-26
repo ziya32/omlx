@@ -18,11 +18,13 @@ Run with: pytest tests/integration/test_boundary_cache_consistency.py -v -m slow
 """
 
 import gc
+import json
+import os
 import shutil
 import sys
 import tempfile
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import pytest
 
@@ -34,33 +36,119 @@ pytestmark = [
     ),
 ]
 
-MODELS = {
-    "kvcache": {
-        "path": "/Users/cryingneko/Workspace/models/Qwen3-4B-Instruct-2507-4bit",
-        "desc": "KVCache only (Qwen3-4B)",
-        "expect_on_off_match": True,
-    },
-    "arrayscache_dense": {
-        "path": "/Users/cryingneko/Workspace/models/Qwen3.5-27B-8bit",
-        "desc": "ArraysCache hybrid non-MoE (Qwen3.5-27B)",
-        "expect_on_off_match": True,
-    },
-    "arrayscache_moe": {
-        "path": "/Users/cryingneko/Workspace/models/Qwen3.5-35B-A3B-oQ4",
-        "desc": "ArraysCache hybrid MoE (Qwen3.5-35B-A3B)",
-        "expect_on_off_match": True,
-    },
-    "rotating_hybrid": {
-        "path": "/Volumes/SSD/Models/gpt-oss-120b-MXFP4-Q8",
-        "desc": "RotatingKVCache+KVCache hybrid (gpt-oss-120b)",
-        "expect_on_off_match": False,  # chunk size differs, quality-only check
-    },
-    "rotating_vlm": {
-        "path": "/Users/cryingneko/Workspace/models/gemma-3-12b-it-qat-4bit",
-        "desc": "RotatingKVCache+KVCache VLM hybrid (Gemma3-12B-QAT)",
-        "expect_on_off_match": False,  # chunk size differs for RotatingKVCache
-    },
-}
+
+def _discover_cache_consistency_models() -> Dict[str, Dict[str, object]]:
+    """Map cache-architecture categories to available models.
+
+    Each cache type below corresponds to a different mlx-lm cache class
+    selected by ``model_type``.  We scan ``OMLX_MODEL_DIR`` and pick the
+    smallest matching model per category; categories with no local match
+    are dropped from the parameter set rather than skipped per-call so
+    the run doesn't carry stale parametrize ids.
+
+    Override with ``OMLX_TEST_BOUNDARY_MODELS_JSON`` (JSON dict matching
+    the original MODELS shape) for explicit selection.
+    """
+    if env := os.environ.get("OMLX_TEST_BOUNDARY_MODELS_JSON"):
+        try:
+            return json.loads(env)
+        except json.JSONDecodeError:
+            pass
+
+    base = Path(os.environ.get("OMLX_MODEL_DIR") or Path.home() / ".myemee" / "models")
+    if not base.is_dir():
+        return {}
+
+    # Cache-architecture rules indexed by mlx-lm model_type.  These
+    # mirror the architectures the original test enumerated; we map
+    # whatever we have on disk into the right cache bucket.
+    #
+    # expect_on_off_match=False is required for RotatingKVCache models —
+    # boundary ON/OFF can yield different tokens because chunk-size
+    # differences perturb attention without recurrent state.
+    KVCACHE_TYPES = {"llama", "qwen3", "qwen2"}  # plain KVCache
+    ARRAYSCACHE_DENSE_TYPES = {"qwen3_5"}        # ArraysCache hybrid (dense)
+    ARRAYSCACHE_MOE_TYPES = {"qwen3_5_moe"}      # ArraysCache hybrid (MoE)
+    ROTATING_HYBRID_TYPES = {"gpt_oss"}           # Rotating + KV hybrid
+    ROTATING_VLM_TYPES = {"gemma3", "gemma4"}     # Rotating VLM hybrid
+
+    def _load_cfg(p: Path) -> dict:
+        try:
+            return json.loads((p / "config.json").read_text())
+        except Exception:
+            return {}
+
+    def _is_text_only_quant(p: Path, cfg: dict) -> bool:
+        """Reject VLM-architecture models that lack actual vision weights.
+
+        Some text-only quants keep ``vision_config`` from the parent VLM
+        but ship no vision_tower weights, so ``mlx_lm.load`` works but
+        ``mlx_vlm.load`` doesn't.  For LLM-only categories we want those;
+        for VLM-only categories we want to skip them.
+        """
+        archs = " ".join(cfg.get("architectures") or []).lower()
+        return "vlforconditional" not in archs and "visionforconditional" not in archs
+
+    def _size(p: Path) -> int:
+        try:
+            return sum(f.stat().st_size for f in p.iterdir() if f.is_file())
+        except OSError:
+            return 0
+
+    buckets: Dict[str, List[Path]] = {
+        "kvcache": [],
+        "arrayscache_dense": [],
+        "arrayscache_moe": [],
+        "rotating_hybrid": [],
+        "rotating_vlm": [],
+    }
+
+    for sub in sorted(base.iterdir()):
+        if not sub.is_dir():
+            continue
+        lower = sub.name.lower()
+        if any(t in lower for t in ("embedding", "reranker", "asr", "tts", "sts")):
+            continue
+        cfg = _load_cfg(sub)
+        if not cfg:
+            continue
+        mt = (cfg.get("model_type") or "").lower()
+        # Categorise — skip true VLMs from LLM buckets.  VLM bucket
+        # accepts both, since the test loads via mlx_vlm.
+        if mt in KVCACHE_TYPES and _is_text_only_quant(sub, cfg):
+            buckets["kvcache"].append(sub)
+        elif mt in ARRAYSCACHE_DENSE_TYPES and _is_text_only_quant(sub, cfg):
+            buckets["arrayscache_dense"].append(sub)
+        elif mt in ARRAYSCACHE_MOE_TYPES and _is_text_only_quant(sub, cfg):
+            buckets["arrayscache_moe"].append(sub)
+        elif mt in ROTATING_HYBRID_TYPES:
+            buckets["rotating_hybrid"].append(sub)
+        elif mt in ROTATING_VLM_TYPES:
+            buckets["rotating_vlm"].append(sub)
+
+    descs = {
+        "kvcache":             ("KVCache only", True),
+        "arrayscache_dense":   ("ArraysCache hybrid non-MoE", True),
+        "arrayscache_moe":     ("ArraysCache hybrid MoE", True),
+        "rotating_hybrid":     ("RotatingKVCache+KVCache hybrid", False),
+        "rotating_vlm":        ("RotatingKVCache+KVCache VLM hybrid", False),
+    }
+    out: Dict[str, Dict[str, object]] = {}
+    for key, candidates in buckets.items():
+        if not candidates:
+            continue
+        candidates.sort(key=_size)
+        chosen = candidates[0]
+        label, expect_match = descs[key]
+        out[key] = {
+            "path": str(chosen),
+            "desc": f"{label} ({chosen.name})",
+            "expect_on_off_match": expect_match,
+        }
+    return out
+
+
+MODELS = _discover_cache_consistency_models()
 
 
 def _build_8k_prompt(tokenizer) -> List[int]:

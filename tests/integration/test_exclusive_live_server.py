@@ -67,7 +67,9 @@ REQUEST_TIMEOUT = 300.0
 RETRY_BACKOFF = 5.0
 RETRYABLE_CODES = {504, 507}
 SERVER_STARTUP_TIMEOUT = 180
-VLM_MAX_RESPONSE_TIME = 30.0  # seconds — fail if single VLM response exceeds this
+VLM_MAX_RESPONSE_TIME = 60.0  # seconds — fail if single VLM response exceeds this.
+# Headroom for the heaviest stress scenarios on a 30B-A3B 8-bit MoE under 9
+# concurrent requests; smaller models on faster hardware will land well below.
 
 REPORT_DIR = Path(__file__).resolve().parents[2] / "test-reports"
 

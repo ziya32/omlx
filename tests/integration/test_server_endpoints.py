@@ -1192,16 +1192,21 @@ class TestErrorHandling:
 
 
 class TestRequestAbortedErrorHandling:
-    """Tests for the FastAPI exception handler that translates
-    RequestAbortedError (raised by EngineCore.generate when the
-    process memory enforcer called abort_all_requests() mid-call)
-    into HTTP 503 with an OpenAI-compatible error body.
+    """Tests for translating RequestAbortedError (raised by EngineCore
+    when the process memory enforcer called abort_all_requests() mid-call)
+    into an OpenAI-compatible error envelope.
+
+    Non-streaming chat/completion endpoints stream a leading whitespace
+    keepalive byte before awaiting the engine, so the HTTP status is
+    locked at 200 before the abort can be observed.  The retry signal
+    (status code) lives in the response body's ``error.code`` field
+    instead — same shape as upstream OpenAI's mid-stream errors.
     """
 
     def test_chat_completions_abort_returns_503(self, client, mock_llm_engine):
         """Non-streaming chat completions: engine.chat raising
-        RequestAbortedError must surface as HTTP 503 with an
-        OpenAI-shaped error envelope."""
+        RequestAbortedError must surface as an OpenAI-shaped error
+        envelope with code=503 in the body."""
         from omlx.exceptions import RequestAbortedError
 
         mock_llm_engine.chat = AsyncMock(
@@ -1219,15 +1224,17 @@ class TestRequestAbortedErrorHandling:
             },
         )
 
-        assert response.status_code == 503
+        # HTTP status is 200 because keepalive byte already streamed;
+        # the 503 retry signal is body-encoded.
+        assert response.status_code == 200
         data = response.json()
-        # OpenAI-style error envelope from _openai_error_body
         assert "error" in data
+        assert data["error"]["code"] == 503
         assert "process memory limit exceeded" in data["error"]["message"]
 
     def test_completions_abort_returns_503(self, client, mock_llm_engine):
         """Non-streaming /v1/completions: engine.generate raising
-        RequestAbortedError must also surface as HTTP 503."""
+        RequestAbortedError must also surface 503 in the body."""
         from omlx.exceptions import RequestAbortedError
 
         mock_llm_engine.generate = AsyncMock(
@@ -1244,9 +1251,10 @@ class TestRequestAbortedErrorHandling:
             },
         )
 
-        assert response.status_code == 503
+        assert response.status_code == 200
         data = response.json()
         assert "error" in data
+        assert data["error"]["code"] == 503
         assert "process memory limit exceeded" in data["error"]["message"]
 
 
@@ -1306,15 +1314,17 @@ class TestStoppedEngineReturns503:
     handler invoking a method on the engine.
 
     Fixed path: the engine raises ``RequestAbortedError`` rather than a
-    plain ``RuntimeError``, so ``request_aborted_handler`` in
-    ``server.py`` translates it to HTTP 503 with an OpenAI-shaped error
-    envelope instead of falling through to the generic 500 handler.
+    plain ``RuntimeError``.  Because chat/completion endpoints stream a
+    leading whitespace keepalive byte before awaiting the engine, the
+    HTTP status is locked at 200 by the time the abort fires, so the
+    503 retry signal is body-encoded in the OpenAI error envelope's
+    ``error.code`` field instead.
     """
 
     def test_chat_on_stopped_engine_returns_503(
         self, client, mock_llm_engine
     ):
-        """Chat completions: stopped-engine error → HTTP 503."""
+        """Chat completions: stopped-engine error → 503 in error body."""
         from omlx.exceptions import RequestAbortedError
 
         mock_llm_engine.chat = AsyncMock(
@@ -1332,16 +1342,17 @@ class TestStoppedEngineReturns503:
             },
         )
 
-        assert response.status_code == 503
+        assert response.status_code == 200
         data = response.json()
         assert "error" in data
+        assert data["error"]["code"] == 503
         assert "stopped" in data["error"]["message"].lower()
         assert "retry" in data["error"]["message"].lower()
 
     def test_completions_on_stopped_engine_returns_503(
         self, client, mock_llm_engine
     ):
-        """Completions: stopped-engine error → HTTP 503."""
+        """Completions: stopped-engine error → 503 in error body."""
         from omlx.exceptions import RequestAbortedError
 
         mock_llm_engine.generate = AsyncMock(
@@ -1359,9 +1370,10 @@ class TestStoppedEngineReturns503:
             },
         )
 
-        assert response.status_code == 503
+        assert response.status_code == 200
         data = response.json()
         assert "error" in data
+        assert data["error"]["code"] == 503
         assert "stopped" in data["error"]["message"].lower()
 
 

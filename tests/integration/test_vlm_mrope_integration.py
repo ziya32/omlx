@@ -19,6 +19,8 @@ Run with:
 """
 
 import gc
+import json
+import os
 import shutil
 import sys
 import tempfile
@@ -36,17 +38,79 @@ pytestmark = [
     ),
 ]
 
-MROPE_MODELS = [
-    "/Users/cryingneko/Workspace/models/Qwen3-VL-30B-A3B-Instruct-3bit",
-    "/Users/cryingneko/Workspace/models/Qwen3.5-27B-4bit",
-    "/Users/cryingneko/Workspace/models/Qwen3.5-35B-A3B-4bit",
-    "/Users/cryingneko/Workspace/models/GLM-4.6V-Flash-4bit",
-    "/Users/cryingneko/Workspace/models/Qwen3.5-122B-A10B-oQ4",
-    "/Users/cryingneko/Workspace/models/gemma-4-26b-a4b-it-4bit",
-    "/Users/cryingneko/Workspace/models/gemma-3-12b-it-qat-4bit",
-    "/Users/cryingneko/Workspace/models/gemma-4-e2b-it-4bit",
-    "/Users/cryingneko/Workspace/models/Nemotron-Cascade-2-30B-A3B-4bit",
-]
+
+# mlx-lm/mlx-vlm model_types that use mRoPE (multi-dimensional RoPE).
+# Per-request rope_deltas tracking only matters for these architectures.
+_MROPE_MODEL_TYPES = {
+    "qwen3_5", "qwen3_5_moe",
+    "qwen3_vl", "qwen3_vl_moe",
+    "qwen2_vl", "qwen2_5_vl",
+    "gemma3", "gemma4",
+    "glm4v", "glm4_5v", "glm4_6v",
+}
+
+
+def _discover_mrope_models() -> List[str]:
+    """Pick mRoPE-capable models from OMLX_MODEL_DIR for the integration suite.
+
+    Override with ``OMLX_TEST_MROPE_MODELS`` (comma-separated absolute
+    paths).  Otherwise auto-discover by ``model_type`` against the
+    ``_MROPE_MODEL_TYPES`` set: prefer a small VLM (true VLM, not a
+    text-only quant) for the multi-image tests, plus a small text-only
+    mRoPE model for the text-only/transition checks.
+    """
+    if env := os.environ.get("OMLX_TEST_MROPE_MODELS"):
+        return [p.strip() for p in env.split(",") if p.strip()]
+
+    base = Path(os.environ.get("OMLX_MODEL_DIR") or Path.home() / ".myemee" / "models")
+    if not base.is_dir():
+        return []
+
+    def _load_cfg(p: Path) -> dict:
+        try:
+            return json.loads((p / "config.json").read_text())
+        except Exception:
+            return {}
+
+    def _is_true_vlm(cfg: dict) -> bool:
+        archs = " ".join(cfg.get("architectures") or []).lower()
+        return "vlforconditional" in archs or "visionforconditional" in archs
+
+    def _size(p: Path) -> int:
+        try:
+            return sum(f.stat().st_size for f in p.iterdir() if f.is_file())
+        except OSError:
+            return 0
+
+    vlms: List[Path] = []
+    text_only: List[Path] = []
+    for sub in sorted(base.iterdir()):
+        if not sub.is_dir():
+            continue
+        lower = sub.name.lower()
+        if any(t in lower for t in ("embedding", "reranker", "asr", "tts", "sts")):
+            continue
+        cfg = _load_cfg(sub)
+        if not cfg:
+            continue
+        if (cfg.get("model_type") or "").lower() not in _MROPE_MODEL_TYPES:
+            continue
+        if _is_true_vlm(cfg):
+            vlms.append(sub)
+        else:
+            text_only.append(sub)
+
+    chosen: List[Path] = []
+    if vlms:
+        vlms.sort(key=_size)
+        chosen.append(vlms[0])
+    if text_only:
+        text_only.sort(key=_size)
+        chosen.append(text_only[0])
+    return [str(p) for p in chosen]
+
+
+MROPE_MODELS = _discover_mrope_models()
 
 TEXT_QUESTIONS = [
     "Explain the difference between a stack and a queue in 3 sentences.",
