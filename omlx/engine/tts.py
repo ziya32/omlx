@@ -300,6 +300,13 @@ class TTSEngine(BaseNonStreamingEngine):
             gen_kwargs["instruct"] = instructions
         if speed != 1.0:
             gen_kwargs["speed"] = speed
+        # Forward voice-cloning kwargs when the model's generate()
+        # signature accepts them (e.g. some CustomVoice variants support
+        # both speaker-name routing AND ref_audio cloning in the same call).
+        if ref_audio is not None and "ref_audio" in gen_params:
+            gen_kwargs["ref_audio"] = ref_audio
+        if ref_text is not None and "ref_text" in gen_params:
+            gen_kwargs["ref_text"] = ref_text
         gen_kwargs.update(extra)
 
         return gen_kwargs
@@ -378,12 +385,14 @@ class TTSEngine(BaseNonStreamingEngine):
         with self._active_lock:
             self._active_count += 1
         try:
-            # Step 1: Create generator on executor (quick)
+            # Step 1: Create generator on executor (quick).
+            # Wrap with iter() so model.generate() returning a list
+            # (test mocks, or eager iterables) supports next(g, None).
             def _create_gen():
                 if __debug__:
                     logger.debug(f"[TTS] Synthesizing: variant={self._variant}")
                 try:
-                    return model.generate(**gen_kwargs)
+                    return iter(model.generate(**gen_kwargs))
                 except Exception as e:
                     if self._variant == "base" and ref_audio:
                         raise VoiceCloningError(
@@ -499,7 +508,8 @@ class TTSEngine(BaseNonStreamingEngine):
         try:
             def _create_stream_gen():
                 try:
-                    return model.generate(**gen_kwargs)
+                    # iter() so list-returning mocks support next(g, None)
+                    return iter(model.generate(**gen_kwargs))
                 except Exception as e:
                     if self._variant == "base" and ref_audio:
                         raise VoiceCloningError(
