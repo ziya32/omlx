@@ -1659,32 +1659,49 @@ class EnginePool:
             model_settings = self._settings_manager.get_settings(model_id)
 
         # Check if DFlash is enabled — takes priority over engine type
-        # since DFlash has its own model loading pipeline
+        # since DFlash has its own load pipeline (target + draft bundles).
+        # Only LLM/VLM effective types qualify; embedding/reranker/audio
+        # routes don't go through dflash-mlx.  Falls back silently to the
+        # default engine if dflash-mlx isn't installed or load fails, so a
+        # misconfigured setting can't take a model offline.
         engine = None
-        if model_settings is not None:
+        if (
+            model_settings is not None
+            and effective_type in ("batched", "vlm")
+        ):
             dflash_enabled = getattr(model_settings, "dflash_enabled", False)
             dflash_draft = getattr(model_settings, "dflash_draft_model", None)
             if dflash_enabled and dflash_draft:
+                enforcer = self._process_memory_enforcer
                 try:
                     from .engine.dflash import DFlashEngine
                     engine = DFlashEngine(
                         model_name=entry.model_path,
                         draft_model_path=dflash_draft,
-                        draft_quant_bits=getattr(model_settings, "dflash_draft_quant_bits", None),
+                        draft_quant_bits=getattr(
+                            model_settings, "dflash_draft_quant_bits", None
+                        ),
                         model_settings=model_settings,
-                        fallback_engine_type=effective_type,
+                        fallback_engine_type=(
+                            "vlm" if effective_type == "vlm" else "batched"
+                        ),
                         scheduler_config=self._scheduler_config,
+                        process_memory_max_bytes=(
+                            getattr(enforcer, "max_bytes", 0) if enforcer else 0
+                        ),
                     )
-                    logger.info(f"DFlash enabled for {model_id}, draft={dflash_draft}")
+                    logger.info(
+                        f"DFlash enabled for {model_id}, draft={dflash_draft}"
+                    )
                 except ImportError:
                     logger.warning(
-                        f"DFlash enabled for {model_id} but dflash-mlx is not installed. "
-                        f"Falling back to default engine."
+                        f"DFlash enabled for {model_id} but dflash-mlx is "
+                        f"not installed; falling back to default engine."
                     )
                 except Exception as e:
                     logger.warning(
-                        f"DFlash init failed for {model_id}: {e}. "
-                        f"Falling back to default engine."
+                        f"DFlash init failed for {model_id}: {e}; "
+                        f"falling back to default engine."
                     )
 
         # Per-model trust_remote_code (security opt-in, issue #926).
@@ -1693,7 +1710,7 @@ class EnginePool:
         # in the admin UI's model settings modal.
         trc = bool(getattr(model_settings, "trust_remote_code", False)) if model_settings else False
 
-        # Create engine based on engine type (if DFlash not active)
+        # Create engine based on engine type (if DFlash didn't take it)
         if engine is None:
             if effective_type == "embedding":
                 engine = EmbeddingEngine(
