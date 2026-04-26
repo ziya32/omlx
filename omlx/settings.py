@@ -174,8 +174,10 @@ class ModelSettings:
         Get max model memory in bytes, or None if disabled.
 
         Returns:
-            Max model memory in bytes (90% of usable RAM if "auto"),
-            or None if disabled (no limit).
+            Max model memory in bytes (usable RAM = total - adaptive reserve
+            if "auto"), or None if disabled (no limit).  The adaptive
+            reserve already accounts for OS + framework overhead, so the
+            full remainder is available to model weights + KV cache.
         """
         value = self.max_model_memory.strip().lower()
         if value == "disabled":
@@ -183,7 +185,7 @@ class ModelSettings:
         if value == "auto":
             total = get_system_memory()
             reserve = _adaptive_system_reserve(total)
-            return max(1 * 1024**3, int((total - reserve) * 0.9))
+            return max(1 * 1024**3, total - reserve)
         return parse_size(self.max_model_memory)
 
     def to_dict(self) -> dict[str, Any]:
