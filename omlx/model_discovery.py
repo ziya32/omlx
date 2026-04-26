@@ -185,7 +185,22 @@ def _build_audio_detection_sets():
 
     Returns (stt_types, tts_types, sts_types) where each is a set of
     model_type strings that should trigger audio detection.
+
+    The mlx-audio dynamic discovery doesn't always capture every known
+    audio model_type (e.g. qwen2_audio, kugelaudio, audiodit aren't keys
+    in MODEL_REMAPPING and lack their own model directories).  We union
+    a curated static set in so detection stays robust as mlx-audio's
+    internal layout changes between releases.
     """
+    # Curated static seeds — keep these in sync with the architectures
+    # listed in AUDIO_*_ARCHITECTURES below.
+    _static_stt = {"whisper", "qwen3_asr", "parakeet", "qwen2_audio"}
+    _static_tts = {
+        "qwen3_tts", "kokoro", "chatterbox", "vibevoice",
+        "vibevoice_streaming", "kugelaudio", "audiodit",
+    }
+    _static_sts = {"deepfilternet", "mossformer2_se", "sam_audio", "lfm_audio"}
+
     try:
         from pathlib import Path as _P
 
@@ -200,16 +215,16 @@ def _build_audio_detection_sets():
                         if p.is_dir() and not p.name.startswith("__")}
             return set()
 
-        # TTS: MODEL_REMAPPING keys + model dir names
+        # TTS: MODEL_REMAPPING keys + model dir names + curated seeds
         from mlx_audio.tts.utils import MODEL_REMAPPING as _tts_remap
-        tts = set(_tts_remap.keys()) | _dir_names("tts")
+        tts = set(_tts_remap.keys()) | _dir_names("tts") | _static_tts
 
-        # STT: MODEL_REMAPPING keys + model dir names
+        # STT: MODEL_REMAPPING keys + model dir names + curated seeds
         from mlx_audio.stt.utils import MODEL_REMAPPING as _stt_remap
-        stt = set(_stt_remap.keys()) | _dir_names("stt")
+        stt = set(_stt_remap.keys()) | _dir_names("stt") | _static_stt
 
-        # STS: model dir names only (no unified utils/remapping)
-        sts = _dir_names("sts")
+        # STS: model dir names + curated seeds
+        sts = _dir_names("sts") | _static_sts
 
         # Strip base-LLM names that collide with audio model dirs
         tts -= _LLM_TYPE_COLLISIONS
@@ -223,11 +238,7 @@ def _build_audio_detection_sets():
 
     except Exception:
         logger.debug("mlx-audio not available — using static audio detection sets")
-        # Static fallback so model discovery still works without mlx-audio
-        _stt = {"whisper", "qwen3_asr", "parakeet", "qwen2_audio"}
-        _tts = {"qwen3_tts", "kokoro", "chatterbox", "vibevoice", "vibevoice_streaming", "kugelaudio", "audiodit"}
-        _sts = {"deepfilternet", "mossformer2_se", "sam_audio", "lfm_audio"}
-        return _stt, _tts, _sts
+        return _static_stt, _static_tts, _static_sts
 
 
 AUDIO_STT_MODEL_TYPES, AUDIO_TTS_MODEL_TYPES, AUDIO_STS_MODEL_TYPES = (
