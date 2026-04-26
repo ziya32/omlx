@@ -10,6 +10,7 @@ Covers:
 - Scheduler grammar path (_build_sampler_and_processors)
 """
 
+import importlib.util
 import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -19,6 +20,14 @@ import numpy as np
 import pytest
 
 from omlx.api.openai_models import StructuredOutputOptions
+
+# xgrammar is in the [grammar] optional extra (requires torch).  Tests that
+# @patch("xgrammar.*") symbols load xgrammar at decoration time, which
+# explodes if it's not installed; skip those tests cleanly when it isn't.
+_xgrammar_missing = importlib.util.find_spec("xgrammar") is None
+_skip_if_no_xgrammar = pytest.mark.skipif(
+    _xgrammar_missing, reason="xgrammar not installed"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +223,7 @@ class TestPatchOutputFormat:
 # _compile_with_structural_tag / _compile_bare_grammar
 # =========================================================================
 
+@_skip_if_no_xgrammar
 class TestCompileWithStructuralTag:
     """Tests for _compile_with_structural_tag."""
 
@@ -399,6 +409,7 @@ class TestCompileGrammarForRequest:
         assert result == "compiled_builtin"
         compiler.compile_builtin_json_grammar.assert_called_once()
 
+    @_skip_if_no_xgrammar
     @patch("xgrammar.get_builtin_structural_tag")
     def test_reasoning_parser_uses_structural_tag(self, mock_get_tag):
         """When reasoning_parser is set, compile_structural_tag is used."""
@@ -423,6 +434,7 @@ class TestCompileGrammarForRequest:
         compiler.compile_structural_tag.assert_called_once()
         mock_get_tag.assert_called_once_with("qwen", reasoning=True)
 
+    @_skip_if_no_xgrammar
     @patch("xgrammar.get_builtin_structural_tag")
     def test_reasoning_parser_with_thinking_disabled(self, mock_get_tag):
         """enable_thinking=False → reasoning=False passed to get_builtin_structural_tag."""

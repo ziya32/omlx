@@ -45,7 +45,7 @@ class TestPostDecodeAbort:
         scheduler._step_counter = 0
         scheduler._pending_abort_ids = {"req-1"}
         scheduler.memory_monitor = None
-        scheduler._deferred_clear_steps = None
+        scheduler._deferred_clear_at = None
 
         # Mock batch_generator.next() returning a response for req-1
         mock_response = MagicMock()

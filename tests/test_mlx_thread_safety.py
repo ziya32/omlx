@@ -158,10 +158,15 @@ class TestSTTThreadSafety:
 
         mock_stt = MagicMock()
         mock_stt.load = _mock_stt_load
+        # Engine now imports load_model from mlx_audio.stt.utils — route it
+        # to the same callable so the thread-name probe still fires.
+        mock_utils = MagicMock()
+        mock_utils.load_model = _mock_stt_load
 
         with patch.dict("sys.modules", {
             "mlx_audio": MagicMock(stt=mock_stt),
             "mlx_audio.stt": mock_stt,
+            "mlx_audio.stt.utils": mock_utils,
         }):
             engine = STTEngine(model_name="whisper-tiny")
             await engine.start()

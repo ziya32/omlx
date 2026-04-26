@@ -215,6 +215,7 @@ class TestSubKeyVerification:
         mock_gs.auth.sub_keys = [
             SubKeyEntry(key="sub-key-1", name="Test Sub Key"),
         ]
+        mock_gs.auth.skip_api_key_verification = False
         mock_gs.server.host = "0.0.0.0"
         _server_state.global_settings = mock_gs
 
