@@ -251,6 +251,7 @@ class GlobalSettingsRequest(BaseModel):
 
     # Auth settings
     api_key: Optional[str] = None
+    skip_api_key_verification: Optional[bool] = None
 
 
 class HFDownloadRequest(BaseModel):
