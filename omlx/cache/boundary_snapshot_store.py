@@ -84,6 +84,14 @@ class BoundarySnapshotSSDStore:
         # reaches zero, preventing unbounded growth.
         self._cancelled_requests: dict[str, int] = {}
 
+        # Serializes any I/O on the snapshot directory tree (writer's
+        # mkdir+write+rename, cleanup_all's rmtree+mkdir, cleanup_request's
+        # rmtree).  Without this, a writer thread already past the
+        # cancelled-check could land a file in a directory that cleanup_*
+        # had just rmtree'd, leaking a stale snapshot into the
+        # freshly-recreated tree.
+        self._io_lock = threading.Lock()
+
         # Background writer thread.
         self._write_queue: queue.Queue = queue.Queue(maxsize=_MAX_PENDING_WRITES)
         self._shutdown = threading.Event()
@@ -253,13 +261,17 @@ class BoundarySnapshotSSDStore:
         with self._registry_lock:
             self._file_registry.pop(request_id, None)
 
-        # Remove files.
-        req_dir = self._snapshot_dir / request_id
-        if req_dir.exists():
-            try:
-                shutil.rmtree(req_dir)
-            except Exception as e:
-                logger.debug("Failed to clean up snapshots for %s: %s", request_id, e)
+        # Remove files.  Hold _io_lock to serialize with any writer
+        # thread currently processing an item for this request — the
+        # writer re-checks _cancelled_requests under the same lock and
+        # will skip its write if we added the id above.
+        with self._io_lock:
+            req_dir = self._snapshot_dir / request_id
+            if req_dir.exists():
+                try:
+                    shutil.rmtree(req_dir)
+                except Exception as e:
+                    logger.debug("Failed to clean up snapshots for %s: %s", request_id, e)
 
     def cleanup_all(self) -> None:
         """Delete all snapshot files (for reset/startup)."""
@@ -278,14 +290,23 @@ class BoundarySnapshotSSDStore:
             self._pending_writes.clear()
         with self._registry_lock:
             self._file_registry.clear()
-        self._cancelled_requests.clear()
 
-        if self._snapshot_dir.exists():
-            try:
-                shutil.rmtree(self._snapshot_dir)
-            except Exception as e:
-                logger.debug("Failed to clean up all boundary snapshots: %s", e)
-        self._snapshot_dir.mkdir(parents=True, exist_ok=True)
+        # Hold _io_lock across the rmtree + mkdir + cancelled-set reset.
+        # This blocks until the writer thread finishes any item it has
+        # already dequeued (the writer holds _io_lock for its entire
+        # mkdir + write + rename sequence in _process_one_write_item),
+        # guaranteeing no writer ops land in the freshly-recreated
+        # snapshot directory.  Clearing _cancelled_requests AFTER
+        # acquiring the lock avoids undoing any cancellation set
+        # between the drain and the lock.
+        with self._io_lock:
+            self._cancelled_requests.clear()
+            if self._snapshot_dir.exists():
+                try:
+                    shutil.rmtree(self._snapshot_dir)
+                except Exception as e:
+                    logger.debug("Failed to clean up all boundary snapshots: %s", e)
+            self._snapshot_dir.mkdir(parents=True, exist_ok=True)
 
     def shutdown(self) -> None:
         """Stop background writer thread."""
@@ -322,7 +343,36 @@ class BoundarySnapshotSSDStore:
             if item is None:  # Sentinel
                 break
 
-            pw_key, tensors_raw, metadata, file_path = item
+            self._process_one_write_item(item)
+
+    def _process_one_write_item(self, item) -> None:
+        """Process a single dequeued write item.
+
+        Extracted from ``_writer_loop`` so tests can drive the race
+        between a dequeued item and ``cleanup_all`` / ``cleanup_request``
+        deterministically without racing against the live writer thread.
+        Behaviour is identical to the inlined version.
+
+        Holds ``_io_lock`` across the entire critical section
+        (mkdir + write + rename) so cleanup_all / cleanup_request can
+        serialize with it deterministically.  Without this, a writer
+        already past the cancelled-set check could write a file into a
+        directory that cleanup_* had just rmtree'd.
+        """
+        pw_key, tensors_raw, metadata, file_path = item
+
+        with self._io_lock:
+            # Staleness check: if our entry is no longer in
+            # _pending_writes, a cleanup_all or cleanup_request wiped
+            # it between dequeue and now.  Skip — writing would leak a
+            # file into a directory cleanup has already emptied.  This
+            # is the same check the cancelled-set covers for individual
+            # request cleanups; cleanup_all clears _pending_writes
+            # without populating _cancelled_requests, so the membership
+            # check is the only signal that fires for it.
+            with self._pending_lock:
+                if pw_key not in self._pending_writes:
+                    return
 
             # Skip writes for cancelled/cleaned-up requests.
             if pw_key[0] in self._cancelled_requests:
@@ -335,7 +385,7 @@ class BoundarySnapshotSSDStore:
                 except Exception:
                     pass
                 self._dec_cancelled(pw_key[0])
-                continue
+                return
 
             temp_path = None
             try:
@@ -355,7 +405,7 @@ class BoundarySnapshotSSDStore:
                     with self._pending_lock:
                         self._pending_writes.pop(pw_key, None)
                     self._dec_cancelled(pw_key[0])
-                    continue
+                    return
 
                 os.rename(str(temp_path), str(file_path))
 
