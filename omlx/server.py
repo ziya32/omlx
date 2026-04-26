@@ -57,7 +57,7 @@ from typing import Optional, Union
 from fastapi import Depends, FastAPI, HTTPException, Request as FastAPIRequest
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from omlx._version import __version__
@@ -1599,7 +1599,14 @@ async def _with_sse_keepalive(
                     keepalive_elapsed = 0.0
                     yield ": keep-alive\n\n"
             if task.done():
-                result = task.result()
+                try:
+                    result = task.result()
+                except Exception as e:
+                    logger.error(f"SSE generator error: {e}")
+                    error_data = {"error": {"message": str(e), "type": "server_error"}}
+                    yield f"data: {json.dumps(error_data)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
                 if result is _KEEPALIVE_SENTINEL:
                     return
                 yield result
@@ -1623,16 +1630,25 @@ async def _with_json_keepalive(
 ) -> AsyncIterator[str]:
     """Wrap a coroutine to send keepalive spaces while waiting for completion.
 
-    Non-streaming response bodies are buffered until the handler returns,
-    so a long prefill can blow past client/proxy read timeouts before any
-    bytes hit the wire.  This wrapper turns the response into a stream
-    that emits a leading space (then more spaces every ``interval`` s)
-    while the underlying coroutine runs.  JSON parsers ignore leading
-    whitespace, so the final response parses normally on the client.
+    Async generator — yields a leading space (then more spaces every
+    ``interval`` s) while the underlying coroutine runs, then the
+    serialized result.  JSON parsers ignore leading whitespace, so the
+    final response parses normally on the client.
+
+    HTTP status is fixed at 200 by the time the first byte hits the
+    wire (Starlette commits ``http.response.start`` before iterating
+    the body).  Exceptions raised by ``coro`` after that point can't
+    flip the status, so we surface them in the response body using the
+    OpenAI error envelope ``{"error": {"message", "type", "code"}}``
+    where ``code`` carries the equivalent HTTP status (503 for
+    ``RequestAbortedError`` / ``EngineEvictedError``, etc.).  Clients
+    use the body's ``error.code`` for retry logic in the same way they
+    would use the status — this is how upstream OpenAI's streaming
+    responses signal mid-stream errors.
 
     Polls ``http_request.is_disconnected()`` every ``disconnect_poll`` s
-    so a client read-timeout at the proxy cancels the engine task instead
-    of running it to completion and discarding the result.
+    so a client read-timeout cancels the engine task instead of running
+    it to completion and discarding the result.
     """
     task = asyncio.ensure_future(coro)
     keepalive_elapsed = 0.0
@@ -1661,7 +1677,53 @@ async def _with_json_keepalive(
             if keepalive_elapsed >= interval:
                 keepalive_elapsed = 0.0
                 yield " "
-        result = task.result()
+
+        # Surface task result OR an OpenAI-shaped error body.  HTTP
+        # status is locked at 200 (keepalive byte already streamed), so
+        # the equivalent status code is mirrored into ``error.code`` so
+        # clients can recover the retry signal from the body.
+        try:
+            result = task.result()
+        except RequestAbortedError as exc:
+            logger.warning(
+                "Request aborted mid-keepalive (status already 200): %s", exc
+            )
+            yield json.dumps(
+                _openai_error_body(str(exc) or "Request aborted", 503, code=503)
+            )
+            return
+        except EngineEvictedError as exc:
+            logger.warning(
+                "Engine evicted mid-keepalive (status already 200): %s", exc
+            )
+            yield json.dumps(
+                _openai_error_body(str(exc) or "Engine evicted", 503, code=503)
+            )
+            return
+        except HTTPException as exc:
+            logger.warning(
+                "HTTPException mid-keepalive (status already 200): %d %s",
+                exc.status_code, exc.detail,
+            )
+            yield json.dumps(
+                _openai_error_body(
+                    str(exc.detail) or "Error",
+                    exc.status_code,
+                    code=exc.status_code,
+                )
+            )
+            return
+        except Exception as exc:
+            logger.exception(
+                "Unhandled exception mid-keepalive (status already 200)"
+            )
+            yield json.dumps(
+                _openai_error_body(
+                    str(exc) or "Internal server error", 500, code=500,
+                )
+            )
+            return
+
         if result is not None:
             yield result
     finally:
@@ -2229,10 +2291,7 @@ async def create_completion(
                 pool.release_engine(resolved_model)
 
         released = True  # _build_completion takes ownership of the lease
-        return StreamingResponse(
-            _with_json_keepalive(http_request, _build_completion()),
-            media_type="application/json",
-        )
+        return StreamingResponse(_with_json_keepalive(http_request, _build_completion()), media_type="application/json")
     finally:
         if not released:
             pool.release_engine(resolved_model)
@@ -2604,10 +2663,7 @@ async def create_chat_completion(
                 pool.release_engine(resolved_model)
 
         released = True  # _build_chat_completion takes ownership of the lease
-        return StreamingResponse(
-            _with_json_keepalive(http_request, _build_chat_completion()),
-            media_type="application/json",
-        )
+        return StreamingResponse(_with_json_keepalive(http_request, _build_chat_completion()), media_type="application/json")
     finally:
         if not released:
             pool.release_engine(resolved_model)
@@ -3828,10 +3884,7 @@ async def create_anthropic_message(
                 pool.release_engine(resolved_model)
 
         released = True  # _build_anthropic_message takes ownership of the lease
-        return StreamingResponse(
-            _with_json_keepalive(http_request, _build_anthropic_message()),
-            media_type="application/json",
-        )
+        return StreamingResponse(_with_json_keepalive(http_request, _build_anthropic_message()), media_type="application/json")
     finally:
         if not released:
             pool.release_engine(resolved_model)
@@ -4254,10 +4307,7 @@ async def create_response(
                 pool.release_engine(resolved_model)
 
         released = True  # _build_response takes ownership of the lease
-        return StreamingResponse(
-            _with_json_keepalive(http_request, _build_response()),
-            media_type="application/json",
-        )
+        return StreamingResponse(_with_json_keepalive(http_request, _build_response()), media_type="application/json")
     finally:
         if not released:
             pool.release_engine(resolved_model)
