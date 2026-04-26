@@ -9,11 +9,56 @@ required. Integration tests (marked @pytest.mark.slow) need a real model.
 """
 
 import io
+import json
+import os
 import wave
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
+
+
+def _resolve_local_sts_model(family_signals: tuple[str, ...]) -> str | None:
+    """Find a local STS-family model in OMLX_MODEL_DIR.
+
+    family_signals is a tuple of substrings that identify the wanted
+    architecture (e.g. ("deepfilter",) or ("mossformer",)).  Override
+    via OMLX_TEST_STS_MODEL (absolute path or HF repo) to bypass.
+    """
+    if env := os.environ.get("OMLX_TEST_STS_MODEL"):
+        return env
+    base = Path(os.environ.get("OMLX_MODEL_DIR") or Path.home() / ".myemee" / "models")
+    if not base.is_dir():
+        return None
+    candidates: list[tuple[int, str]] = []
+    for sub in sorted(base.iterdir()):
+        if not sub.is_dir():
+            continue
+        cfg_path = sub / "config.json"
+        if not cfg_path.exists():
+            continue
+        try:
+            cfg = json.loads(cfg_path.read_text())
+        except Exception:
+            continue
+        archs = " ".join(cfg.get("architectures") or []).lower()
+        mt = (cfg.get("model_type") or "").lower()
+        name_lower = sub.name.lower()
+        match = any(
+            s in archs or s in mt or s in name_lower for s in family_signals
+        )
+        if not match:
+            continue
+        try:
+            size = sum(f.stat().st_size for f in sub.iterdir() if f.is_file())
+        except OSError:
+            size = 0
+        candidates.append((size, str(sub)))
+    if not candidates:
+        return None
+    candidates.sort()
+    return candidates[0][1]
 
 
 # ---------------------------------------------------------------------------
@@ -463,7 +508,12 @@ class TestSTSIntegrationDeepFilterNet:
         from omlx.engine.sts import STSEngine
         import asyncio
 
-        model_name = "mlx-community/DeepFilterNet-mlx"
+        model_name = _resolve_local_sts_model(("deepfilter",))
+        if model_name is None:
+            pytest.skip(
+                "No local DeepFilterNet model in OMLX_MODEL_DIR — "
+                "set OMLX_TEST_STS_MODEL to override."
+            )
         wav_path = tmp_path / "test.wav"
         wav_path.write_bytes(TINY_WAV)
 
@@ -489,7 +539,12 @@ class TestSTSIntegrationMossFormer2:
         from omlx.engine.sts import STSEngine
         import asyncio
 
-        model_name = "starkdmi/MossFormer2-SE"
+        model_name = _resolve_local_sts_model(("mossformer",))
+        if model_name is None:
+            pytest.skip(
+                "No local MossFormer2 model in OMLX_MODEL_DIR — "
+                "set OMLX_TEST_STS_MODEL to override."
+            )
         wav_path = tmp_path / "test.wav"
         wav_path.write_bytes(TINY_WAV)
 
@@ -515,7 +570,12 @@ class TestSTSIntegrationSAMAudio:
         from omlx.engine.sts import STSEngine
         import asyncio
 
-        model_name = "mlx-community/sam-audio-base-fp16"
+        model_name = _resolve_local_sts_model(("sam_audio", "samaudio", "sam-audio"))
+        if model_name is None:
+            pytest.skip(
+                "No local SAMAudio model in OMLX_MODEL_DIR — "
+                "set OMLX_TEST_STS_MODEL to override."
+            )
         wav_path = tmp_path / "test.wav"
         wav_path.write_bytes(TINY_WAV)
 
@@ -543,7 +603,12 @@ class TestSTSIntegrationLFM2:
         from omlx.engine.sts import STSEngine
         import asyncio
 
-        model_name = "mlx-community/LFM2.5-Audio-1.5B-6bit"
+        model_name = _resolve_local_sts_model(("lfm",))
+        if model_name is None:
+            pytest.skip(
+                "No local LFM2 model in OMLX_MODEL_DIR — "
+                "set OMLX_TEST_STS_MODEL to override."
+            )
         wav_path = tmp_path / "test.wav"
         wav_path.write_bytes(TINY_WAV)
 

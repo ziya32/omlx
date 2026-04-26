@@ -41,12 +41,22 @@ def _make_stt_output(text="", language=None, segments=None):
 
 
 def _patch_stt(mock_stt):
-    """Context manager that patches sys.modules so ``from mlx_audio import stt`` works."""
+    """Patch sys.modules so the STT engine's mlx_audio imports resolve to mocks.
+
+    The engine does ``from mlx_audio.stt.utils import load_model``; expose that
+    on the patched submodule and route it to the same mock.load() callable so
+    existing tests asserting on ``mock_stt.load.assert_called_once`` continue
+    to work.
+    """
     mlx_audio_mock = MagicMock()
     mlx_audio_mock.stt = mock_stt
+    mock_utils = MagicMock()
+    mock_utils.load_model = mock_stt.load
+    mock_stt.utils = mock_utils
     return patch.dict("sys.modules", {
         "mlx_audio": mlx_audio_mock,
         "mlx_audio.stt": mock_stt,
+        "mlx_audio.stt.utils": mock_utils,
     })
 
 

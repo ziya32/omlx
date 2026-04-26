@@ -9,11 +9,59 @@ required. Integration tests (marked @pytest.mark.slow) need a real model.
 """
 
 import io
+import json
+import os
 import wave
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
+
+
+def _resolve_local_stt_model() -> str | None:
+    """Find a local STT model in OMLX_MODEL_DIR, or None.
+
+    Override with OMLX_TEST_STT_MODEL (absolute path or repo id).  The
+    discovery scans architectures/model_type for known STT signals so
+    we don't try to download a HuggingFace repo that may need auth.
+    """
+    if env := os.environ.get("OMLX_TEST_STT_MODEL"):
+        return env
+    base = Path(os.environ.get("OMLX_MODEL_DIR") or Path.home() / ".myemee" / "models")
+    if not base.is_dir():
+        return None
+    stt_signals = ("asr", "whisper", "qwen3_asr", "moonshine", "parakeet", "voxtral")
+    candidates: list[tuple[int, str]] = []
+    for sub in sorted(base.iterdir()):
+        if not sub.is_dir():
+            continue
+        cfg_path = sub / "config.json"
+        if not cfg_path.exists():
+            continue
+        try:
+            cfg = json.loads(cfg_path.read_text())
+        except Exception:
+            continue
+        archs = " ".join(cfg.get("architectures") or []).lower()
+        mt = (cfg.get("model_type") or "").lower()
+        name_lower = sub.name.lower()
+        is_stt = (
+            any(s in archs for s in stt_signals)
+            or mt in stt_signals
+            or any(s in name_lower for s in stt_signals)
+        )
+        if not is_stt:
+            continue
+        try:
+            size = sum(f.stat().st_size for f in sub.iterdir() if f.is_file())
+        except OSError:
+            size = 0
+        candidates.append((size, str(sub)))
+    if not candidates:
+        return None
+    candidates.sort()
+    return candidates[0][1]
 
 
 # ---------------------------------------------------------------------------
@@ -415,7 +463,12 @@ class TestSTTIntegration:
 
         from omlx.engine.stt import STTEngine
 
-        model_name = "mlx-community/whisper-tiny"
+        model_name = _resolve_local_stt_model()
+        if model_name is None:
+            pytest.skip(
+                "No local STT model found in OMLX_MODEL_DIR — "
+                "set OMLX_TEST_STT_MODEL to override."
+            )
         wav_path = tmp_path / "test.wav"
         wav_path.write_bytes(TINY_WAV)
 
@@ -423,8 +476,18 @@ class TestSTTIntegration:
             import asyncio
             engine = STTEngine(model_name)
             asyncio.run(engine.start())
-            result = asyncio.run(engine.transcribe(wav_path))
-            assert "text" in result
+            # transcribe() declares ``audio_path: str`` — some backends
+            # (Qwen3-ASR) inspect a possibly-array argument via ``.ndim``
+            # before normalising, which crashes on a bare Path.  Pass the
+            # str form so all backends agree.
+            result = asyncio.run(engine.transcribe(str(wav_path)))
+            # transcribe() returns a TranscriptionOutput dataclass with
+            # a ``.text`` attribute; the upstream test (which used
+            # whisper-tiny) saw a dict shape via mlx_audio's older API.
+            text = getattr(result, "text", None)
+            if text is None and isinstance(result, dict):
+                text = result.get("text")
+            assert text is not None
             asyncio.run(engine.stop())
         except Exception as e:
             pytest.skip(f"Could not run integration test: {e}")
