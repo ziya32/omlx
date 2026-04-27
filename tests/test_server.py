@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for omlx.server module - sampling parameter resolution and exception handlers."""
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -627,3 +628,167 @@ class TestChatCompletionRequestId:
         from omlx.api.openai_models import ChatCompletionRequest
         req = ChatCompletionRequest(model="m", messages=[], request_id="my-uuid")
         assert req.request_id == "my-uuid"
+
+
+class TestRunWithDisconnectGuardCleanup:
+    """Regression: _run_with_disconnect_guard must drain its inner task on
+    every exit path so asyncio doesn't log
+    "Task exception was never retrieved".
+
+    Bug:
+        Concurrent flow that surfaced this:
+        - long-running engine.chat() runs as Task B (wrapped by guard)
+        - separately, POST /v1/cancel/{id} aborts the request → Task B
+          is about to finish with RequestAbortedError
+        - meanwhile the outer keepalive wrapper sees the gateway has
+          closed its connection and cancels the guard's awaiter
+        - guard exits via CancelledError before reaching task.result(),
+          leaves Task B running
+        - Task B finishes with RequestAbortedError, asyncio GCs the
+          orphaned task → "Task exception was never retrieved" error.
+    """
+
+    @pytest.mark.asyncio
+    async def test_inner_task_drained_when_guard_is_cancelled(self):
+        """Outer cancel must drain inner task's exception."""
+        from omlx.server import _run_with_disconnect_guard
+
+        # Mock http_request whose is_disconnected() returns False so the
+        # guard's wait-loop does NOT exit via its own disconnect path.
+        # Cancellation will come from outside.
+        http_request = MagicMock()
+        http_request.is_disconnected = AsyncMock(return_value=False)
+
+        finished_box: list[str] = []
+
+        async def slow_then_raise():
+            try:
+                await asyncio.sleep(0.05)
+                raise RuntimeError("simulated RequestAbortedError equivalent")
+            finally:
+                finished_box.append("done")
+
+        async def run_guard():
+            return await _run_with_disconnect_guard(
+                http_request, slow_then_raise(), poll_interval=0.01,
+            )
+
+        outer = asyncio.create_task(run_guard())
+        await asyncio.sleep(0.01)  # let guard start its wait loop
+        outer.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await outer
+
+        # Give the inner task a moment to finish and be drained
+        await asyncio.sleep(0.1)
+
+        assert finished_box == ["done"], (
+            "Inner task's finally never ran — guard didn't await it on cancel."
+        )
+
+    @pytest.mark.asyncio
+    async def test_inner_task_exception_retrieved_when_guard_is_cancelled(self):
+        """The inner task's exception must be RETRIEVED (await task) on
+        cancel exit, otherwise asyncio logs `Task exception was never
+        retrieved`.  Hard to assert directly without warning hooks, so
+        we instead check that no warning is emitted.
+        """
+        from omlx.server import _run_with_disconnect_guard
+
+        http_request = MagicMock()
+        http_request.is_disconnected = AsyncMock(return_value=False)
+
+        async def will_raise_after_short_sleep():
+            await asyncio.sleep(0.01)
+            raise RuntimeError("inner failure")
+
+        # Track unretrieved-task warnings via the loop's exception handler
+        unretrieved: list[Exception] = []
+        loop = asyncio.get_running_loop()
+        original_handler = loop.get_exception_handler()
+
+        def tracker(loop, context):
+            msg = context.get("message", "")
+            exc = context.get("exception")
+            if "Task exception was never retrieved" in msg or "never retrieved" in msg:
+                unretrieved.append(exc)
+
+        loop.set_exception_handler(tracker)
+
+        try:
+            outer = asyncio.create_task(
+                _run_with_disconnect_guard(
+                    http_request,
+                    will_raise_after_short_sleep(),
+                    poll_interval=0.01,
+                )
+            )
+            await asyncio.sleep(0.005)  # let guard's wait loop start
+            outer.cancel()
+            with pytest.raises((asyncio.CancelledError, RuntimeError)):
+                await outer
+
+            # Give asyncio time to GC and emit any warning
+            for _ in range(20):
+                await asyncio.sleep(0.01)
+            import gc
+            gc.collect()
+            await asyncio.sleep(0.01)
+        finally:
+            loop.set_exception_handler(original_handler)
+
+        assert not unretrieved, (
+            "_run_with_disconnect_guard left an unretrieved task exception "
+            f"on cancel. Warnings: {unretrieved}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_normal_completion_unchanged(self):
+        """Ensure the cleanup wrapping doesn't break the happy path."""
+        from omlx.server import _run_with_disconnect_guard
+
+        http_request = MagicMock()
+        http_request.is_disconnected = AsyncMock(return_value=False)
+
+        async def succeeds():
+            return "ok"
+
+        result = await _run_with_disconnect_guard(
+            http_request, succeeds(), poll_interval=0.01,
+        )
+        assert result == "ok"
+
+    @pytest.mark.asyncio
+    async def test_inner_exception_propagates(self):
+        """Exceptions from the inner coroutine still propagate."""
+        from omlx.server import _run_with_disconnect_guard
+
+        http_request = MagicMock()
+        http_request.is_disconnected = AsyncMock(return_value=False)
+
+        async def raises():
+            raise ValueError("inner")
+
+        with pytest.raises(ValueError, match="inner"):
+            await _run_with_disconnect_guard(
+                http_request, raises(), poll_interval=0.01,
+            )
+
+    @pytest.mark.asyncio
+    async def test_disconnect_path_returns_none(self):
+        """Disconnect path is unchanged: returns None, drains task."""
+        from omlx.server import _run_with_disconnect_guard
+
+        http_request = MagicMock()
+        # First call returns False (so we enter the wait loop), second True
+        http_request.is_disconnected = AsyncMock(side_effect=[False, True, True])
+
+        async def long_running():
+            await asyncio.sleep(60)
+            return "should not reach"
+
+        result = await _run_with_disconnect_guard(
+            http_request, long_running(), poll_interval=0.01,
+        )
+        assert result is None

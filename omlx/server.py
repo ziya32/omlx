@@ -1757,19 +1757,35 @@ async def _run_with_disconnect_guard(
     connection without sending an explicit cancel.
     """
     task = asyncio.create_task(coro)
-    while not task.done():
-        done, _ = await asyncio.wait({task}, timeout=poll_interval)
-        if done:
-            break
-        if await http_request.is_disconnected():
-            logger.info("Client disconnected, cancelling generation task")
+    try:
+        while not task.done():
+            done, _ = await asyncio.wait({task}, timeout=poll_interval)
+            if done:
+                break
+            if await http_request.is_disconnected():
+                logger.info("Client disconnected, cancelling generation task")
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+                return None
+        return task.result()
+    except BaseException:
+        # The wait-loop awaitable was cancelled or another exception
+        # propagated out before we reached ``task.result()``. Without
+        # this drain, the inner task can finish with an exception
+        # (e.g. RequestAbortedError when the cancel RPC fires
+        # concurrently) that nobody retrieves, and asyncio logs
+        # "Task exception was never retrieved" on GC. Always cancel
+        # + drain on the way out.
+        if not task.done():
             task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            return None
-    return task.result()
+        try:
+            await task
+        except BaseException:
+            pass  # exception (CancelledError, RequestAbortedError, etc.) consumed
+        raise
 
 
 @app.get("/health")
