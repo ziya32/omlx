@@ -826,3 +826,14 @@ class BatchedEngine(BaseEngine):
         if self._engine and self._engine.engine:
             return await self._engine.engine.abort_all_requests()
         return 0
+
+    async def abort_request(self, request_id: str) -> bool:
+        """Abort a single in-flight request by ID.
+
+        Used by ``POST /v1/cancel/{request_id}`` to surface the inner
+        EngineCore's abort path on the public engine interface so the
+        cancel endpoint can walk loaded engines uniformly.
+        """
+        if self._engine is None:
+            return False
+        return await self._engine.abort_request(request_id)

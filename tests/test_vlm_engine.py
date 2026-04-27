@@ -969,6 +969,40 @@ class TestPrepareVisionInputsFastPathPositionState:
         )
 
 
+class TestAbortRequestPublicInterface:
+    """Regression: ``abort_request(request_id)`` must be callable on the
+    public engine wrapper, not only on the inner ``self._engine``.
+
+    POST /v1/cancel/{request_id} (omlx/server.py) walks
+    engine_pool.get_loaded_model_ids() and calls
+    ``entry.engine.abort_request(rid)``.  When this method was missing
+    on VLMBatchedEngine, the cancel endpoint logged
+    ``'VLMBatchedEngine' object has no attribute 'abort_request'`` and
+    treated every cancel as a no-op — reproducing the e2e failure
+    ``post_active=1 30s after cancel`` even with the new explicit
+    cancel RPC wired through.
+    """
+
+    @pytest.mark.asyncio
+    async def test_vlm_engine_exposes_abort_request(self):
+        """VLMBatchedEngine.abort_request delegates to inner _engine.abort_request."""
+        engine = _make_loaded_engine()
+        inner = MagicMock()
+        inner.abort_request = AsyncMock(return_value=True)
+        engine._engine = inner
+
+        result = await engine.abort_request("rid-abc")
+
+        assert result is True
+        inner.abort_request.assert_awaited_once_with("rid-abc")
+
+    @pytest.mark.asyncio
+    async def test_vlm_engine_abort_request_returns_false_when_engine_unset(self):
+        engine = _make_engine()
+        engine._engine = None
+        assert await engine.abort_request("rid-abc") is False
+
+
 class TestFormatMessagesForVLMTemplate:
     """Tests for VLMBatchedEngine._format_messages_for_vlm_template()."""
 

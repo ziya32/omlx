@@ -673,3 +673,31 @@ class TestApplyChatTemplatePartialMode:
         # partial stripped from message dicts
         call_msgs = mock_tokenizer.apply_chat_template.call_args[0][0]
         assert "partial" not in call_msgs[-1]
+
+
+class TestBatchedEngineAbortRequest:
+    """Regression: ``abort_request(request_id)`` must be on the public
+    BatchedEngine interface so POST /v1/cancel/{request_id} can route
+    cancels uniformly across loaded engines.
+    """
+
+    @pytest.mark.asyncio
+    async def test_abort_request_delegates_to_inner_engine(self):
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        inner = MagicMock()
+        inner.abort_request = AsyncMock(return_value=True)
+        engine._engine = inner
+
+        result = await engine.abort_request("rid-xyz")
+        assert result is True
+        inner.abort_request.assert_awaited_once_with("rid-xyz")
+
+    @pytest.mark.asyncio
+    async def test_abort_request_returns_false_when_engine_unset(self):
+        from omlx.engine.batched import BatchedEngine
+
+        engine = BatchedEngine(model_name="test-model")
+        engine._engine = None
+        assert await engine.abort_request("rid-xyz") is False
