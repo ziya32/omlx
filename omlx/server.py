@@ -4144,6 +4144,14 @@ async def create_response(
             if ms.chat_template_kwargs:
                 merged_ct_kwargs.update(ms.chat_template_kwargs)
             forced_keys = set(ms.forced_ct_kwargs or [])
+            # Dedicated enable_thinking toggle takes precedence over chat_template_kwargs
+            if ms.enable_thinking is not None:
+                merged_ct_kwargs["enable_thinking"] = ms.enable_thinking
+            # preserve_thinking: keep <think> blocks in historical turns (Qwen 3.6+)
+            if ms.preserve_thinking is not None:
+                merged_ct_kwargs["preserve_thinking"] = ms.preserve_thinking
+
+        _entry = get_engine_pool().get_entry(resolved_model)
 
         # Note: extract_text_content/extract_harmony_messages/extract_multimodal_content
         # are NOT called here because convert_responses_input_to_messages() already
@@ -4245,6 +4253,17 @@ async def create_response(
         # suppress thinking unless this kwarg is True.
         if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:
             merged_ct_kwargs["enable_thinking"] = True
+
+        # Auto-set preserve_thinking only when the template advertises support
+        # for it (Qwen 3.6+). Gated on detection so other templates don't
+        # receive an unknown kwarg.
+        if (
+            _entry is not None
+            and _entry.preserve_thinking_default is True
+            and merged_ct_kwargs.get("enable_thinking") is not False
+            and "preserve_thinking" not in merged_ct_kwargs
+        ):
+            merged_ct_kwargs["preserve_thinking"] = True
 
         # Add compiled grammar for logit-level structured output.
         if compiled_grammar is not None:
