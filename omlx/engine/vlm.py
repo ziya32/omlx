@@ -1327,6 +1327,16 @@ class VLMBatchedEngine(BaseEngine):
                         (int(img.width * scale), int(img.height * scale)),
                     )
 
+        # Test-only capture (no-op unless OMLX_DEBUG_CAPTURE=1).
+        # The VLM engine returns token_ids from _prepare_vision_inputs, so
+        # the str-isinstance check in chat()/stream_chat() never fires —
+        # capture the rendered prompt here, while it's still a str, so
+        # tests like test_rendered_prompt_has_tools can verify chat-template
+        # output without depending on having no images.
+        if isinstance(prompt, str):
+            from ..debug_capture import capture_prompt
+            capture_prompt(prompt)
+
         # Tokenize text and preprocess images
         inputs = prepare_inputs(
             self._processor,
@@ -1541,6 +1551,25 @@ class VLMBatchedEngine(BaseEngine):
                     for k, v in feat_dict.items():
                         if k != "inputs_embeds" and v is not None:
                             extra_kwargs[k] = v
+
+                # Mirror mRoPE position state into extra_kwargs so the
+                # scheduler can restore it before retries. Some mlx-vlm
+                # models (e.g. Qwen3.5/Qwen3.6) compute position_ids inside
+                # get_input_embeddings and store them only on the language
+                # model — InputEmbeddingsFeatures.to_dict() exposes just
+                # inputs_embeds. Without this snapshot, a cache-corruption
+                # recovery followed by an intervening text-only request
+                # overwrites lm._position_ids with a short text grid, and
+                # the VLM retry hits broadcast_shapes (the same root cause
+                # the chunked path already guards against below).
+                lm = getattr(self._vlm_model, "language_model", None)
+                if lm is not None:
+                    pos_ids = getattr(lm, "_position_ids", None)
+                    if pos_ids is not None and "_vlm_position_ids" not in extra_kwargs:
+                        extra_kwargs["_vlm_position_ids"] = pos_ids
+                    rope_deltas = getattr(lm, "_rope_deltas", None)
+                    if rope_deltas is not None and "_vlm_rope_deltas" not in extra_kwargs:
+                        extra_kwargs["_vlm_rope_deltas"] = rope_deltas
 
                 token_ids = input_ids[0].tolist() if input_ids.ndim > 1 else input_ids.tolist()
                 return (

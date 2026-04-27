@@ -652,6 +652,322 @@ class TestPrepareVisionInputs:
         with pytest.raises(ValueError, match="does not support multi-image"):
             engine._prepare_vision_inputs(messages, images)
 
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("omlx.debug_capture.capture_prompt")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    @patch("mlx_vlm.prompt_utils.apply_chat_template")
+    def test_rendered_prompt_is_captured_for_text_only(
+        self, mock_vlm_act, mock_prepare, mock_capture,
+    ):
+        """Regression: VLM engine must hand the rendered prompt to
+        capture_prompt() so tests like test_rendered_prompt_has_tools can
+        inspect chat-template output.
+
+        Bug:
+            chat()/stream_chat() guard their capture_prompt() calls behind
+            ``isinstance(prompt, str)``, but ``_process_chat_messages``
+            returns ``token_ids`` (list[int]) — even for text-only turns —
+            because every VLM message goes through ``_prepare_vision_inputs``.
+            So the str-branch never fires and prompt_count stays 0.
+
+        Fix:
+            ``_prepare_vision_inputs`` calls ``capture_prompt(prompt)``
+            after ``apply_chat_template`` and before tokenisation, while
+            the prompt is still a str.
+        """
+        engine = self._setup_engine_for_vision()
+
+        mock_vlm_act.return_value = [{"role": "user", "content": "formatted"}]
+        mock_prepare.return_value = {
+            "input_ids": mx.array([[1, 2, 3]]),
+            "pixel_values": None,
+        }
+
+        # Have the processor return a known rendered prompt
+        rendered = "<|im_start|>user\nHello\n<|im_end|>"
+        engine._processor.apply_chat_template.return_value = rendered
+
+        from PIL import Image
+        images = [Image.new("RGB", (4, 4), "red")]
+        messages = [{"role": "user", "content": "Describe"}]
+
+        engine._prepare_vision_inputs(messages, images)
+
+        # capture_prompt must have been called with the rendered prompt.
+        # The fix puts the call between apply_chat_template and
+        # prepare_inputs, while ``prompt`` is still a str.
+        captured_args = [c.args for c in mock_capture.call_args_list]
+        assert (rendered,) in captured_args, (
+            f"capture_prompt was not invoked with the rendered prompt. "
+            f"Got calls: {captured_args}"
+        )
+
+
+class TestPrepareVisionInputsFastPathPositionState:
+    """Regression: fast path must mirror lm._position_ids/_rope_deltas
+    into extra_kwargs so cache-corruption recovery can restore mRoPE state.
+
+    Bug:
+        Some mlx-vlm models (Qwen3.5/3.6) compute position_ids inside
+        get_input_embeddings and store them only on the language model.
+        InputEmbeddingsFeatures.to_dict() exposes just inputs_embeds, so
+        the fast path's extra_kwargs ended up empty. After a cache
+        corruption recovery (which clears lm._position_ids) and an
+        intervening text-only request (which sets lm._position_ids to a
+        SHORT grid sized to the text request, e.g. (3, 1, 73)), the VLM
+        retry slices the short grid at cache_offset=10240 and gets a
+        shape-(3, 1, 0) position_ids. apply_multimodal_rotary_pos_emb
+        then computes cos with shape (1, 1, 0, 64) and broadcast against
+        q_rot (1, 24, 1706, 64) fails with:
+            [broadcast_shapes] Shapes (1,24,1706,64) and (1,1,0,64) cannot be broadcast.
+
+        omlx scheduler retries the request 3 times (same error each time)
+        before failing with `Cache corruption not recoverable after retries`,
+        which surfaces to the gateway as a 200-status body-encoded error
+        envelope and ultimately as `'NoneType' object is not subscriptable`
+        on the gateway side.
+
+    Fix:
+        After get_input_embeddings, copy lm._position_ids and lm._rope_deltas
+        into extra_kwargs as _vlm_position_ids / _vlm_rope_deltas so the
+        scheduler's _restore_vlm_position_state can rehydrate them on
+        every retry. The chunked path already does this — the bug was
+        fast-path-only.
+    """
+
+    def _setup_engine_for_vision(self, model_type="qwen3_5"):
+        engine = _make_loaded_engine(model_type=model_type)
+        mock_processor = MagicMock()
+        mock_processor.apply_chat_template.return_value = "<vision prompt>"
+        mock_processor.tokenizer = engine._tokenizer
+        engine._processor = mock_processor
+
+        # Force fast path: no chunking budget, no token-limit guard, no cache.
+        engine.vision_chunk_budget_pixels = 0
+        engine.max_vision_tokens = 0
+        engine._vision_cache = None
+        engine._vision_cache_enabled = False
+        return engine
+
+    def _attach_qwen35_like_get_input_embeddings(
+        self,
+        engine,
+        position_ids,
+        rope_deltas,
+        seq_len,
+    ):
+        """Wire engine._vlm_model so get_input_embeddings mimics Qwen3.5/3.6:
+        sets _position_ids / _rope_deltas on language_model and returns an
+        InputEmbeddingsFeatures with only inputs_embeds populated.
+
+        Also exposes the same lm under ``_language_model`` so the scheduler's
+        _restore_vlm_position_state path (which reads
+        ``self.model._language_model``) sees the same instance the engine
+        wrote into via ``self._vlm_model.language_model``.
+        """
+        from mlx_vlm.models.base import InputEmbeddingsFeatures
+
+        mock_lm = MagicMock()
+        mock_lm._position_ids = None
+        mock_lm._rope_deltas = None
+        engine._vlm_model.language_model = mock_lm
+        # Mirror the adapter convention used by VLMModelAdapter so the
+        # scheduler can find the language model via its own attr name.
+        engine._vlm_model._language_model = mock_lm
+
+        def fake_get_input_embeddings(input_ids, pixel_values, **kwargs):
+            mock_lm._position_ids = position_ids
+            mock_lm._rope_deltas = rope_deltas
+            return InputEmbeddingsFeatures(
+                inputs_embeds=mx.zeros((1, seq_len, 16))
+            )
+
+        engine._vlm_model.get_input_embeddings = fake_get_input_embeddings
+        return mock_lm
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    @patch("mlx_vlm.prompt_utils.apply_chat_template")
+    def test_fast_path_mirrors_position_ids_into_extra_kwargs(
+        self, mock_vlm_act, mock_prepare,
+    ):
+        """Fast path captures lm._position_ids into extra_kwargs[_vlm_position_ids]."""
+        engine = self._setup_engine_for_vision(model_type="qwen3_5")
+
+        seq_len = 8
+        mock_vlm_act.return_value = [{"role": "user", "content": "formatted"}]
+        mock_prepare.return_value = {
+            "input_ids": mx.arange(seq_len).reshape(1, seq_len),
+            "pixel_values": mx.zeros((1, 3, 4, 4)),
+            "attention_mask": mx.ones((1, seq_len)),
+            # image_grid_thw=[1,2,2] → 1 vision token after spatial_merge_size=2
+            "image_grid_thw": mx.array([[1, 2, 2]]),
+        }
+
+        # Simulate Qwen3.5/3.6 fast path: language model tracks position_ids
+        # internally; InputEmbeddingsFeatures only carries inputs_embeds.
+        position_ids = mx.broadcast_to(
+            mx.arange(seq_len, dtype=mx.int32).reshape(1, 1, seq_len),
+            (3, 1, seq_len),
+        )
+        rope_deltas = mx.array([0.0])
+        self._attach_qwen35_like_get_input_embeddings(
+            engine, position_ids, rope_deltas, seq_len,
+        )
+
+        from PIL import Image
+        images = [Image.new("RGB", (4, 4), "red")]
+        messages = [{"role": "user", "content": "Describe"}]
+
+        result = engine._prepare_vision_inputs(messages, images)
+        _, _, extra_kwargs, _, _, _ = result
+
+        # Without the fix, extra_kwargs is empty and a cache-corruption
+        # retry has no _vlm_position_ids to restore — broadcast_shapes
+        # error fires when an intervening text-only request has clobbered
+        # lm._position_ids.
+        assert "_vlm_position_ids" in extra_kwargs, (
+            "Fast path must mirror lm._position_ids into extra_kwargs so "
+            "scheduler._restore_vlm_position_state can rehydrate it on "
+            "cache-corruption retry. See "
+            "test_scheduler.py::TestVLMPositionStateContamination."
+        )
+        assert extra_kwargs["_vlm_position_ids"].shape == (3, 1, seq_len)
+        # Same array (not a copy) — restore-by-reference is fine here, the
+        # scheduler stores the request and never mutates the saved tensor.
+        assert extra_kwargs["_vlm_position_ids"] is position_ids
+
+        assert "_vlm_rope_deltas" in extra_kwargs, (
+            "Fast path must also mirror lm._rope_deltas; without it the "
+            "language model falls back to delta-based positions which "
+            "are incorrect for VLM prefill."
+        )
+        assert extra_kwargs["_vlm_rope_deltas"] is rope_deltas
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    @patch("mlx_vlm.prompt_utils.apply_chat_template")
+    def test_fast_path_does_not_inject_when_lm_has_no_position_state(
+        self, mock_vlm_act, mock_prepare,
+    ):
+        """Models that don't set _position_ids (e.g. Gemma) still produce
+        an empty/clean extra_kwargs — the fix must not fabricate state.
+        """
+        engine = self._setup_engine_for_vision(model_type="gemma3")
+
+        seq_len = 8
+        mock_vlm_act.return_value = [{"role": "user", "content": "formatted"}]
+        mock_prepare.return_value = {
+            "input_ids": mx.arange(seq_len).reshape(1, seq_len),
+            "pixel_values": mx.zeros((1, 3, 4, 4)),
+            "attention_mask": mx.ones((1, seq_len)),
+            "image_grid_thw": mx.array([[1, 2, 2]]),
+        }
+
+        # Language model with no position state — Gemma-style
+        from mlx_vlm.models.base import InputEmbeddingsFeatures
+
+        mock_lm = MagicMock()
+        mock_lm._position_ids = None
+        mock_lm._rope_deltas = None
+        engine._vlm_model.language_model = mock_lm
+
+        def fake_get_input_embeddings(input_ids, pixel_values, **kwargs):
+            # Gemma-style: never touches _position_ids / _rope_deltas
+            return InputEmbeddingsFeatures(
+                inputs_embeds=mx.zeros((1, seq_len, 16))
+            )
+
+        engine._vlm_model.get_input_embeddings = fake_get_input_embeddings
+
+        from PIL import Image
+        images = [Image.new("RGB", (4, 4), "red")]
+        messages = [{"role": "user", "content": "Describe"}]
+
+        result = engine._prepare_vision_inputs(messages, images)
+        _, _, extra_kwargs, _, _, _ = result
+
+        assert "_vlm_position_ids" not in extra_kwargs
+        assert "_vlm_rope_deltas" not in extra_kwargs
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    @patch("mlx_vlm.utils.prepare_inputs")
+    @patch("mlx_vlm.prompt_utils.apply_chat_template")
+    def test_fast_path_extra_kwargs_survives_restore_after_text_clobber(
+        self, mock_vlm_act, mock_prepare,
+    ):
+        """End-to-end: fast path's extra_kwargs feeds the scheduler's
+        restore path, which rehydrates lm._position_ids even when a
+        text-only request has overwritten it with a shorter grid.
+
+        Without the fast-path fix, the restore is a noop (extra_kwargs
+        empty), and lm._position_ids stays stuck at the short text grid —
+        the exact precondition that triggers the broadcast_shapes crash.
+        """
+        # Step 1: VLM request runs through fast path → produces extra_kwargs
+        engine = self._setup_engine_for_vision(model_type="qwen3_5")
+
+        seq_len = 11947  # the failing-prompt length from server.log.2026-04-26
+        mock_vlm_act.return_value = [{"role": "user", "content": "formatted"}]
+        mock_prepare.return_value = {
+            "input_ids": mx.zeros((1, seq_len), dtype=mx.int32),
+            "pixel_values": mx.zeros((1, 3, 4, 4)),
+            "attention_mask": mx.ones((1, seq_len)),
+            "image_grid_thw": mx.array([[1, 2, 2]]),
+        }
+
+        full_position_ids = mx.broadcast_to(
+            mx.arange(seq_len, dtype=mx.int32).reshape(1, 1, seq_len),
+            (3, 1, seq_len),
+        )
+        rope_deltas = mx.array([0.0])
+        mock_lm = self._attach_qwen35_like_get_input_embeddings(
+            engine, full_position_ids, rope_deltas, seq_len,
+        )
+
+        from PIL import Image
+        images = [Image.new("RGB", (4, 4), "red")]
+        messages = [{"role": "user", "content": "Describe"}]
+        _, vlm_inputs_embeds, extra_kwargs, _, _, _ = engine._prepare_vision_inputs(
+            messages, images,
+        )
+
+        # Step 2: simulate intervening text-only request clobbering
+        # lm._position_ids with a SHORT grid (this is what `else` branch
+        # in LanguageModel.__call__ does when _position_ids is None and
+        # get_rope_index returns text-only positions of size = chunk_len).
+        mock_lm._position_ids = mx.zeros((3, 1, 73), dtype=mx.int32)
+        mock_lm._rope_deltas = mx.array([0.0])
+
+        # Step 3: simulate cache-corruption retry — scheduler builds the
+        # vlm_embeds tuple from the request and calls _restore_vlm_position_state.
+        from omlx.scheduler import Scheduler  # noqa: PLC0415
+        # We don't need a real Scheduler — the helper is straightforward.
+        # Direct invocation mirrors what _do_external_prefill does on every retry.
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.model = engine._vlm_model
+
+        cached_tokens = 10240
+        vlm_embeds = (vlm_inputs_embeds, extra_kwargs, cached_tokens)
+        scheduler._restore_vlm_position_state(vlm_embeds)
+
+        # After restore, lm._position_ids must be the FULL VLM grid again.
+        # Slicing at cache_offset=10240 with seq_length=1706 must yield a
+        # non-empty (3, 1, 1706) — the prerequisite for cos to have a
+        # non-zero seq dim, which is what avoids the broadcast_shapes crash.
+        assert mock_lm._position_ids is full_position_ids
+        seq_length = 1706
+        sliced = mock_lm._position_ids[
+            :, :, cached_tokens : cached_tokens + seq_length
+        ]
+        assert sliced.shape == (3, 1, seq_length), (
+            f"After restore, slicing _position_ids at cache_offset={cached_tokens} "
+            f"for seq_length={seq_length} yielded shape {sliced.shape}; "
+            f"expected (3, 1, {seq_length}). A 0 in the seq dim means the "
+            f"slice exceeded the array size — this is the precondition for "
+            f"the broadcast_shapes crash in apply_multimodal_rotary_pos_emb."
+        )
+
 
 class TestFormatMessagesForVLMTemplate:
     """Tests for VLMBatchedEngine._format_messages_for_vlm_template()."""
