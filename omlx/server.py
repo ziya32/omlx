@@ -1747,6 +1747,14 @@ async def _run_with_disconnect_guard(
     is_disconnected() periodically and cancels the task on disconnect,
     which triggers CancelledError -> abort_request() in EngineCore.generate()
     to free scheduler/GPU resources.
+
+    Note: this is now a *fallback* path. The primary cancellation mechanism
+    is the explicit ``POST /v1/cancel/{request_id}`` RPC, which clients use
+    when their async tasks are cancelled — it does not depend on TCP-close
+    detection (the openai SDK / httpx pool does not reliably propagate FIN
+    on async cancel until the entire client pool is shut down). This guard
+    is kept for clients that don't supply a request_id or that abandon a
+    connection without sending an explicit cancel.
     """
     task = asyncio.create_task(coro)
     while not task.done():
@@ -1805,6 +1813,55 @@ async def debug_pool(_: bool = Depends(verify_api_key)):
     """
     pool = get_engine_pool()
     return pool.get_debug_status()
+
+
+@app.post("/v1/cancel/{request_id}")
+async def cancel_request(request_id: str, _: bool = Depends(verify_api_key)):
+    """Abort an in-flight request by its client-supplied ``request_id``.
+
+    Out-of-band cancellation: the client supplies ``request_id`` when
+    submitting a chat completion (via the optional ``request_id`` field
+    on the request body), and calls this endpoint to abort that request
+    later.  This avoids depending on TCP-close detection, which is
+    unreliable under the OpenAI Python SDK's connection-pool semantics
+    (the SDK reports ``aclose`` to httpcore but the actual FIN packet
+    can be deferred until full client shutdown).
+
+    Returns ``{"request_id": ..., "found": bool, "cancelled": bool}``.
+    ``found`` is True iff some loaded engine claimed the request.  Both
+    fields are False on no-op (already done, never existed, wrong ID).
+    """
+    pool = get_engine_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+
+    # The request_id is unique across the server, so it lives on at most
+    # one engine.  Walk loaded engines and call abort_request on each;
+    # the scheduler returns False for engines that don't have the ID, so
+    # a stray hit on the wrong engine is a no-op.  Stop on the first
+    # success.
+    found = False
+    for model_id in pool.get_loaded_model_ids():
+        entry = pool.get_entry(model_id)
+        if entry is None or entry.engine is None:
+            continue
+        try:
+            success = await entry.engine.abort_request(request_id)
+        except Exception as exc:
+            logger.warning(
+                "cancel: abort_request on engine '%s' raised: %s",
+                model_id, exc,
+            )
+            continue
+        if success:
+            found = True
+            logger.info(
+                "cancel: aborted request %s on engine '%s'",
+                request_id, model_id,
+            )
+            break
+
+    return {"request_id": request_id, "found": found, "cancelled": found}
 
 
 @app.get("/api/status")
@@ -2322,7 +2379,10 @@ async def create_chat_completion(
     }
     ```
     """
-    req_id = str(uuid.uuid4())
+    # Allow the client to supply its own request_id so it can cancel the
+    # request later via POST /v1/cancel/{request_id}.  Falls back to a
+    # server-generated UUID when omitted.
+    req_id = request.request_id or str(uuid.uuid4())
 
     # Test-only request capture (no-op unless OMLX_DEBUG_CAPTURE=1)
     from .debug_capture import capture_request

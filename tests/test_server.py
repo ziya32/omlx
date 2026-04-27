@@ -457,3 +457,173 @@ class TestUseEngineResolveOnce:
         )
         # pool.get_engine received the pre-resolved id.
         assert pool.get_engine.await_args.args[0] == "resolved-once"
+
+
+class TestCancelEndpoint:
+    """Tests for POST /v1/cancel/{request_id}.
+
+    The endpoint exists so the gateway can abort an in-flight chat
+    completion out-of-band, without depending on TCP-close detection.
+    The gateway stamps a UUID into the chat completion request body
+    (via ChatCompletionRequest.request_id) and posts to this endpoint
+    when its asyncio handler task is cancelled.
+    """
+
+    @pytest.fixture
+    def client(self):
+        from omlx.server import _server_state
+        original_api_key = _server_state.api_key
+        _server_state.api_key = "test-key"
+        yield TestClient(
+            app,
+            raise_server_exceptions=False,
+            headers={"Authorization": "Bearer test-key"},
+        )
+        _server_state.api_key = original_api_key
+
+    def _setup_pool_with_engines(self, *engines):
+        """Build a mock engine_pool with the given (model_id, engine) pairs."""
+        pool = MagicMock()
+        pool.get_loaded_model_ids.return_value = [m for m, _ in engines]
+        entries = {}
+        for model_id, engine in engines:
+            entry = MagicMock()
+            entry.engine = engine
+            entries[model_id] = entry
+        pool.get_entry.side_effect = lambda mid: entries.get(mid)
+        return pool
+
+    def test_cancel_returns_503_when_pool_uninitialized(self, client):
+        """Without an engine pool the endpoint must surface 503, not 500."""
+        with patch("omlx.server.get_engine_pool", return_value=None):
+            response = client.post("/v1/cancel/abc-123")
+        assert response.status_code == 503
+
+    def test_cancel_finds_request_on_first_engine(self, client):
+        """Successful cancel: scheduler finds the request and aborts it."""
+        engine = MagicMock()
+        engine.abort_request = AsyncMock(return_value=True)
+        pool = self._setup_pool_with_engines(("model-a", engine))
+
+        with patch("omlx.server.get_engine_pool", return_value=pool):
+            response = client.post("/v1/cancel/abc-123")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body == {
+            "request_id": "abc-123",
+            "found": True,
+            "cancelled": True,
+        }
+        engine.abort_request.assert_awaited_once_with("abc-123")
+
+    def test_cancel_walks_engines_until_match(self, client):
+        """If the first engine's scheduler doesn't have the ID, walk on."""
+        engine_a = MagicMock()
+        engine_a.abort_request = AsyncMock(return_value=False)
+        engine_b = MagicMock()
+        engine_b.abort_request = AsyncMock(return_value=True)
+        engine_c = MagicMock()
+        engine_c.abort_request = AsyncMock(return_value=False)
+        pool = self._setup_pool_with_engines(
+            ("model-a", engine_a),
+            ("model-b", engine_b),
+            ("model-c", engine_c),
+        )
+
+        with patch("omlx.server.get_engine_pool", return_value=pool):
+            response = client.post("/v1/cancel/abc-123")
+
+        assert response.status_code == 200
+        assert response.json()["cancelled"] is True
+        engine_a.abort_request.assert_awaited_once()
+        engine_b.abort_request.assert_awaited_once()
+        # Should stop on first match — engine_c not consulted
+        engine_c.abort_request.assert_not_called()
+
+    def test_cancel_returns_not_found_when_no_engine_has_id(self, client):
+        """All engines say no → cancelled=False, found=False, status 200."""
+        engine_a = MagicMock()
+        engine_a.abort_request = AsyncMock(return_value=False)
+        engine_b = MagicMock()
+        engine_b.abort_request = AsyncMock(return_value=False)
+        pool = self._setup_pool_with_engines(
+            ("model-a", engine_a),
+            ("model-b", engine_b),
+        )
+
+        with patch("omlx.server.get_engine_pool", return_value=pool):
+            response = client.post("/v1/cancel/abc-123")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body == {
+            "request_id": "abc-123",
+            "found": False,
+            "cancelled": False,
+        }
+
+    def test_cancel_swallows_per_engine_exception(self, client):
+        """If one engine's abort_request raises, we keep walking the rest."""
+        bad_engine = MagicMock()
+        bad_engine.abort_request = AsyncMock(side_effect=RuntimeError("boom"))
+        good_engine = MagicMock()
+        good_engine.abort_request = AsyncMock(return_value=True)
+        pool = self._setup_pool_with_engines(
+            ("model-bad", bad_engine),
+            ("model-good", good_engine),
+        )
+
+        with patch("omlx.server.get_engine_pool", return_value=pool):
+            response = client.post("/v1/cancel/abc-123")
+
+        assert response.status_code == 200
+        assert response.json()["cancelled"] is True
+
+    def test_cancel_skips_unloaded_engines(self, client):
+        """Entries with engine=None are skipped without raising."""
+        loaded = MagicMock()
+        loaded.abort_request = AsyncMock(return_value=True)
+        pool = MagicMock()
+        pool.get_loaded_model_ids.return_value = ["unloaded", "loaded"]
+        unloaded_entry = MagicMock()
+        unloaded_entry.engine = None
+        loaded_entry = MagicMock()
+        loaded_entry.engine = loaded
+        pool.get_entry.side_effect = lambda mid: {
+            "unloaded": unloaded_entry, "loaded": loaded_entry,
+        }.get(mid)
+
+        with patch("omlx.server.get_engine_pool", return_value=pool):
+            response = client.post("/v1/cancel/abc-123")
+
+        assert response.status_code == 200
+        assert response.json()["cancelled"] is True
+        loaded.abort_request.assert_awaited_once()
+
+    def test_cancel_requires_auth(self):
+        """The cancel endpoint is auth-gated like every other /v1/* route."""
+        from omlx.server import _server_state
+        original = _server_state.api_key
+        _server_state.api_key = "test-key"
+        try:
+            client = TestClient(app, raise_server_exceptions=False)
+            # No Authorization header
+            response = client.post("/v1/cancel/abc-123")
+            assert response.status_code in (401, 403)
+        finally:
+            _server_state.api_key = original
+
+
+class TestChatCompletionRequestId:
+    """Verify ChatCompletionRequest.request_id passes through Pydantic."""
+
+    def test_request_id_is_optional(self):
+        from omlx.api.openai_models import ChatCompletionRequest
+        req = ChatCompletionRequest(model="m", messages=[])
+        assert req.request_id is None
+
+    def test_request_id_is_accepted(self):
+        from omlx.api.openai_models import ChatCompletionRequest
+        req = ChatCompletionRequest(model="m", messages=[], request_id="my-uuid")
+        assert req.request_id == "my-uuid"

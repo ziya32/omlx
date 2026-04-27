@@ -256,6 +256,12 @@ class ChatCompletionRequest(BaseModel):
     specprefill_threshold: Optional[int] = None
     # Seed for reproducible generation (best-effort)
     seed: Optional[int] = None
+    # Client-supplied request ID. Lets the caller cancel this request
+    # out-of-band via POST /v1/cancel/{request_id} without depending on
+    # TCP-close detection (which httpx/openai SDK delivery is unreliable
+    # under the openai client's connection-pool semantics — see the
+    # gateway-side cancel design notes).
+    request_id: Optional[str] = None
 
     @field_validator("stop", mode="before")
     @classmethod
