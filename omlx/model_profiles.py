@@ -30,6 +30,7 @@ UNIVERSAL_PROFILE_FIELDS = (
     "enable_thinking",
     "thinking_budget_enabled",
     "thinking_budget_tokens",
+    "preserve_thinking",
     "reasoning_parser",
     "max_tool_result_tokens",
     "chat_template_kwargs",
@@ -49,6 +50,12 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "specprefill_keep_pct",
     "specprefill_threshold",
     "index_cache_freq",
+    # Audio (TTS/ASR) per-model defaults — meaningful only for the specific
+    # model loaded, never propagated via global templates.
+    "default_voice",
+    "default_instruct",
+    "default_language",
+    "default_response_format",
 )
 
 # Excluded — never stored in a profile or template.
@@ -63,6 +70,12 @@ EXCLUDED_FROM_PROFILES = frozenset({
     "ttl_seconds",
     # Security flag must be explicit per model — never propagated via profiles.
     "trust_remote_code",
+    # Aliases are identity, not configuration.
+    "aliases",
+    # Exclusive eviction is paired with `is_pinned` and reflects pool runtime
+    # policy for a specific deployment, not a tunable users save in profiles.
+    "exclusive",
+    "exclusive_max_hold",
 })
 
 
