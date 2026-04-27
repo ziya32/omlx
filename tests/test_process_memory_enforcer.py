@@ -92,11 +92,13 @@ class TestCheckAndEnforce:
         enforcer._engine_pool._unload_engine.assert_called_once_with("model-a")
 
     @pytest.mark.asyncio
-    async def test_stops_when_all_pinned(self, enforcer):
-        """Stops eviction when all models are pinned (no victim)."""
+    async def test_stops_when_all_pinned_with_no_active_requests(self, enforcer):
+        """When all models are pinned and have no active requests, the
+        enforcer logs and waits — it must NOT unload pinned models."""
         enforcer._engine_pool._find_drain_or_evict_candidate.return_value = None
-        # Add a pinned loaded model so the log says "pinned"
-        entry = _make_entry("pinned-model", engine=MagicMock(), is_pinned=True)
+        engine = MagicMock()
+        engine.abort_all_requests = AsyncMock(return_value=0)
+        entry = _make_entry("pinned-model", engine=engine, is_pinned=True)
         enforcer._engine_pool._entries = {"pinned-model": entry}
         with patch("omlx.process_memory_enforcer.mx") as mock_mx:
             mock_mx.get_active_memory.side_effect = [
@@ -105,6 +107,97 @@ class TestCheckAndEnforce:
             ]
             await enforcer._check_and_enforce()
         enforcer._engine_pool._unload_engine.assert_not_called()
+        # We still try to abort, but there are no active requests
+        engine.abort_all_requests.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_aborts_pinned_model_active_requests_at_soft_limit(self, enforcer):
+        """Regression: when memory exceeds the soft limit and the only
+        loaded models are pinned, the enforcer must abort their active
+        requests to free KV cache + vision encoder activations.
+
+        Previously the enforcer logged "all loaded models are pinned —
+        cannot evict" and let the request keep running, allowing memory
+        to climb past the limit. The pinned model itself is preserved
+        (no unload), but in-flight requests are aborted.
+
+        Reproduces tests/e2e/test_memory_limit_propagation_e2e.py
+        ::TestVLMSoftLimitAbort::test_video_frames_aborted_at_soft_limit.
+        """
+        enforcer._engine_pool._find_drain_or_evict_candidate.return_value = None
+        engine = MagicMock()
+        # Pinned engine has 3 active requests (e.g. 1 VLM prefill + 2 chats)
+        engine.abort_all_requests = AsyncMock(return_value=3)
+        entry = _make_entry("pinned-vlm", engine=engine, is_pinned=True)
+        enforcer._engine_pool._entries = {"pinned-vlm": entry}
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
+            mock_mx.get_active_memory.side_effect = [
+                15 * 1024**3,  # Initial check (over soft limit = 10GB)
+                15 * 1024**3,  # Re-check in loop
+            ]
+            await enforcer._check_and_enforce()
+
+        # Pinned model must NOT be unloaded — that's the contract of "pinned"
+        enforcer._engine_pool._unload_engine.assert_not_called()
+        # But active requests must be aborted to release KV cache + activations
+        engine.abort_all_requests.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_aborts_all_pinned_engines_when_multiple(self, enforcer):
+        """Multiple pinned models all get their active requests aborted.
+
+        When the soft limit fires under multi-pinned-model load (e.g.
+        a chat model + a VLM both pinned), every pinned engine with
+        active requests gets ``abort_all_requests()`` so combined KV
+        cache pressure drops in one tick.
+        """
+        enforcer._engine_pool._find_drain_or_evict_candidate.return_value = None
+        engine_a = MagicMock()
+        engine_a.abort_all_requests = AsyncMock(return_value=2)
+        engine_b = MagicMock()
+        engine_b.abort_all_requests = AsyncMock(return_value=1)
+        engine_c = MagicMock()
+        # Pinned but no active requests — abort returns 0; still called.
+        engine_c.abort_all_requests = AsyncMock(return_value=0)
+
+        enforcer._engine_pool._entries = {
+            "pinned-a": _make_entry("pinned-a", engine=engine_a, is_pinned=True),
+            "pinned-b": _make_entry("pinned-b", engine=engine_b, is_pinned=True),
+            "pinned-c": _make_entry("pinned-c", engine=engine_c, is_pinned=True),
+        }
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
+            mock_mx.get_active_memory.side_effect = [15 * 1024**3, 15 * 1024**3]
+            await enforcer._check_and_enforce()
+
+        engine_a.abort_all_requests.assert_awaited_once()
+        engine_b.abort_all_requests.assert_awaited_once()
+        engine_c.abort_all_requests.assert_awaited_once()
+        enforcer._engine_pool._unload_engine.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_pinned_abort_swallows_per_engine_failure(self, enforcer):
+        """If one pinned engine's abort_all_requests raises, the enforcer
+        must still attempt the remaining pinned engines and not crash
+        the enforcer loop."""
+        enforcer._engine_pool._find_drain_or_evict_candidate.return_value = None
+        bad_engine = MagicMock()
+        bad_engine.abort_all_requests = AsyncMock(
+            side_effect=RuntimeError("simulated abort failure")
+        )
+        good_engine = MagicMock()
+        good_engine.abort_all_requests = AsyncMock(return_value=2)
+
+        enforcer._engine_pool._entries = {
+            "bad": _make_entry("bad", engine=bad_engine, is_pinned=True),
+            "good": _make_entry("good", engine=good_engine, is_pinned=True),
+        }
+        with patch("omlx.process_memory_enforcer.mx") as mock_mx:
+            mock_mx.get_active_memory.side_effect = [15 * 1024**3, 15 * 1024**3]
+            # Must not raise
+            await enforcer._check_and_enforce()
+
+        bad_engine.abort_all_requests.assert_awaited_once()
+        good_engine.abort_all_requests.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_evicts_one_per_tick_across_multiple_ticks(self, enforcer):

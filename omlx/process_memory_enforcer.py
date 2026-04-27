@@ -393,22 +393,50 @@ class ProcessMemoryEnforcer:
                 for e in self._engine_pool._entries.values()
                 if e.state == EngineState.DRAINING
             ]
-            pinned = [
-                e.model_id
+            pinned_entries = [
+                e
                 for e in self._engine_pool._entries.values()
                 if e.engine is not None and e.is_pinned
             ]
+            pinned = [e.model_id for e in pinned_entries]
             if draining:
                 logger.warning(
                     f"Memory limit exceeded while draining "
                     f"{draining} — waiting for active requests "
                     f"to finish."
                 )
-            elif pinned:
-                logger.warning(
-                    f"Memory limit exceeded but all loaded "
-                    f"models are pinned ({pinned}) — cannot evict."
-                )
+            elif pinned_entries:
+                # All loaded models are pinned — we can't unload them, but
+                # we can still reclaim memory from in-flight requests. KV
+                # cache + vision encoder activations are the dominant
+                # transient consumers; aborting active requests releases
+                # both without dropping the model weights.
+                aborted_total = 0
+                for entry in pinned_entries:
+                    try:
+                        n = await entry.engine.abort_all_requests()
+                    except Exception as exc:
+                        logger.warning(
+                            "abort_all_requests on pinned '%s' failed: %s",
+                            entry.model_id, exc,
+                        )
+                        continue
+                    if n > 0:
+                        aborted_total += n
+                        logger.warning(
+                            "Aborted %d active request(s) on pinned model "
+                            "'%s' to enforce process memory limit "
+                            "(%s exceeds %s).",
+                            n, entry.model_id,
+                            _format_gb(current),
+                            _format_gb(self._max_bytes),
+                        )
+                if aborted_total == 0:
+                    logger.warning(
+                        f"Memory limit exceeded but all loaded "
+                        f"models are pinned ({pinned}) and have no "
+                        f"active requests to abort."
+                    )
             else:
                 snapshot = self._engine_pool.get_crash_diagnostic_snapshot()
                 logger.warning(
