@@ -317,8 +317,11 @@ async def _run_batch(tasks: dict[str, asyncio.Task], label: str = "") -> None:
     failures = []
     for name, result in zip(tasks.keys(), results):
         if isinstance(result, BaseException):
-            failures.append(f"  {name}: {result}")
-            _tracker.add_failure(f"[{label}] {name}: {result}")
+            # Some exceptions (httpx.ReadTimeout, ConnectError) stringify to
+            # "" — append the type name so the failure list is diagnosable.
+            msg = str(result) or type(result).__name__
+            failures.append(f"  {name}: {msg}")
+            _tracker.add_failure(f"[{label}] {name}: {msg}")
     assert not failures, (
         f"[{label}] failures:\n" + "\n".join(failures)
     )
@@ -384,6 +387,10 @@ async def do_vlm_chat(
         rec.total_time = time.monotonic() - t0
         rec.status_code = resp.status_code
         data = resp.json()
+        if "choices" not in data:
+            raise AssertionError(
+                f"Server returned non-OK response: status={resp.status_code} body={data}"
+            )
         content = data["choices"][0]["message"]["content"]
         rec.response_content = content
         rec.usage = data.get("usage", {})
@@ -393,8 +400,12 @@ async def do_vlm_chat(
         return data
     except Exception as e:
         rec.total_time = time.monotonic() - t0
-        rec.error = str(e)
-        rec.response_content = f"ERROR: {e}"
+        # Some httpx exceptions (e.g. ReadTimeout, ConnectError) stringify
+        # to "" — fall back to the type name so callers and the
+        # "exceeded threshold" check (test_99) can reliably treat
+        # ``rec.error`` as truthy on any failure.
+        rec.error = str(e) or type(e).__name__
+        rec.response_content = f"ERROR: {rec.error}"
         _tracker.add(rec)
         raise
 
@@ -472,8 +483,12 @@ async def do_vlm_stream(
         }
     except Exception as e:
         rec.total_time = time.monotonic() - t0
-        rec.error = str(e)
-        rec.response_content = f"ERROR: {e}"
+        # Some httpx exceptions (e.g. ReadTimeout, ConnectError) stringify
+        # to "" — fall back to the type name so callers and the
+        # "exceeded threshold" check (test_99) can reliably treat
+        # ``rec.error`` as truthy on any failure.
+        rec.error = str(e) or type(e).__name__
+        rec.response_content = f"ERROR: {rec.error}"
         _tracker.add(rec)
         raise
 
@@ -645,7 +660,18 @@ def server_base_path():
     **Module-scoped** — paired with the module-scoped ``server_process``
     so the subprocess's working directory lives exactly as long as the
     subprocess itself.
+
+    Set ``OMLX_TEST_KEEP_BASE_PATH=/some/dir`` to use a fixed directory and
+    skip cleanup — useful when diagnosing post-mortem hangs from
+    ``logs/server.log``.
     """
+    keep = os.environ.get("OMLX_TEST_KEEP_BASE_PATH")
+    if keep:
+        base = Path(keep)
+        base.mkdir(parents=True, exist_ok=True)
+        yield base
+        # Skip cleanup so logs persist for inspection.
+        return
     base = Path(tempfile.mkdtemp(prefix="omlx-exclusive-test-"))
     try:
         yield base

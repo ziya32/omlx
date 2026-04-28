@@ -147,7 +147,7 @@ def _load_model_for_scheduler(info: DiscoveredModel) -> Tuple[object, object]:
             )
 
         try:
-            adapter = VLMModelAdapter(vlm_model=vlm_model, decode_model=None)
+            adapter = VLMModelAdapter(vlm_model=vlm_model)
         except Exception as exc:
             pytest.skip(
                 f"Could not wrap {info.model_id} in VLMModelAdapter: "

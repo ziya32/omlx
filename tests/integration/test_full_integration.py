@@ -102,6 +102,11 @@ def _discover_integration_models() -> List[str]:
             return False
         if "audio" in archs or "tts" in archs or "asr" in archs:
             return False
+        # DFlash draft checkpoints look like normal LLMs by model_type but
+        # are not loadable as standalone targets (mlx-lm rejects their
+        # parameter set). They serve only as paired drafts via DFlashEngine.
+        if "draftmodel" in archs:
+            return False
         if _is_vlm(cfg):
             return False
         return cfg.get("model_type") is not None
@@ -1206,29 +1211,6 @@ def test_full_integration(model_path):
 
     patch_applied = apply_gated_delta_advance_patch(adapter._language_model)
     print(f"  VLM GatedDeltaNet patch: {'applied' if patch_applied else 'skipped'}")
-
-    # Quality assertions (single-char repetition, etc.) are only
-    # meaningful when the decode model has its own valid weights.  When
-    # the weight-sharing build above failed (e.g. Qwen3-VL strips
-    # ``tie_word_embeddings`` from text_config and mlx-lm's text-only
-    # loader can't parse it), the VLMModelAdapter falls back to a path
-    # that frequently produces degenerate text — which is a model+
-    # adapter compatibility issue, not a correctness regression in the
-    # code under test.  Skip the VLM phase in that case so we don't
-    # paper over a real future bug with a known-flaky model setup.
-    if decode_model is None:
-        print(
-            "  VLM decode model unavailable — skipping Phase 2 quality tests "
-            "(VLMModelAdapter fallback path is not expected to produce "
-            "coherent text without a valid decode model)."
-        )
-        del vlm_model, processor, adapter, vlm_tokenizer
-        gc.collect()
-        mx.clear_cache()
-        print(f"\n{'='*60}")
-        print(f"PHASE 2 SKIPPED (decode model build failed): {model_name}")
-        print(f"{'='*60}")
-        return
 
     try:
         with _track_peak_memory("Test 4 - VLM engine basics"):
