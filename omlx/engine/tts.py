@@ -520,8 +520,6 @@ class TTSEngine(BaseNonStreamingEngine):
         executor = get_mlx_executor()
         with self._active_lock:
             self._active_count += 1
-        start_time = time.perf_counter()
-        total_duration = 0.0
 
         try:
             def _create_stream_gen():
@@ -567,7 +565,6 @@ class TTSEngine(BaseNonStreamingEngine):
                     break
                 chunk = await loop.run_in_executor(executor, _segment_to_pcm, seg)
                 self._raise_if_aborted()
-                total_duration += chunk.duration
                 yield chunk
         finally:
             with self._active_lock:
