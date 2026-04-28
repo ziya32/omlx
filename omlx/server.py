@@ -818,6 +818,20 @@ async def get_engine(
                 status_code=400,
                 detail=f"Model '{model_id}' is not a TTS model."
             )
+    elif engine_type == EngineType.LLM:
+        # #507: non-LLM engines (STT/TTS/STS/Embedding/Reranker) previously
+        # fell through and crashed on `engine.model_type` with an unhandled
+        # 500. Reject with a clear 400 pointing the caller at the right
+        # endpoint.
+        if not isinstance(engine, BaseEngine):
+            _endpoint_hint = _suggest_endpoint_for_engine(engine)
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Model '{model_id}' is not an LLM / chat model. "
+                    f"{_endpoint_hint}"
+                ),
+            )
 
     # Close the race window between pool.get_engine's last yield and
     # the caller touching `engine`: the process memory enforcer may
@@ -830,6 +844,28 @@ async def get_engine(
         raise HTTPException(status_code=503, detail=str(e))
 
     return engine
+
+
+def _suggest_endpoint_for_engine(engine: object) -> str:
+    """Return a one-line hint pointing at the correct endpoint for a non-LLM engine."""
+    # Import audio engine classes lazily so that oMLX without the [audio]
+    # extra still imports this module.
+    try:
+        from omlx.engine.sts import STSEngine
+    except Exception:  # pragma: no cover - defensive
+        STSEngine = None  # type: ignore[assignment]
+
+    if isinstance(engine, STTEngine):
+        return "Use /v1/audio/transcriptions for speech-to-text models."
+    if isinstance(engine, TTSEngine):
+        return "Use /v1/audio/speech for text-to-speech models."
+    if STSEngine is not None and isinstance(engine, STSEngine):
+        return "Use /v1/audio/process for speech-to-speech / audio processing models."
+    if isinstance(engine, EmbeddingEngine):
+        return "Use /v1/embeddings for embedding models."
+    if isinstance(engine, RerankerEngine):
+        return "Use /v1/rerank for reranker models."
+    return "Use the model's dedicated endpoint (see /v1/models)."
 
 
 @asynccontextmanager
