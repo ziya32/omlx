@@ -31,6 +31,7 @@ of the same module.
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any, Optional
 
 try:
@@ -44,7 +45,43 @@ logger = logging.getLogger(__name__)
 
 
 _patched_classes: set[int] = set()
-_call_counter = {"plain": 0, "mrope": 0}
+_call_counter = {"plain": 0, "mrope": 0, "forced": 0}
+
+
+# Thread-local force-plain flag.  VLMModelAdapter sets this around forward
+# calls during text-only decode so the patch can skip the per-layer
+# ``mx.all(...).item()`` probes inside ``_is_text_only_position_ids``.
+# Each .item() forces a GPU→CPU sync; with 40-64 layers and two probes
+# per call, that adds 5-10 ms per generated token (Qwen tg slowdown
+# observed in `/tmp/omlx_bench/results_omlx*.json`).
+_local = threading.local()
+
+
+def _is_force_text_only() -> bool:
+    return bool(getattr(_local, "force_text_only", False))
+
+
+class force_text_only_rope:
+    """Context manager that forces ``use_plain=True`` in patched Qwen3_5Attention.
+
+    Reentry-safe via depth counter so nested decode calls inside the same
+    thread (e.g. chunked prefill that loops the language model) don't drop
+    the flag prematurely.  Single-thread executor in ``engine_core`` makes
+    races impossible, but threading.local keeps it safe under any caller.
+    """
+
+    def __enter__(self):
+        _local.depth = getattr(_local, "depth", 0) + 1
+        _local.force_text_only = True
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        depth = getattr(_local, "depth", 1) - 1
+        _local.depth = depth
+        if depth <= 0:
+            _local.force_text_only = False
+            _local.depth = 0
+        return False
 
 
 def _rotate_half(x):
@@ -106,18 +143,30 @@ def _build_replacement_call():
         # only when position_ids carries genuinely different multimodal
         # positions across the 3 sections.
         #
-        # No try/except wrapping the check: a failure here would mean
-        # _is_text_only_position_ids has a real bug, and silently
-        # switching to the mRoPE branch is exactly the broken path this
-        # whole patch exists to avoid (10/12 FAIL on cached-length
-        # sweep). Let it raise so the bug surfaces.
+        # Fast path: when VLMModelAdapter wraps a text-only decode with
+        # force_text_only_rope(), skip the per-layer .item() probes
+        # entirely (~5-10ms saved per token on 40-64 layer Qwen models).
+        #
+        # No try/except around the position_ids check: a failure there
+        # would mean _is_text_only_position_ids has a real bug, and
+        # silently switching to the mRoPE branch is exactly the broken
+        # path this whole patch exists to avoid (10/12 FAIL on
+        # cached-length sweep). Let it raise so the bug surfaces.
+        forced = _is_force_text_only()
         use_plain = True
-        if position_ids is not None:
+        if not forced and position_ids is not None:
             use_plain = _is_text_only_position_ids(position_ids)
 
-        # Track usage so it's visible in logs whether the plain/mRoPE branch
-        # is being exercised.
-        if use_plain:
+        # Track usage so it's visible in logs whether the plain/mRoPE/forced
+        # branch is being exercised.
+        if forced:
+            _call_counter["forced"] += 1
+            if _call_counter["forced"] in (1, 100, 1000):
+                logger.info(
+                    f"[qwen3_5-attn-patch] forced-plain call #{_call_counter['forced']} "
+                    f"B,L={B},{L}"
+                )
+        elif use_plain:
             _call_counter["plain"] += 1
             if _call_counter["plain"] in (1, 100, 1000):
                 logger.info(
