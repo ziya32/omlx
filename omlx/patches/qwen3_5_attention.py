@@ -35,7 +35,6 @@ from typing import Any, Optional
 
 try:
     import mlx.core as mx
-    import mlx.nn as nn
 
     HAS_MLX = True
 except ImportError:
@@ -103,19 +102,18 @@ def _build_replacement_call():
             0, 2, 1, 3
         )
 
-        # Decide RoPE path. Default = plain (text-only); fall back to mRoPE
+        # Decide RoPE path. Default = plain (text-only); switch to mRoPE
         # only when position_ids carries genuinely different multimodal
         # positions across the 3 sections.
+        #
+        # No try/except wrapping the check: a failure here would mean
+        # _is_text_only_position_ids has a real bug, and silently
+        # switching to the mRoPE branch is exactly the broken path this
+        # whole patch exists to avoid (10/12 FAIL on cached-length
+        # sweep). Let it raise so the bug surfaces.
         use_plain = True
         if position_ids is not None:
-            try:
-                use_plain = _is_text_only_position_ids(position_ids)
-            except Exception as e:
-                logger.warning(
-                    f"Qwen3_5Attention patch: position_ids check failed ({e}); "
-                    "falling back to mRoPE path."
-                )
-                use_plain = False
+            use_plain = _is_text_only_position_ids(position_ids)
 
         # Track usage so it's visible in logs whether the plain/mRoPE branch
         # is being exercised.
