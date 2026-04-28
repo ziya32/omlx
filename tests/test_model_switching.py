@@ -553,8 +553,19 @@ class TestDrainBehavior:
 
         assert pool._timeout_counter >= 1
 
-    async def test_new_requests_rejected_during_drain(self, switching_pool):
-        """get_engine for a draining model waits (does not return the draining engine)."""
+    async def test_get_engine_during_drain_returns_live_engine(self, switching_pool):
+        """get_engine for a DRAINING-but-still-loaded model re-acquires the
+        live engine instead of waiting for unload + reload.
+
+        Sibling-model drain race: a request for model-c triggered drain on
+        model-a as the LRU victim, but the engine ref is still loaded.
+        A second request for model-a should fast-path on the live ref —
+        forcing it to wait through the drain would queue a 30s+25s
+        unload/reload cycle (the test_17_max_stress regression in 6fa23ee).
+
+        Active requests on engine_a keep the drain monitor from unloading,
+        so the drain naturally extends to cover the new acquirer.
+        """
         engine_a = await switching_pool.get_engine("model-a")
         engine_a.add_request("req-1")
         engine_b = await switching_pool.get_engine("model-b")
@@ -566,22 +577,23 @@ class TestDrainBehavior:
 
         entry_a = switching_pool.get_entry("model-a")
         assert entry_a.state == EngineState.DRAINING
+        assert entry_a.engine is engine_a  # still loaded
 
-        # A second request for model-a must wait, not get the draining engine.
-        task_a_again = asyncio.create_task(switching_pool.get_engine("model-a"))
-        await asyncio.sleep(0.1)
-        assert not task_a_again.done(), (
-            "get_engine for a draining model must not return immediately"
+        # Second get_engine on model-a fast-paths on the live engine ref.
+        # Tight timeout proves we don't fall through to drain_complete.wait().
+        engine_a_again = await asyncio.wait_for(
+            switching_pool.get_engine("model-a"), timeout=2.0
+        )
+        assert engine_a_again is engine_a, (
+            "DRAINING-with-engine-loaded must return the live ref, "
+            "not wait for the full unload/reload cycle"
         )
 
-        # Complete the drain.
+        # Drain still completes once req-1 finishes — re-acquiring did
+        # not interfere with drain mechanics.
         engine_a.finish_request("req-1")
         engine_b.finish_request("req-2")
         await asyncio.wait_for(task_c, timeout=8)
-        # task_a_again should eventually resolve (model-a will be reloaded or
-        # wait until memory is available).
-        result = await asyncio.wait_for(task_a_again, timeout=8)
-        assert result is not None
 
     async def test_drain_monitor_crash_sets_event(self, switching_pool):
         """If drain_monitor crashes, drain_complete is still set."""
