@@ -440,6 +440,83 @@ class TestPerRequestMRoPEDecode:
         vlm.language_model._rope_deltas = None
         assert adapter.get_last_rope_deltas() == 0.0
 
+    def test_scalar_offset_cache_passes_position_ids(self):
+        """Regression for the unreachable-elif structural bug.
+
+        The mRoPE prefill against a single-request KVCache (scalar
+        ``cache.offset`` > 0) — i.e. an SSD-cache prefix hit on a
+        text-only prompt — must pass ``position_ids = arange(offset,
+        offset+L)`` to the language model so attention queries align
+        with the cached KV positions.
+
+        Earlier, the e8839a4 fix lived inside an ``else`` branch whose
+        condition (``_uses_mrope and cache is not None``) was already
+        consumed by a preceding ``elif``, making it unreachable. The
+        adapter then called ``language_model(input_ids, cache=cache)``
+        without ``position_ids``; mlx-vlm's ``get_rope_index`` returned
+        positions ``0..L-1`` regardless of cache_offset, attention
+        diverged from cached KV, and the first sampled token was EOS —
+        the request finished with **0 generated tokens** even though
+        the SSD cache hit covered most of the prompt.
+
+        This test pins the path: a Mock language_model + a cache with
+        scalar offset > 0, and asserts position_ids was actually passed.
+        """
+        import mlx.core as mx
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = self._make_mrope_vlm_model()
+        adapter = VLMModelAdapter(vlm)
+        assert adapter._uses_mrope is True
+
+        # Single-request cache with scalar offset (mlx-lm KVCache layout)
+        # — mimics the state right after an SSD cache hit covering 6144
+        # tokens of a 7683-token prompt; the chunk being prefilled here
+        # is the remaining 1539 tokens.
+        cache_layer = MagicMock()
+        cache_layer.offset = mx.array(6144)  # ndim == 0 → scalar path
+        cache = [cache_layer]
+
+        L = 1539
+        input_ids = mx.zeros((1, L), dtype=mx.int32)
+        adapter(input_ids, cache=cache)
+
+        vlm.language_model.assert_called_once()
+        call_kwargs = vlm.language_model.call_args[1]
+        assert "position_ids" in call_kwargs, (
+            "language_model called without position_ids — the "
+            "scalar-offset branch is unreachable"
+        )
+        pos_ids = call_kwargs["position_ids"]
+        # Shape: (3, 1, 1539) — 3 mRoPE channels, 1 request, L tokens
+        assert pos_ids.shape == (3, 1, L)
+        # Values: arange(6144, 6144 + 1539); broadcast across the 3
+        # channels so every channel sees the same position. Spot-check
+        # endpoints rather than the full range.
+        assert pos_ids[0, 0, 0].item() == 6144
+        assert pos_ids[0, 0, L - 1].item() == 6144 + L - 1
+
+    def test_scalar_offset_zero_uses_no_position_ids(self):
+        """With scalar_offset == 0 (fresh prefill from position 0) the
+        adapter should NOT pass position_ids; the language model
+        computes them itself via get_rope_index, which produces the
+        same positions for an offset-0 prompt.
+        """
+        import mlx.core as mx
+        from omlx.models.vlm import VLMModelAdapter
+
+        vlm = self._make_mrope_vlm_model()
+        adapter = VLMModelAdapter(vlm)
+
+        cache_layer = MagicMock()
+        cache_layer.offset = mx.array(0)  # ndim == 0, value 0
+        cache = [cache_layer]
+
+        adapter(mx.zeros((1, 100), dtype=mx.int32), cache=cache)
+
+        vlm.language_model.assert_called_once()
+        assert "position_ids" not in vlm.language_model.call_args[1]
+
 
 class TestLogitsExtraction:
     """Tests for LanguageModelOutput.logits extraction."""
