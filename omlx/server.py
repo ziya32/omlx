@@ -141,8 +141,10 @@ from .api.tool_calling import (
     ToolCallStreamFilter,
     build_json_system_prompt,
     convert_tools_for_template,
+    enrich_tool_params_for_gemma4,
     extract_tool_calls_with_thinking,
     parse_json_output,
+    restore_gemma4_param_names,
     sanitize_tool_call_markup,
 )
 from .api.thinking import ThinkingParser, extract_thinking
@@ -2636,7 +2638,7 @@ async def create_chat_completion(
             return StreamingResponse(
                 _with_engine_guard(
                     _with_sse_keepalive(
-                        stream_chat_completion(engine, messages, request, model_load_duration=model_load_duration, request_id=req_id, **chat_kwargs),
+                        stream_chat_completion(engine, messages, request, model_load_duration=model_load_duration, request_id=req_id, resolved_model=resolved_model, **chat_kwargs),
                         http_request=http_request,
                     ),
                     pool, resolved_model,
@@ -3089,6 +3091,7 @@ async def stream_chat_completion(
     request: ChatCompletionRequest,
     model_load_duration: float = 0.0,
     request_id: str | None = None,
+    resolved_model: Optional[str] = None,
     **kwargs,
 ) -> AsyncIterator[str]:
     """Stream chat completion response.
@@ -3380,6 +3383,7 @@ async def stream_anthropic_messages(
     messages: list,
     request: AnthropicMessagesRequest,
     request_id: str | None = None,
+    resolved_model: Optional[str] = None,
     **kwargs,
 ) -> AsyncIterator[str]:
     """
@@ -3863,7 +3867,7 @@ async def create_anthropic_message(
             return StreamingResponse(
                 _with_engine_guard(
                     _with_sse_keepalive(
-                        stream_anthropic_messages(engine, messages, request, request_id=req_id, **chat_kwargs),
+                        stream_anthropic_messages(engine, messages, request, request_id=req_id, resolved_model=resolved_model, **chat_kwargs),
                         http_request=http_request,
                     ),
                     pool, resolved_model,
@@ -4294,6 +4298,7 @@ async def create_response(
                             store_response=_should_store_response(request.store),
                             model_load_duration=model_load_duration,
                             request_id=req_id,
+                            resolved_model=resolved_model,
                             **chat_kwargs,
                         ),
                         http_request=http_request,
@@ -4416,6 +4421,7 @@ async def stream_responses_api(
     store_response: bool = True,
     model_load_duration: float = 0.0,
     request_id: str | None = None,
+    resolved_model: Optional[str] = None,
     **kwargs,
 ) -> AsyncIterator[str]:
     """Stream Responses API events (SSE with named event types)."""
