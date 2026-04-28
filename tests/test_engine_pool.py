@@ -693,6 +693,77 @@ class TestEnginePoolEviction:
             with pytest.raises((InsufficientMemoryError, ModelTooLargeError)):
                 await pool.get_engine("model-b")
 
+    @pytest.mark.asyncio
+    async def test_get_engine_on_draining_extends_lease(self, tight_memory_pool):
+        """Regression test for the test_17_max_stress race.
+
+        When request A1 acquires model A and request B for a *different*
+        model triggers ``_start_drain(A)`` (so A goes ACTIVE → DRAINING
+        before request A2 fast-paths in), A2 must STILL be able to grab
+        the still-loaded engine — otherwise A2 waits a full drain +
+        unload + reload cycle (~30s drain wait + ~25s reload) for no
+        functional reason. Under heavy concurrent stress this cascade
+        can push the long-tail past the 300s client timeout.
+
+        The fix: if ``state == DRAINING`` and ``engine is not None``,
+        get_engine returns the engine (extends the lease). The drain
+        monitor refuses to ``_unload_engine`` while ``active_uses > 0``,
+        so the drain naturally waits for the new acquirer too — no
+        special signaling needed.
+
+        We pin ``active_uses=1`` and ``has_active_requests=True`` to
+        guarantee the drain monitor would otherwise sit on the request
+        until ``drain_timeout`` — so without the fix this test would
+        block until that timeout and fail the wait_for guard. With the
+        fix, the second get_engine returns immediately.
+        """
+        pool = tight_memory_pool
+
+        mock_engine_a = MagicMock()
+        mock_engine_a.start = AsyncMock()
+        # Pin both signals the drain monitor checks so it can NEVER
+        # decide active_uses==0 and unload during this test.
+        mock_engine_a.has_active_requests.return_value = True
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine_a):
+            # First acquirer brings model-a to ACTIVE.
+            engine_a1 = await pool.get_engine("model-a")
+            assert engine_a1 is mock_engine_a
+            entry_a = pool._entries["model-a"]
+            assert entry_a.state == EngineState.ACTIVE
+
+            # A1 is still using the engine. Simulate the protocol:
+            # acquire_engine bumps active_uses, drain_monitor's check
+            # ``active_uses > 0`` keeps it from unloading.
+            pool.acquire_engine("model-a")
+            assert entry_a.active_uses == 1
+
+            # A request for a different model triggers drain on this one
+            # (this is what happens in test_17 when an asr/tts request
+            # wins the lock race ahead of a sibling rerank-2 request).
+            async with pool._lock:
+                pool._start_drain("model-a")
+            assert entry_a.state == EngineState.DRAINING
+            assert entry_a.engine is mock_engine_a
+
+            # Second acquirer for the SAME model. Must NOT block waiting
+            # for drain_complete; the drain_monitor cannot unload while
+            # active_uses > 0, so without the fix this would hang until
+            # ``drain_timeout`` elapsed. ``wait_for(timeout=5)`` proves
+            # the fast path is taken.
+            engine_a2 = await asyncio.wait_for(
+                pool.get_engine("model-a"), timeout=5.0
+            )
+            assert engine_a2 is mock_engine_a, (
+                "second get_engine on a DRAINING-but-still-loaded "
+                "engine should re-acquire the live ref, not wait for "
+                "the drain (which would force a full unload/reload)"
+            )
+
+            pool.release_engine("model-a")
+
+        await pool.shutdown()
+
 
 class TestEnginePoolStatus:
     """Tests for get_status is_loading field."""

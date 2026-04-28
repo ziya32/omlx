@@ -668,8 +668,34 @@ class EnginePool:
                     event = entry.ready_event
 
                 elif entry.state == EngineState.DRAINING:
-                    # Model is being unloaded — wait for drain, then it will
-                    # need to be reloaded (or another model will free space)
+                    # The drain was triggered by a different model's
+                    # _prepare_memory_for needing this engine evicted —
+                    # but we ARE that engine's user, so re-acquiring lets
+                    # us batch with the existing leases instead of
+                    # waiting for full unload + reload cycle (which adds
+                    # ~30s drain + ~25s reload per cycle on a 4B
+                    # reranker/embedding model under stress).
+                    #
+                    # Race seen in test_17_max_stress: VLM exclusive_idle
+                    # fires; 6 non-VLM requests wake up and race for the
+                    # pool lock; if a request for a DIFFERENT model
+                    # (e.g. asr) wins the race, it triggers drain on the
+                    # just-loaded model (e.g. Reranker) before a sibling
+                    # request (rerank-2) can fast-path acquire. Without
+                    # this branch rerank-2 waits the full drain+reload
+                    # cycle, pushing tail latency past the 300s client
+                    # timeout under heavy load.
+                    #
+                    # The drain monitor checks active_uses each second
+                    # and refuses to call _unload_engine while
+                    # active_uses > 0, so re-acquisition naturally
+                    # extends the drain — once we release, drain_monitor
+                    # sees active_uses==0 again and proceeds with
+                    # unload. Bounded by drain_timeout in pathological
+                    # cases.
+                    if entry.engine is not None:
+                        entry.last_access = time.time()
+                        return entry.engine
                     event = entry.drain_complete
 
                 elif entry.state == EngineState.UNLOADING:
@@ -1721,11 +1747,6 @@ class EnginePool:
                 engine = RerankerEngine(
                     model_name=entry.model_path,
                     trust_remote_code=trc,
-                )
-            elif effective_type == "llm_reranker":
-                engine = LLMRerankerEngine(
-                    model_name=entry.model_path,
-                    scheduler_config=self._scheduler_config,
                 )
             elif effective_type == "vlm":
                 enforcer = self._process_memory_enforcer
