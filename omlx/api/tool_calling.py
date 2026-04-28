@@ -25,7 +25,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from jsonschema import validate, ValidationError
 
-from .openai_models import FunctionCall, ResponseFormat, ToolCall, ToolDefinition
+from .openai_models import FunctionCall, ResponseFormat, ToolCall
 
 logger = logging.getLogger(__name__)
 

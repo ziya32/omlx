@@ -57,7 +57,7 @@ from typing import Optional, Union
 from fastapi import Depends, FastAPI, HTTPException, Request as FastAPIRequest
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from omlx._version import __version__
@@ -148,8 +148,8 @@ from .api.tool_calling import (
     sanitize_tool_call_markup,
 )
 from .api.thinking import ThinkingParser, extract_thinking
-from .api.utils import clean_output_text, clean_special_tokens, extract_multimodal_content, extract_text_content
-from .engine import BaseEngine, BatchedEngine, VLMBatchedEngine
+from .api.utils import clean_special_tokens, extract_multimodal_content, extract_text_content
+from .engine import BaseEngine, VLMBatchedEngine
 from .engine.stt import STTEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
@@ -1327,8 +1327,6 @@ def init_server(
     Raises:
         ValueError: If model directory doesn't exist or no models found
     """
-    from pathlib import Path
-
     from .model_settings import ModelSettingsManager
 
     # Store API key
@@ -2028,8 +2026,9 @@ async def unload_model(model_id: str, _: bool = Depends(verify_api_key)):
 @app.post("/v1/embeddings")
 async def create_embeddings(
     request: EmbeddingRequest,
+    http_request: FastAPIRequest,
     _: bool = Depends(verify_api_key),
-) -> EmbeddingResponse:
+):
     """
     Create embeddings for input text(s).
 
@@ -2070,48 +2069,50 @@ async def create_embeddings(
     if not embedding_inputs:
         raise HTTPException(status_code=400, detail="Input cannot be empty")
 
-    # Generate embeddings
-    start_time = time.perf_counter()
-    try:
-        output = await engine.embed(embedding_inputs, instruction=request.instruction)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except TypeError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    async def _build_embeddings():
+        start_time = time.perf_counter()
+        try:
+            output = await engine.embed(embedding_inputs, instruction=request.instruction)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        except TypeError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
-    elapsed = time.perf_counter() - start_time
-    logger.info(
-        f"Embedding [{req_id}]: {len(embedding_inputs)} inputs, {output.dimensions} dims, "
-        f"{output.total_tokens} tokens in {elapsed:.3f}s"
-    )
-
-    # Format response
-    data = []
-    for i, embedding in enumerate(output.embeddings):
-        # Apply dimension truncation if specified
-        if request.dimensions and request.dimensions < len(embedding):
-            embedding = truncate_embedding(embedding, request.dimensions)
-
-        # Apply encoding format
-        if request.encoding_format == "base64":
-            formatted_embedding = encode_embedding_base64(embedding)
-        else:
-            formatted_embedding = embedding
-
-        data.append(
-            EmbeddingData(
-                index=i,
-                embedding=formatted_embedding,
-            )
+        elapsed = time.perf_counter() - start_time
+        logger.info(
+            f"Embedding [{req_id}]: {len(embedding_inputs)} inputs, {output.dimensions} dims, "
+            f"{output.total_tokens} tokens in {elapsed:.3f}s"
         )
 
-    return EmbeddingResponse(
-        data=data,
-        model=request.model,
-        usage=EmbeddingUsage(
-            prompt_tokens=output.total_tokens,
-            total_tokens=output.total_tokens,
-        ),
+        data = []
+        for i, embedding in enumerate(output.embeddings):
+            if request.dimensions and request.dimensions < len(embedding):
+                embedding = truncate_embedding(embedding, request.dimensions)
+
+            if request.encoding_format == "base64":
+                formatted_embedding = encode_embedding_base64(embedding)
+            else:
+                formatted_embedding = embedding
+
+            data.append(
+                EmbeddingData(
+                    index=i,
+                    embedding=formatted_embedding,
+                )
+            )
+
+        return EmbeddingResponse(
+            data=data,
+            model=request.model,
+            usage=EmbeddingUsage(
+                prompt_tokens=output.total_tokens,
+                total_tokens=output.total_tokens,
+            ),
+        ).model_dump_json()
+
+    return StreamingResponse(
+        _with_json_keepalive(http_request, _build_embeddings()),
+        media_type="application/json",
     )
 
 
@@ -3601,7 +3602,9 @@ async def stream_anthropic_messages(
             tokenizer=engine.tokenizer,
             tools=kwargs.get("tools"),
         )
-        cleaned_text = extraction.cleaned_text
+        # Anthropic streaming has already emitted text deltas character-by-character
+        # by this point; the tool_use blocks below carry the structured calls and
+        # extraction.cleaned_text has no place to land in the wire protocol.
         tool_calls = extraction.tool_calls
 
     # Emit tool_use blocks if present
@@ -4136,18 +4139,18 @@ async def create_response(
         # Convert tools: flat → nested
         openai_tools = convert_responses_tools(request.tools)
 
-        # Get per-model settings
-        max_tool_result_tokens = None
+        # Get per-model settings. The Responses endpoint takes a pre-built
+        # message dict from convert_responses_input_to_messages and skips the
+        # tool-result truncation / forced_ct_kwargs path that chat-completions
+        # and Anthropic apply on Pydantic Message objects, so only the kwargs
+        # we actually consume below are read here.
         merged_ct_kwargs = {}
-        forced_keys: set[str] = set()
         reasoning_parser = None
         if _server_state.settings_manager:
             ms = _server_state.settings_manager.get_settings(resolved_model)
-            max_tool_result_tokens = ms.max_tool_result_tokens
             reasoning_parser = ms.reasoning_parser
             if ms.chat_template_kwargs:
                 merged_ct_kwargs.update(ms.chat_template_kwargs)
-            forced_keys = set(ms.forced_ct_kwargs or [])
             # Dedicated enable_thinking toggle takes precedence over chat_template_kwargs
             if ms.enable_thinking is not None:
                 merged_ct_kwargs["enable_thinking"] = ms.enable_thinking

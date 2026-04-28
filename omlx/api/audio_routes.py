@@ -379,7 +379,6 @@ async def create_transcription(
 
     logger.info(f"Transcription [{req_id}] received: model={model}")
 
-    pool = _get_engine_pool()
     model = _resolve_model(str(model))
 
     model_str = str(model)
