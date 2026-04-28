@@ -481,6 +481,11 @@ async def debug_reset_enforcer_peak(_: bool = Depends(verify_api_key)):
 
 
 # Include MCP routes
+# MCP and audio routers gate every endpoint via Depends(_verify_auth), where
+# _verify_auth is wired to verify_api_key here. This achieves the same goal
+# as upstream's app.include_router(..., dependencies=[Depends(verify_api_key)])
+# (#697f63d) without the indirection that would force every test to patch
+# both layers.
 from .api.mcp_routes import router as mcp_router, set_mcp_manager_getter, set_auth_dependency
 set_mcp_manager_getter(get_mcp_manager)
 set_auth_dependency(verify_api_key)
