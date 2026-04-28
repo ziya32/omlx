@@ -668,33 +668,51 @@ class EnginePool:
                     event = entry.ready_event
 
                 elif entry.state == EngineState.DRAINING:
-                    # The drain was triggered by a different model's
-                    # _prepare_memory_for needing this engine evicted —
-                    # but we ARE that engine's user, so re-acquiring lets
-                    # us batch with the existing leases instead of
-                    # waiting for full unload + reload cycle (which adds
-                    # ~30s drain + ~25s reload per cycle on a 4B
-                    # reranker/embedding model under stress).
+                    # The drain was triggered by a *different* model's
+                    # _prepare_memory_for choosing this engine as its
+                    # eviction victim — but we ARE that engine's user,
+                    # so re-acquiring the live ref lets us batch with
+                    # the existing leases instead of waiting through
+                    # the full unload + reload cycle (~30s drain +
+                    # ~25s reload on a 4B reranker/embedding under
+                    # stress).
                     #
-                    # Race seen in test_17_max_stress: VLM exclusive_idle
-                    # fires; 6 non-VLM requests wake up and race for the
-                    # pool lock; if a request for a DIFFERENT model
-                    # (e.g. asr) wins the race, it triggers drain on the
-                    # just-loaded model (e.g. Reranker) before a sibling
-                    # request (rerank-2) can fast-path acquire. Without
-                    # this branch rerank-2 waits the full drain+reload
+                    # Race seen in test_17_max_stress: VLM
+                    # exclusive_idle fires; 6 non-VLM requests wake up
+                    # and race for the pool lock; if a request for a
+                    # DIFFERENT model (e.g. asr) wins the race, it
+                    # triggers drain on the just-loaded model
+                    # (e.g. Reranker) before a sibling request
+                    # (rerank-2) can fast-path acquire. Without this
+                    # branch rerank-2 waits the full drain + reload
                     # cycle, pushing tail latency past the 300s client
                     # timeout under heavy load.
                     #
-                    # The drain monitor checks active_uses each second
-                    # and refuses to call _unload_engine while
-                    # active_uses > 0, so re-acquisition naturally
-                    # extends the drain — once we release, drain_monitor
-                    # sees active_uses==0 again and proceeds with
-                    # unload. Bounded by drain_timeout in pathological
-                    # cases.
+                    # Safety: every server endpoint calls
+                    # acquire_engine BEFORE awaiting get_engine (see
+                    # use_engine ctxmgr + the streaming endpoints in
+                    # server.py), so the caller's lease is already
+                    # bumped when we return here. The drain monitor's
+                    # has_work check (1/sec) is
+                    # ``engine.has_active_requests() OR
+                    # active_uses > 0`` — both must be False to call
+                    # _unload_engine — so the new lease keeps the
+                    # engine alive until the caller releases it.
+                    # Once active_uses drops to 0 and no in-flight
+                    # request remains, drain_monitor proceeds with
+                    # unload at its next 1s tick. drain_timeout still
+                    # caps pathological extensions: if elapsed >
+                    # drain_timeout AND active_uses == 0, the monitor
+                    # force-unloads and aborts in-flight requests.
                     if entry.engine is not None:
                         entry.last_access = time.time()
+                        logger.info(
+                            f"get_engine({model_id}) DRAINING fast-path: "
+                            f"returning live engine "
+                            f"(active_uses={entry.active_uses}, "
+                            f"drain_elapsed="
+                            f"{time.time() - entry.drain_started:.1f}s)"
+                        )
                         return entry.engine
                     event = entry.drain_complete
 
