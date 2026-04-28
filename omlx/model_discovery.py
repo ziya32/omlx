@@ -161,7 +161,14 @@ RERANKER_ARCHITECTURES = SUPPORTED_RERANKER_ARCHITECTURES | UNSUPPORTED_RERANKER
 # handled as audio types (audio_stt / audio_tts) — see AUDIO_* sets below.
 UNSUPPORTED_MODEL_TYPES: set[str] = set()
 
-UNSUPPORTED_ARCHITECTURES: set[str] = set()
+# DFlash draft models are auxiliary checkpoints paired with a primary
+# model via model_settings.dflash_draft_model — they are not servable
+# standalone (mlx-lm rejects their parameter set with "Received N
+# parameters not in model"). Skip them at discovery so they never
+# appear as servable models.
+UNSUPPORTED_ARCHITECTURES: set[str] = {
+    "DFlashDraftModel",
+}
 
 # ---------------------------------------------------------------------------
 # Audio model detection — dynamically loaded from mlx-audio when available
