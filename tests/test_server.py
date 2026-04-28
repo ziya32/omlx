@@ -379,7 +379,9 @@ class TestUseEngineResolveOnce:
         pool.release_engine = lambda mid: release_calls.append(mid)
         pool.ensure_engine_alive = lambda mid, eng: ensure_alive_calls.append(mid)
 
-        mock_engine = MagicMock()
+        # spec=BaseEngine so the LLM type validation (#507) accepts the mock
+        from omlx.engine.base import BaseEngine
+        mock_engine = MagicMock(spec=BaseEngine)
 
         async def get_engine_stub(model_id, *a, **kw):
             return mock_engine

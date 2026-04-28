@@ -537,7 +537,7 @@ async def _stream_speech_response(
 
         stream_format: Optional[tuple[int, int, int]] = None
         for idx, segment in enumerate(segments, start=1):
-            wav_bytes = await engine.synthesize(
+            output = await engine.synthesize(
                 segment,
                 voice=request.voice,
                 speed=request.speed,
@@ -550,6 +550,10 @@ async def _stream_speech_response(
                 repetition_penalty=request.repetition_penalty,
                 max_tokens=request.max_tokens,
             )
+            # engine.synthesize returns SpeechOutput; pull the WAV bytes off
+            # so wav_bytes_to_pcm_frames can split header from frames. Some
+            # tests pass raw bytes through AsyncMock; accept either shape.
+            wav_bytes = output.audio_bytes if hasattr(output, "audio_bytes") else output
             sample_rate, channels, sample_width, pcm_bytes = wav_bytes_to_pcm_frames(wav_bytes)
             fmt = (sample_rate, channels, sample_width)
             if stream_format is None:
@@ -698,7 +702,6 @@ async def create_transcription(
 @router.post("/v1/audio/speech")
 async def create_speech(
     request: AudioSpeechRequest,
-    stream: bool = False,
     _: bool = Depends(_verify_auth),
 ):
     """
@@ -714,10 +717,10 @@ async def create_speech(
     - voice: ignored
     - instructions: voice description (e.g., "A warm female narrator")
 
-    Query params:
-    - stream: if true, stream raw PCM chunks as they're generated
-
-    Returns binary WAV audio (24 kHz) or streaming PCM.
+    When ``stream=true`` is set on the request body, the response is
+    a streaming WAV (header + PCM frames) so clients can begin playback
+    before synthesis completes. Otherwise a single binary WAV (24 kHz)
+    is returned.
     """
     from omlx.engine.tts import (
         TTSEngine,
@@ -743,16 +746,14 @@ async def create_speech(
 
     if not request.input or not request.input.strip():
         raise HTTPException(status_code=400, detail="'input' field must not be empty")
+    streaming_interval = DEFAULT_NATIVE_TTS_STREAMING_INTERVAL_SECONDS
     if request.stream:
         if request.response_format not in (None, "wav"):
             raise HTTPException(
                 status_code=400,
                 detail="Streaming TTS currently only supports response_format='wav'",
             )
-        # Validate streaming_interval client-side even though our chunked
-        # stream_synthesize path doesn't consume it; rejecting bad values
-        # here keeps the contract identical to native-streaming callers.
-        _resolve_tts_streaming_interval(request)
+        streaming_interval = _resolve_tts_streaming_interval(request)
 
     # --- Validate and decode ref_audio (voice clone) ---
     # We decode to bytes here (cheap) and defer tempfile creation to each
@@ -800,7 +801,7 @@ async def create_speech(
             detail=f"Speed must be between 0.25 and 4.0, got {speed}",
         )
 
-    if stream:
+    if request.stream:
         if speed != 1.0:
             raise HTTPException(
                 status_code=400,
@@ -812,7 +813,18 @@ async def create_speech(
                 detail=f"Streaming only supports wav/pcm format, got {fmt}",
             )
 
-        # For streaming TTS, acquire the engine for the entire stream
+        # Streaming TTS: hold the engine lease for the entire stream and
+        # use upstream's _stream_speech_response helper, which tries native
+        # PCM streaming first (engine.stream_synthesize_pcm) and falls back
+        # to per-segment synthesize when the model lacks native streaming.
+        # The _release_once / weakref.finalize pair guarantees the lease
+        # is released exactly once, including the un-iterated case where
+        # the client disconnects between handler return and Starlette's
+        # body_iterator entry (Python closes an un-started async generator
+        # without running its try/finally; without the finalizer the
+        # engine_pool active_uses lease leaks and produces LIVELOCK_SUSPECT
+        # on the next non-pinned model load — same fix applied to the chat
+        # streaming handlers in server.py).
         pool = _get_engine_pool()
         sm = _get_settings_manager()
         resolved = pool.resolve_model_id(request.model, sm) if sm else request.model
@@ -824,22 +836,6 @@ async def create_speech(
             )
         pool.acquire_engine(resolved)
 
-        # Release must happen exactly once even if the generator body
-        # never executes.  An un-iterated async generator's try/finally
-        # does NOT run when it's garbage-collected — Python closes it
-        # without entering the body.  That path is reachable when the
-        # client disconnects between the handler returning the
-        # StreamingResponse and Starlette's stream_response() entering
-        # its `async for chunk in self.body_iterator` loop (e.g. a
-        # CancelledError fires at the first `await send({'type':
-        # 'http.response.start', ...})`).  Without the weakref.finalize
-        # fallback, the engine lease leaks and active_uses stays
-        # incremented, producing LIVELOCK_SUSPECT on the next
-        # non-pinned model load (the same failure mode the nanobot
-        # test suite hit with the chat-streaming handlers, fixed there
-        # via the same weakref.finalize pattern).
-        # Materialize ref_audio tempfile only now — past all sync
-        # validation, so a 4xx raise above can't leak the tempfile.
         stream_ref_audio_path = _write_ref_audio_tempfile(ref_audio_bytes)
         released_flag = [False]
 
@@ -847,38 +843,42 @@ async def create_speech(
             if not released_flag[0]:
                 released_flag[0] = True
                 pool.release_engine(resolved)
+            # _stream_speech_response also unlinks ref_audio_path in its
+            # own finally block, but _cleanup_tempfile is idempotent.
             _cleanup_tempfile(stream_ref_audio_path)
 
-        async def _stream_pcm():
+        async def _release_after(stream_iter):
             try:
-                async for chunk in engine.stream_synthesize(
-                    text=request.input,
-                    voice=speaker,
-                    instructions=instruct,
-                    ref_audio=stream_ref_audio_path,
-                    ref_text=request.ref_text,
-                    temperature=request.temperature,
-                    top_k=request.top_k,
-                    top_p=request.top_p,
-                    repetition_penalty=request.repetition_penalty,
-                    max_tokens=request.max_tokens,
-                ):
-                    yield chunk.audio_bytes
+                async for chunk in stream_iter:
+                    yield chunk
             finally:
                 _release_once()
 
-        body = _stream_pcm()
+        inner = _stream_speech_response(
+            engine, request, stream_ref_audio_path, streaming_interval,
+        )
+        try:
+            first_chunk = await inner.__anext__()
+        except StopAsyncIteration as exc:
+            _release_once()
+            raise HTTPException(
+                status_code=500,
+                detail="TTS streaming produced no audio output",
+            ) from exc
+        except HTTPException:
+            _release_once()
+            raise
+        except Exception as exc:
+            _release_once()
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+        body = _release_after(_stream_with_prefetched_chunk(first_chunk, inner))
         # Fallback for the never-iterated case: fires on GC of `body`.
         weakref.finalize(body, _release_once)
 
         return StreamingResponse(
             body,
-            media_type="audio/pcm",
-            headers={
-                "X-Sample-Rate": "24000",
-                "X-Channels": "1",
-                "X-Bits-Per-Sample": "16",
-            },
+            media_type="audio/wav",
         )
 
     start_time = time.perf_counter()
