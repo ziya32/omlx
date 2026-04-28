@@ -2,7 +2,6 @@
 """Tests for admin authentication and chat page API key injection."""
 
 import asyncio
-import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -442,12 +441,17 @@ class TestCheckUpdate:
     @pytest.mark.asyncio
     async def test_prerelease_not_shown(self):
         """Dev/pre-release GitHub releases should not trigger update notification."""
+        # /releases returns a list; select_latest_stable_release (#981)
+        # filters PEP 440 pre-release tags so dev/rc don't surface as
+        # updates even when the GitHub prerelease flag is unset.
         fake_resp = _FakeResponse(
             200,
-            {
-                "tag_name": "v99.0.0.dev1",
-                "html_url": "https://github.com/jundot/omlx/releases/tag/v99.0.0.dev1",
-            },
+            [
+                {
+                    "tag_name": "v99.0.0.dev1",
+                    "html_url": "https://github.com/jundot/omlx/releases/tag/v99.0.0.dev1",
+                },
+            ],
         )
         with patch("omlx.admin.routes.asyncio") as mock_asyncio:
             mock_asyncio.to_thread = _make_async_return(fake_resp)
@@ -461,10 +465,12 @@ class TestCheckUpdate:
         """Stable GitHub releases should trigger update notification."""
         fake_resp = _FakeResponse(
             200,
-            {
-                "tag_name": "v99.0.0",
-                "html_url": "https://github.com/jundot/omlx/releases/tag/v99.0.0",
-            },
+            [
+                {
+                    "tag_name": "v99.0.0",
+                    "html_url": "https://github.com/jundot/omlx/releases/tag/v99.0.0",
+                },
+            ],
         )
         with patch("omlx.admin.routes.asyncio") as mock_asyncio:
             mock_asyncio.to_thread = _make_async_return(fake_resp)
@@ -478,10 +484,12 @@ class TestCheckUpdate:
         """RC releases should not trigger update notification."""
         fake_resp = _FakeResponse(
             200,
-            {
-                "tag_name": "v99.0.0rc1",
-                "html_url": "https://github.com/jundot/omlx/releases/tag/v99.0.0rc1",
-            },
+            [
+                {
+                    "tag_name": "v99.0.0rc1",
+                    "html_url": "https://github.com/jundot/omlx/releases/tag/v99.0.0rc1",
+                },
+            ],
         )
         with patch("omlx.admin.routes.asyncio") as mock_asyncio:
             mock_asyncio.to_thread = _make_async_return(fake_resp)
