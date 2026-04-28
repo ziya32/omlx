@@ -36,8 +36,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import curses
+import importlib.util
 import os
 import re
+import subprocess
 import sys
 import time
 from collections import deque
@@ -144,6 +146,10 @@ RE_RESULT_ONLY = re.compile(
     r"^(PASSED|FAILED|ERROR|XFAIL|SKIPPED|XPASS)\b[^[]*\[\s*(\d+)%\]"
 )
 RE_SECTION = re.compile(r"^={3,}\s+(.+?)\s+={3,}\s*$")
+# pytest writes "collecting ... " with no trailing newline, so the first
+# ``>>> QUEUED ...`` print from the plugin can be glued onto it. Match
+# anywhere in the line (re.search) — RE.match would miss the first item.
+RE_QUEUED = re.compile(r">>> QUEUED (.+?)\s*$")
 
 
 def shorten_test_name(full: str) -> str:
@@ -359,10 +365,14 @@ async def run_suite(
     )
     state._proc = proc
 
+    test_queue: list[str] = []
+    test_index = 0
     in_test_phase = False
+    saw_live_start = False
     last_started_full: str | None = None
 
     def _handle_result(test_full: str, result: str, inner_pct: int) -> None:
+        nonlocal test_index
         short = shorten_test_name(test_full)
         state.last_test = short
         state.last_result = result
@@ -370,9 +380,29 @@ async def run_suite(
         state.overall_pct = base + inner_pct // state.total_suites
         if result in ("FAILED", "ERROR"):
             state.failed_tests.append(f"{name}: {short}")
+        # Advance current_test to the next queued nodeid. In log-cli mode
+        # the next RE_TEST_START line will overwrite it, so clear instead.
+        test_index += 1
+        if saw_live_start:
+            state.current_test = ""
+        elif test_index < len(test_queue):
+            state.current_test = test_queue[test_index]
+        else:
+            state.current_test = ""
 
     def _parse_line(line: str):
-        nonlocal in_test_phase, last_started_full
+        nonlocal in_test_phase, saw_live_start, last_started_full
+
+        # Plugin-emitted queue: pre-populate the run order so we can show
+        # the test that's *about to* run, not just the last finished one.
+        m_q = RE_QUEUED.search(line)
+        if m_q:
+            short = shorten_test_name(m_q.group(1))
+            test_queue.append(short)
+            if len(test_queue) == 1 and not state.current_test:
+                state.current_test = short
+            return
+
         m_sec = RE_SECTION.match(line)
         if m_sec:
             in_test_phase = "test session starts" in m_sec.group(1).lower()
@@ -389,6 +419,7 @@ async def run_suite(
 
         m_start = RE_TEST_START.match(line)
         if m_start:
+            saw_live_start = True
             last_started_full = m_start.group(1)
             state.current_test = shorten_test_name(last_started_full)
             return
@@ -416,7 +447,8 @@ async def run_suite(
                 break
             line = line_bytes.decode("utf-8", errors="replace").rstrip("\n")
             _parse_line(line)
-            if line.strip():
+            stripped = line.strip()
+            if stripped and not stripped.startswith(">>> QUEUED"):
                 state.log(line)
                 _write_log(line)
 
@@ -425,7 +457,8 @@ async def run_suite(
             if remaining:
                 for line in remaining.decode("utf-8", errors="replace").splitlines():
                     _parse_line(line)
-                    if line.strip():
+                    stripped = line.strip()
+                    if stripped and not stripped.startswith(">>> QUEUED"):
                         state.log(line)
                         _write_log(line)
 
@@ -653,6 +686,100 @@ def main(stdscr, args, log_dir: Path):
     return exit_code
 
 
+# Optional pyproject extras and the canonical importable module each
+# provides. ``_ensure_optional_extras`` walks this list to detect which
+# extras are currently satisfied in the venv (so a sync doesn't drop them)
+# and which ones whole batches of tests need.
+#
+# Add an extra here when its absence would silently skip real test coverage.
+ALL_KNOWN_EXTRAS: list[tuple[str, str]] = [
+    ("grammar", "xgrammar"),    # tests/test_grammar.py — ~50 tests skip without it
+    ("audio", "mlx_audio"),     # audio engine tests (TTS/STT/STS)
+    ("mcp", "mcp"),             # MCP integration tests
+    ("modelscope", "modelscope"),
+]
+
+# Extras the runner WILL install if missing. Subset of ALL_KNOWN_EXTRAS —
+# the others are only used for "preserve what's already there" detection.
+REQUIRED_EXTRAS: list[str] = ["grammar"]
+
+
+def _ensure_optional_extras(
+    required: list[str],
+    known: list[tuple[str, str]] = ALL_KNOWN_EXTRAS,
+) -> None:
+    """Install any required extras whose import targets are missing.
+
+    ``uv sync`` makes the venv match its argument set EXACTLY — passing
+    only ``--extra grammar`` would drop already-installed extras like
+    ``audio`` and ``mcp``. To avoid clobbering, we detect which extras
+    are currently satisfied (via their canonical importable module) and
+    pass the union of (currently satisfied ∪ required) to ``uv sync``.
+    ``--frozen`` keeps the lockfile pinned; it must already list each
+    extra's packages (see ``provides-extras`` in uv.lock).
+
+    Without this step, running the TUI on a fresh venv silently skipped
+    ~50 tests in tests/test_grammar.py because ``xgrammar`` wasn't installed
+    and the file's ``importorskip`` masked the gap as "skipped".
+    """
+    name_to_module = dict(known)
+    currently_satisfied: list[str] = []
+    for extra, module in known:
+        if importlib.util.find_spec(module) is not None:
+            currently_satisfied.append(extra)
+
+    target_extras: list[str] = sorted(set(currently_satisfied) | set(required))
+
+    missing_required = [
+        extra for extra in required
+        if importlib.util.find_spec(name_to_module[extra]) is None
+    ]
+    if not missing_required:
+        return
+
+    for extra in missing_required:
+        module = name_to_module[extra]
+        print(f"installing missing extra: {extra} (provides {module})")
+
+    extras_args: list[str] = []
+    for extra in target_extras:
+        extras_args += ["--extra", extra]
+    cmd = ["uv", "sync", "--frozen", *extras_args]
+    print(f"  $ {' '.join(cmd)}")
+    try:
+        subprocess.run(cmd, cwd=str(REPO_ROOT), check=True)
+    except FileNotFoundError:
+        print(
+            "error: 'uv' not found on PATH — install uv "
+            "(https://docs.astral.sh/uv/) or pre-install the missing "
+            f"extras manually: {missing_required}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    except subprocess.CalledProcessError as e:
+        print(
+            f"error: uv sync failed (rc={e.returncode}). Install the "
+            f"missing extras manually: {missing_required}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    # Verify the install actually exposes the modules we expected.
+    importlib.invalidate_caches()
+    still_missing = [
+        name_to_module[extra] for extra in missing_required
+        if importlib.util.find_spec(name_to_module[extra]) is None
+    ]
+    if still_missing:
+        print(
+            f"error: extras installed but modules still not importable: "
+            f"{still_missing}. Check pyproject + uv.lock.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    print()
+
+
 if __name__ == "__main__":
     default_model_dir = REPO_ROOT / "models"
 
@@ -668,18 +795,36 @@ if __name__ == "__main__":
                         help=f"OMLX_MODEL_DIR for slow/integration tests "
                              f"(default: {default_model_dir}). "
                              f"Use --model-dir '' to leave unset.")
+    parser.add_argument("--no-install-deps", action="store_true",
+                        help="Skip the optional-extras dependency check + "
+                             "auto-install. Tests that need missing extras "
+                             "will silently skip (e.g. xgrammar grammar tests).")
     args = parser.parse_args()
 
     os.chdir(REPO_ROOT)
 
+    # Install any missing required extras BEFORE running tests so coverage
+    # isn't silently lost to skipped tests. Curses hasn't started yet, so
+    # uv sync output streams to the terminal directly. Already-installed
+    # extras (e.g. audio, mcp) are preserved across the sync.
+    if not args.no_install_deps:
+        _ensure_optional_extras(REQUIRED_EXTRAS)
+
     # Apply --model-dir → OMLX_MODEL_DIR. Pass an empty string to leave it
-    # unset; missing dirs are tolerated (slow/integration tests will skip).
+    # unset (slow/integration tests that need models will skip themselves).
+    # Otherwise the directory must exist — silently skipping a whole phase
+    # because of a typo / unmounted volume hides real regressions.
     if args.model_dir and str(args.model_dir):
         resolved = args.model_dir.expanduser().resolve()
-        os.environ["OMLX_MODEL_DIR"] = str(resolved)
         if not resolved.is_dir():
-            print(f"warning: --model-dir {resolved} does not exist; "
-                  f"slow/integration tests that need models will skip")
+            print(
+                f"error: --model-dir {resolved} does not exist. "
+                f"Pass --model-dir '' to run without models, or point "
+                f"--model-dir at an existing directory.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        os.environ["OMLX_MODEL_DIR"] = str(resolved)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_dir = REPO_ROOT / "test-reports" / f"logs_{timestamp}"

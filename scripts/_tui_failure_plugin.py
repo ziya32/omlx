@@ -47,6 +47,21 @@ def pytest_configure(config: Any) -> None:
         md.write_text("# Test Failures\n\n")
 
 
+def pytest_collection_modifyitems(items: Any) -> None:
+    """Emit execution-ordered test list so the TUI can show the running test.
+
+    Default ``-v`` output only prints the nodeid once the test finishes
+    (``tests/foo.py::test_bar PASSED [42%]``), so without this hook the
+    runner never knows which test is *currently* executing — only which
+    one just finished. The runner consumes these lines, builds a queue,
+    and advances ``current_test`` after each completion.
+    """
+    if not os.environ.get("OMLX_TUI_REPORT_DIR"):
+        return
+    for item in items:
+        print(f">>> QUEUED {item.nodeid}", flush=True)
+
+
 def pytest_runtest_logreport(report: Any) -> None:  # noqa: D401
     """Hook: called after each setup/call/teardown phase of every test."""
     # Only the call phase carries a real failure for normal tests; setup
