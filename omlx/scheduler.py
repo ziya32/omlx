@@ -4150,12 +4150,13 @@ class Scheduler:
         except (TypeError, AttributeError, ValueError) as e:
             if self._is_cache_corruption_error(e):
                 import traceback
+                tb = traceback.format_exc()
                 logger.warning(
                     f"Cache corruption detected: {e}, "
                     f"clearing cache and re-prefilling..."
                 )
                 logger.debug(
-                    f"Cache corruption traceback:\n{traceback.format_exc()}"
+                    f"Cache corruption traceback:\n{tb}"
                 )
                 # Full reset: clear batch generator, all caches, VLM state
                 self._recover_from_cache_error()
@@ -4165,6 +4166,14 @@ class Scheduler:
                     is_corruption=True
                 )
                 for rid in failed_ids:
+                    # Promote the traceback from DEBUG to WARNING when a
+                    # request gives up entirely — without the frame info
+                    # the surfaced "Cache corruption not recoverable" is
+                    # impossible to triage from server logs.
+                    logger.warning(
+                        f"Cache corruption gave up on {rid} after retries; "
+                        f"final traceback:\n{tb}"
+                    )
                     output.outputs.append(
                         RequestOutput(
                             request_id=rid,
