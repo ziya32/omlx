@@ -43,6 +43,14 @@ class ServerMetrics:
         self.total_cached_tokens: int = 0
         self.total_requests: int = 0
         self.total_prefill_duration: float = 0.0
+        # Uncached prompt tokens (prompt - cached) accumulated only for
+        # requests that report a prefill duration. Non-streaming code paths
+        # don't separate prefill from generation, so they record
+        # generation_duration for the whole wall time and skip prefill_duration;
+        # without this counter, their uncached prompt tokens would inflate the
+        # avg_prefill_tps numerator while contributing nothing to its
+        # denominator.
+        self.total_prefill_processed_tokens: int = 0
         self.total_generation_duration: float = 0.0
         self._per_model: Dict[str, Dict[str, Any]] = {}
 
@@ -52,6 +60,7 @@ class ServerMetrics:
         self._alltime_cached_tokens: int = 0
         self._alltime_requests: int = 0
         self._alltime_prefill_duration: float = 0.0
+        self._alltime_prefill_processed_tokens: int = 0
         self._alltime_generation_duration: float = 0.0
         self._alltime_per_model: Dict[str, Dict[str, Any]] = {}
 
@@ -70,6 +79,7 @@ class ServerMetrics:
             "cached_tokens": 0,
             "requests": 0,
             "prefill_duration": 0.0,
+            "prefill_processed_tokens": 0,
             "generation_duration": 0.0,
         }
 
@@ -89,6 +99,9 @@ class ServerMetrics:
             self._alltime_prefill_duration = float(
                 data.get("total_prefill_duration", 0.0)
             )
+            self._alltime_prefill_processed_tokens = int(
+                data.get("total_prefill_processed_tokens", 0)
+            )
             self._alltime_generation_duration = float(
                 data.get("total_generation_duration", 0.0)
             )
@@ -100,6 +113,9 @@ class ServerMetrics:
                     "cached_tokens": int(counters.get("cached_tokens", 0)),
                     "requests": int(counters.get("requests", 0)),
                     "prefill_duration": float(counters.get("prefill_duration", 0.0)),
+                    "prefill_processed_tokens": int(
+                        counters.get("prefill_processed_tokens", 0)
+                    ),
                     "generation_duration": float(
                         counters.get("generation_duration", 0.0)
                     ),
@@ -119,6 +135,7 @@ class ServerMetrics:
                 "total_cached_tokens": self._alltime_cached_tokens,
                 "total_requests": self._alltime_requests,
                 "total_prefill_duration": self._alltime_prefill_duration,
+                "total_prefill_processed_tokens": self._alltime_prefill_processed_tokens,
                 "total_generation_duration": self._alltime_generation_duration,
                 "per_model": dict(self._alltime_per_model),
             }
@@ -155,6 +172,13 @@ class ServerMetrics:
         model_id: str = "",
     ) -> None:
         """Record a completed request. Thread-safe."""
+        # Only requests that report a real prefill duration contribute to the
+        # avg_prefill_tps numerator. Otherwise non-streaming paths (which fold
+        # prefill into generation_duration) would inflate the metric.
+        prefill_processed = (
+            max(0, prompt_tokens - cached_tokens) if prefill_duration > 0 else 0
+        )
+
         with self._lock:
             # Session counters
             self.total_prompt_tokens += prompt_tokens
@@ -162,6 +186,7 @@ class ServerMetrics:
             self.total_cached_tokens += cached_tokens
             self.total_requests += 1
             self.total_prefill_duration += prefill_duration
+            self.total_prefill_processed_tokens += prefill_processed
             self.total_generation_duration += generation_duration
 
             # All-time counters
@@ -170,6 +195,7 @@ class ServerMetrics:
             self._alltime_cached_tokens += cached_tokens
             self._alltime_requests += 1
             self._alltime_prefill_duration += prefill_duration
+            self._alltime_prefill_processed_tokens += prefill_processed
             self._alltime_generation_duration += generation_duration
 
             # Per-model counters (session)
@@ -182,6 +208,7 @@ class ServerMetrics:
                 m["cached_tokens"] += cached_tokens
                 m["requests"] += 1
                 m["prefill_duration"] += prefill_duration
+                m["prefill_processed_tokens"] += prefill_processed
                 m["generation_duration"] += generation_duration
 
                 # Per-model counters (all-time)
@@ -193,6 +220,7 @@ class ServerMetrics:
                 am["cached_tokens"] += cached_tokens
                 am["requests"] += 1
                 am["prefill_duration"] += prefill_duration
+                am["prefill_processed_tokens"] += prefill_processed
                 am["generation_duration"] += generation_duration
 
             # Periodic save
@@ -205,13 +233,13 @@ class ServerMetrics:
         cached: int,
         requests: int,
         prefill_dur: float,
+        prefill_processed: int,
         gen_dur: float,
         uptime: float,
     ) -> Dict[str, Any]:
         """Build a metrics snapshot dict from raw values."""
-        actual_processed = prompt - cached
         avg_prefill_tps = (
-            actual_processed / prefill_dur if prefill_dur > 0 else 0.0
+            prefill_processed / prefill_dur if prefill_dur > 0 else 0.0
         )
         avg_generation_tps = completion / gen_dur if gen_dur > 0 else 0.0
         cache_efficiency = (cached / prompt * 100) if prompt > 0 else 0.0
@@ -252,16 +280,18 @@ class ServerMetrics:
                             m["cached_tokens"],
                             m["requests"],
                             m["prefill_duration"],
+                            m["prefill_processed_tokens"],
                             m["generation_duration"],
                             uptime,
                         )
-                    return self._build_snapshot(0, 0, 0, 0, 0.0, 0.0, uptime)
+                    return self._build_snapshot(0, 0, 0, 0, 0.0, 0, 0.0, uptime)
                 return self._build_snapshot(
                     self._alltime_prompt_tokens,
                     self._alltime_completion_tokens,
                     self._alltime_cached_tokens,
                     self._alltime_requests,
                     self._alltime_prefill_duration,
+                    self._alltime_prefill_processed_tokens,
                     self._alltime_generation_duration,
                     uptime,
                 )
@@ -276,10 +306,11 @@ class ServerMetrics:
                         m["cached_tokens"],
                         m["requests"],
                         m["prefill_duration"],
+                        m["prefill_processed_tokens"],
                         m["generation_duration"],
                         uptime,
                     )
-                return self._build_snapshot(0, 0, 0, 0, 0.0, 0.0, uptime)
+                return self._build_snapshot(0, 0, 0, 0, 0.0, 0, 0.0, uptime)
 
             return self._build_snapshot(
                 self.total_prompt_tokens,
@@ -287,6 +318,7 @@ class ServerMetrics:
                 self.total_cached_tokens,
                 self.total_requests,
                 self.total_prefill_duration,
+                self.total_prefill_processed_tokens,
                 self.total_generation_duration,
                 uptime,
             )
@@ -299,6 +331,7 @@ class ServerMetrics:
             self.total_cached_tokens = 0
             self.total_requests = 0
             self.total_prefill_duration = 0.0
+            self.total_prefill_processed_tokens = 0
             self.total_generation_duration = 0.0
             self._per_model.clear()
 
@@ -310,6 +343,7 @@ class ServerMetrics:
             self._alltime_cached_tokens = 0
             self._alltime_requests = 0
             self._alltime_prefill_duration = 0.0
+            self._alltime_prefill_processed_tokens = 0
             self._alltime_generation_duration = 0.0
             self._alltime_per_model.clear()
         if self._stats_path and self._stats_path.exists():

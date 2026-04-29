@@ -3,7 +3,6 @@
 
 import json
 import threading
-from pathlib import Path
 
 import pytest
 
@@ -146,6 +145,36 @@ class TestServerMetrics:
         snapshot = metrics.get_snapshot()
         assert snapshot["avg_prefill_tps"] == 0.0
         assert snapshot["avg_generation_tps"] == 0.0
+
+    def test_avg_prefill_tps_ignores_requests_without_prefill_duration(self):
+        """Regression: non-streaming code paths only report generation_duration
+        for the entire wall time; their uncached prompt tokens must not
+        inflate avg_prefill_tps when no prefill_duration was recorded.
+        """
+        metrics = ServerMetrics()
+        # Streaming-style request: contributes to prefill TPS.
+        metrics.record_request_complete(
+            prompt_tokens=1000,
+            completion_tokens=100,
+            cached_tokens=0,
+            prefill_duration=2.0,
+            generation_duration=2.0,
+        )
+        # Non-streaming-style request: large uncached prompt but no
+        # prefill_duration. Must not affect avg_prefill_tps.
+        metrics.record_request_complete(
+            prompt_tokens=200_000,
+            completion_tokens=50,
+            cached_tokens=0,
+            generation_duration=10.0,
+        )
+
+        snapshot = metrics.get_snapshot()
+        # 1000 / 2.0 = 500 tok/s — the second request must be ignored here.
+        assert snapshot["avg_prefill_tps"] == pytest.approx(500.0, abs=0.1)
+        # Cache efficiency / total tokens still see both requests.
+        assert snapshot["total_prompt_tokens"] == 201_000
+        assert snapshot["total_requests"] == 2
 
     def test_thread_safety(self):
         """Test concurrent recording from multiple threads."""
