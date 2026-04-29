@@ -532,7 +532,7 @@ def _write_index(state: State, log_dir: Path) -> None:
     lines = ["# Test report", ""]
     lines.append(f"- Run dir: `{log_dir.name}`")
     lines.append(f"- Started: {datetime.fromtimestamp(state.start_time).isoformat() if state.start_time else 'pending'}")
-    lines.append(f"- Failures (live): [`failures.md`](failures.md)")
+    lines.append("- Failures (live): [`failures.md`](failures.md)")
     lines.append("")
     lines.append("| Suite | Status | Duration | Counts | Log |")
     lines.append("|-------|--------|----------|--------|-----|")
@@ -780,6 +780,66 @@ def _ensure_optional_extras(
     print()
 
 
+def _disable_app_nap(reason: str):
+    """Hold an NSActivity assertion that prevents App Nap from coalescing
+    this process's timers when Terminal's window becomes occluded (e.g.
+    the display sleeps). Returns the activity token, which must stay
+    referenced for the assertion to hold; returning None on any failure
+    just degrades gracefully.
+
+    Uses NSActivityUserInitiated, which disables App Nap and idle system
+    sleep but does NOT prevent display sleep.
+    """
+    if sys.platform != "darwin":
+        return None
+    try:
+        import ctypes
+        from ctypes import c_char_p, c_uint64, c_void_p
+
+        objc = ctypes.cdll.LoadLibrary("libobjc.dylib")
+        objc.objc_getClass.restype = c_void_p
+        objc.objc_getClass.argtypes = [c_char_p]
+        objc.sel_registerName.restype = c_void_p
+        objc.sel_registerName.argtypes = [c_char_p]
+        objc.objc_msgSend.restype = c_void_p
+
+        NSProcessInfo = objc.objc_getClass(b"NSProcessInfo")
+        NSString = objc.objc_getClass(b"NSString")
+        if not NSProcessInfo or not NSString:
+            return None
+
+        objc.objc_msgSend.argtypes = [c_void_p, c_void_p]
+        pi = objc.objc_msgSend(NSProcessInfo, objc.sel_registerName(b"processInfo"))
+        if not pi:
+            return None
+
+        objc.objc_msgSend.argtypes = [c_void_p, c_void_p, c_char_p]
+        nsreason = objc.objc_msgSend(
+            NSString, objc.sel_registerName(b"stringWithUTF8String:"),
+            reason.encode("utf-8"),
+        )
+        if not nsreason:
+            return None
+
+        # NSActivityUserInitiated = 0x00FFFFFF | NSActivityIdleSystemSleepDisabled
+        options = c_uint64(0x00FFFFFF | (1 << 20))
+        objc.objc_msgSend.argtypes = [c_void_p, c_void_p, c_uint64, c_void_p]
+        token = objc.objc_msgSend(
+            pi, objc.sel_registerName(b"beginActivityWithOptions:reason:"),
+            options, nsreason,
+        )
+        if not token:
+            return None
+
+        # The token is autoreleased; retain it so the assertion holds
+        # for the lifetime of the process.
+        objc.objc_msgSend.argtypes = [c_void_p, c_void_p]
+        objc.objc_msgSend(token, objc.sel_registerName(b"retain"))
+        return token
+    except Exception:
+        return None
+
+
 if __name__ == "__main__":
     default_model_dir = REPO_ROOT / "models"
 
@@ -799,6 +859,9 @@ if __name__ == "__main__":
                         help="Skip the optional-extras dependency check + "
                              "auto-install. Tests that need missing extras "
                              "will silently skip (e.g. xgrammar grammar tests).")
+    parser.add_argument("--allow-system-sleep", action="store_true",
+                        help="Don't hold a wake assertion / disable App Nap "
+                             "during the run")
     args = parser.parse_args()
 
     os.chdir(REPO_ROOT)
@@ -836,5 +899,28 @@ if __name__ == "__main__":
         print(f"OMLX_MODEL_DIR={os.environ['OMLX_MODEL_DIR']}")
     print()
 
-    rc = curses.wrapper(lambda stdscr: main(stdscr, args, log_dir))
+    # Without these, the test process keeps running but its asyncio
+    # loop and the parent's pipe-drain cadence fall behind real time:
+    # `caffeinate -i` blocks system idle sleep so the test doesn't halt
+    # entirely after the user walks away, and the NSActivity disables
+    # App Nap on this process so Terminal can repaint up-to-date state
+    # the moment the display wakes. Display sleep itself stays enabled.
+    caffeinate_proc = None
+    activity_token = None
+    if not args.allow_system_sleep and sys.platform == "darwin":
+        try:
+            caffeinate_proc = subprocess.Popen(
+                ["caffeinate", "-i", "-w", str(os.getpid())],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except (FileNotFoundError, OSError):
+            pass
+        activity_token = _disable_app_nap("omlx test runner")
+
+    try:
+        rc = curses.wrapper(lambda stdscr: main(stdscr, args, log_dir))
+    finally:
+        if caffeinate_proc and caffeinate_proc.poll() is None:
+            caffeinate_proc.terminate()
     sys.exit(rc)
