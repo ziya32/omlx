@@ -10,7 +10,8 @@ import json
 import pytest
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, List, Optional
-from unittest.mock import AsyncMock, MagicMock, patch
+
+from omlx.engine.base import BaseEngine
 
 TEST_API_KEY = "test-api-key"
 
@@ -53,7 +54,7 @@ class MockTokenizer:
         return "\n".join(parts)
 
 
-class MockBaseEngine:
+class MockBaseEngine(BaseEngine):
     """Mock LLM engine with streaming support for testing."""
 
     def __init__(self, model_name: str = "test-model"):
@@ -78,6 +79,18 @@ class MockBaseEngine:
     @property
     def prefix_cache_enabled(self) -> bool:
         return False
+
+    async def start(self) -> None:
+        pass
+
+    async def stop(self) -> None:
+        pass
+
+    def get_stats(self) -> Dict[str, Any]:
+        return {"model_name": self._model_name}
+
+    def get_cache_stats(self) -> Optional[Dict[str, Any]]:
+        return None
 
     def set_stream_outputs(self, outputs: List[MockGenerationOutput]):
         """Set custom streaming outputs for testing."""

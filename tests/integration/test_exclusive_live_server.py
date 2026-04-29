@@ -65,7 +65,11 @@ ALL_MODELS = [
 MAX_RETRIES = 3
 REQUEST_TIMEOUT = 300.0
 RETRY_BACKOFF = 5.0
-RETRYABLE_CODES = {504, 507}
+# Codes worth retrying. 503 covers eviction / abort surfaces, including the
+# body-encoded form emitted by ``_with_json_keepalive`` after status 200 has
+# already been committed (chat / completions / messages / responses /
+# embeddings all share that envelope).
+RETRYABLE_CODES = {503, 504, 507}
 SERVER_STARTUP_TIMEOUT = 180
 VLM_MAX_RESPONSE_TIME = 60.0  # seconds — fail if single VLM response exceeds this.
 # Headroom for the heaviest stress scenarios on a 30B-A3B 8-bit MoE under 9
@@ -275,6 +279,40 @@ class RetryExhausted(Exception):
     pass
 
 
+def _effective_status(resp: httpx.Response) -> tuple[int, str]:
+    """Return (status, message) accounting for keepalive body-encoded errors.
+
+    The non-streaming JSON endpoints (chat / completions / messages /
+    responses / embeddings) wrap their work in ``_with_json_keepalive``,
+    which commits HTTP 200 before the engine task runs and then encodes any
+    later exception into the body as
+    ``{"error": {"message", "type", "code"}}`` where ``code`` mirrors the
+    equivalent HTTP status. For binary endpoints (TTS audio bytes, ASR
+    JSON without keepalive) and the success path, ``resp.status_code`` is
+    authoritative.
+    """
+    status = resp.status_code
+    if status != 200:
+        try:
+            detail = resp.json().get("detail", "")[:300]
+        except Exception:
+            detail = resp.text[:300]
+        return status, detail
+    if "application/json" not in resp.headers.get("content-type", ""):
+        return 200, ""
+    try:
+        body = resp.json()
+    except Exception:
+        return 200, ""
+    err = body.get("error") if isinstance(body, dict) else None
+    if isinstance(err, dict):
+        code = err.get("code")
+        message = err.get("message", "") or ""
+        if isinstance(code, int):
+            return code, message[:300]
+    return 200, ""
+
+
 async def _request_with_retry(
     client: httpx.AsyncClient,
     method: str,
@@ -286,28 +324,19 @@ async def _request_with_retry(
 ) -> httpx.Response:
     for attempt in range(1, max_retries + 1):
         resp = await client.request(method, url, **kwargs)
-        if resp.status_code == 200:
+        status, detail = _effective_status(resp)
+        if status == 200:
             return resp
-        if resp.status_code in RETRYABLE_CODES:
-            detail = ""
-            try:
-                detail = resp.json().get("detail", "")[:200]
-            except Exception:
-                pass
+        if status in RETRYABLE_CODES:
             if attempt < max_retries:
                 await asyncio.sleep(RETRY_BACKOFF * attempt)
                 continue
             raise RetryExhausted(
                 f"[{label}] {max_retries} retries exhausted. "
-                f"Last status={resp.status_code} detail={detail}"
+                f"Last status={status} detail={detail[:200]}"
             )
-        detail = ""
-        try:
-            detail = resp.json().get("detail", "")[:300]
-        except Exception:
-            detail = resp.text[:300]
         raise AssertionError(
-            f"[{label}] HTTP {resp.status_code}: {detail}"
+            f"[{label}] HTTP {status}: {detail}"
         )
     raise RetryExhausted(f"[{label}] unexpected retry loop exit")
 

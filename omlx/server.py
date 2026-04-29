@@ -4866,20 +4866,25 @@ async def delete_response(
 # =============================================================================
 # Audio routes — all audio endpoints live in audio_routes.py
 # =============================================================================
+#
+# Registered unconditionally.  audio_routes.py and its module-level imports
+# don't pull mlx-audio (engine modules import it lazily inside start()), so
+# the router loads fine without the optional dep.  When mlx-audio is missing
+# and a request actually needs it, the engine's load path raises ImportError
+# with an actionable "pip install 'omlx[audio]'" message; _use_engine catches
+# that and surfaces it as 501 (Not Implemented — the server lacks the
+# functionality until ops installs the dep, not a retryable 503) instead of
+# letting it become a generic 500.  Endpoints that don't touch mlx-audio
+# (e.g. /v1/audio/speakers reads from disk) work even without it installed.
 
-try:
-    import mlx_audio as _mlx_audio_check  # noqa: F401
-    from .api.audio_routes import (
-        router as audio_router,
-        set_auth_dependency as set_audio_auth,
-        set_settings_manager_getter,
-    )
-    set_audio_auth(verify_api_key)
-    set_settings_manager_getter(lambda: _server_state.settings_manager)
-    app.include_router(audio_router)
-    del _mlx_audio_check
-except ImportError:
-    pass
+from .api.audio_routes import (
+    router as audio_router,
+    set_auth_dependency as set_audio_auth,
+    set_settings_manager_getter,
+)
+set_audio_auth(verify_api_key)
+set_settings_manager_getter(lambda: _server_state.settings_manager)
+app.include_router(audio_router)
 
 
 # =============================================================================

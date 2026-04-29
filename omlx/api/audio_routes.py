@@ -142,9 +142,11 @@ def _get_settings_manager():
 async def _use_engine(model_id: str):
     """Get an engine with eviction protection for the duration of the block.
 
-    Converts ModelNotFoundError to HTTP 404 and EngineEvictedError
-    (raised by pool.ensure_engine_alive on the post-get-engine race
-    check) to HTTP 503 so callers don't need to handle them individually.
+    Converts ModelNotFoundError to HTTP 404, EngineEvictedError (raised by
+    pool.ensure_engine_alive on the post-get-engine race check) to HTTP 503,
+    and ImportError (raised by audio engine load when an optional dependency
+    like mlx-audio isn't installed) to HTTP 501 with the engine's actionable
+    install message — so callers don't need to handle them individually.
     """
     from omlx.exceptions import EngineEvictedError, ModelNotFoundError
 
@@ -159,6 +161,15 @@ async def _use_engine(model_id: str):
             status_code=404,
             detail=f"Model '{model_id}' not found. Available: {avail}",
         ) from exc
+    except ImportError as exc:
+        # Engine load needed an optional dep that isn't installed (e.g.
+        # mlx-audio for TTS/STT/STS).  Surface the engine's actionable
+        # message ("Install it with: pip install 'omlx[audio]'") via 501,
+        # not 503 — this isn't a transient capacity problem, the server
+        # genuinely lacks the functionality until ops installs the dep.
+        # Using 501 also keeps clients with 503-retry policies from
+        # uselessly pounding the endpoint.
+        raise HTTPException(status_code=501, detail=str(exc)) from exc
 
     pool.acquire_engine(resolved)
     try:
@@ -785,6 +796,12 @@ async def create_speech(
             status_code=404,
             detail=f"Model '{resolved_model}' not found. Available: {avail}",
         ) from exc
+    except ImportError as exc:
+        # Engine load needed an optional dep (mlx-audio).  Surface the
+        # engine's actionable install message via 501 — the server lacks
+        # the functionality until ops installs the dep, not a transient
+        # 503 condition.
+        raise HTTPException(status_code=501, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -828,7 +845,11 @@ async def create_speech(
         pool = _get_engine_pool()
         sm = _get_settings_manager()
         resolved = pool.resolve_model_id(request.model, sm) if sm else request.model
-        engine = await pool.get_engine(resolved)
+        try:
+            engine = await pool.get_engine(resolved)
+        except ImportError as exc:
+            # See non-streaming branch above — 501 for missing optional dep.
+            raise HTTPException(status_code=501, detail=str(exc)) from exc
         if not isinstance(engine, TTSEngine):
             raise HTTPException(
                 status_code=400,
@@ -970,6 +991,9 @@ async def process_audio(
             status_code=404,
             detail=f"Model '{model}' not found. Available: {avail}",
         ) from exc
+    except ImportError as exc:
+        # See create_speech — 501 for missing optional dep (mlx-audio).
+        raise HTTPException(status_code=501, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 

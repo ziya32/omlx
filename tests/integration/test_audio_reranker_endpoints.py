@@ -11,12 +11,12 @@ import json
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
 
+from omlx.engine.base import BaseEngine
 from omlx.engine.stt import STTEngine, TranscriptionOutput
 
 TEST_API_KEY = "test-api-key"
@@ -145,7 +145,7 @@ class MockRerankerEngine(RerankerEngine):
         return {"model_name": self._model_name, "loaded": True, "engine_type": "reranker"}
 
 
-class MockBaseEngine:
+class MockBaseEngine(BaseEngine):
     """Minimal mock LLM engine."""
 
     def __init__(self, model_name="test-llm-model"):
@@ -167,6 +167,18 @@ class MockBaseEngine:
     def model_type(self):
         return "llama"
 
+    async def start(self):
+        pass
+
+    async def stop(self):
+        pass
+
+    def get_stats(self):
+        return {"model_name": self._model_name}
+
+    def get_cache_stats(self):
+        return None
+
     async def generate(self, prompt, **kw):
         @dataclass
         class Out:
@@ -181,23 +193,17 @@ class MockBaseEngine:
             cached_tokens: int = 0
         return Out()
 
+    async def stream_generate(self, prompt, **kw):
+        yield await self.generate("")
+
     async def chat(self, messages, **kw):
         return await self.generate("")
 
     async def stream_chat(self, messages, **kw):
         yield await self.generate("")
 
-    async def stream_generate(self, prompt, **kw):
-        yield await self.generate("")
-
     def count_chat_tokens(self, messages, tools=None, chat_template_kwargs=None):
         return 5
-
-    def get_stats(self):
-        return {}
-
-    def get_cache_stats(self):
-        return None
 
 
 class MockEnginePool:
@@ -901,20 +907,24 @@ class TestEngineTypeRouting:
         assert response.status_code == 400
 
     def test_tts_model_rejects_chat_request(self, client):
-        """Test that using TTS model for chat fails (not silently succeeds).
+        """Test that using TTS model for chat returns a clean 400 with an
+        endpoint hint (not a 500 crash, not a silent 200).
 
-        TTS engine doesn't implement BaseEngine interface, so the server
-        will error. TestClient raises server exceptions by default, so we
-        catch any exception as proof that TTS can't serve chat requests.
+        TTS engine doesn't implement BaseEngine, so the LLM-type guard in
+        ``get_engine`` rejects it before the handler can crash on
+        ``engine.model_type`` (Issue #507).
         """
-        with pytest.raises(Exception):
-            client.post(
-                "/v1/chat/completions",
-                json={
-                    "model": "test-tts-model",
-                    "messages": [{"role": "user", "content": "hello"}],
-                },
-            )
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "test-tts-model",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+        assert response.status_code == 400
+        message = response.json().get("error", {}).get("message", "").lower()
+        assert "not an llm" in message or "not a chat" in message
+        assert "/v1/audio/speech" in message
 
     def test_models_endpoint_lists_all_types(self, client):
         """Test /v1/models includes all engine types."""
@@ -946,7 +956,7 @@ class TestModelDiscoveryIntegration:
         }))
         (model_dir / "model.safetensors").write_bytes(b"\x00" * 1024)
 
-        from omlx.model_discovery import detect_model_type, DiscoveredModel
+        from omlx.model_discovery import detect_model_type
         from omlx.engine_pool import EnginePool
 
         assert detect_model_type(model_dir) == "audio_stt"

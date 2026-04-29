@@ -15,6 +15,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from omlx.api.responses_utils import ResponseStore
+from omlx.engine.base import BaseEngine
 from omlx.engine.embedding import EmbeddingEngine
 from omlx.engine.reranker import RerankerEngine
 
@@ -145,7 +146,7 @@ class MockTokenizer:
         return "\n".join(parts)
 
 
-class MockBaseEngine:
+class MockBaseEngine(BaseEngine):
     """Mock LLM engine for testing."""
 
     def __init__(self, model_name: str = "test-llm-model"):
@@ -172,6 +173,14 @@ class MockBaseEngine:
     async def start(self) -> None:
         pass
 
+    async def stop(self) -> None:
+        pass
+
+    def get_stats(self) -> Dict[str, Any]:
+        return {"model_name": self._model_name}
+
+    def get_cache_stats(self) -> Optional[Dict[str, Any]]:
+        return None
 
     async def generate(self, prompt: str, **kwargs) -> MockGenerationOutput:
         return MockGenerationOutput(text="Generated response.")
