@@ -130,6 +130,14 @@ class STTEngine(BaseNonStreamingEngine):
                 'Install it with: pip install "omlx[audio]"'
             ) from exc
 
+        # See engine/tts.py: mlx-audio's qwen3-asr imports samplers from
+        # mlx-lm whose @mx.compile decorator freezes RNG state inside our
+        # worker-thread executor.  Swap in the non-compile copies before
+        # any transcribe call runs (no-op when temp == 0, but matters as
+        # soon as a caller raises temperature for noisy audio).
+        from ..utils.sampling import patch_mlx_audio_samplers
+        patch_mlx_audio_samplers()
+
         model_name = self._model_name
 
         def _load_stt_sync():

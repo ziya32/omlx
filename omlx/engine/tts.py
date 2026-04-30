@@ -224,6 +224,14 @@ class TTSEngine(BaseNonStreamingEngine):
                 'Install it with: pip install "omlx[audio]"'
             ) from exc
 
+        # mlx-audio's qwen3-tts imports `categorical_sampling` etc. from
+        # mlx-lm, which are decorated with @mx.compile and fail to advance
+        # the RNG state inside our worker-thread executor — the model then
+        # mode-collapses (constant tone) or cuts off mid-utterance.  Swap
+        # in the non-compile copies before any synthesize call runs.
+        from ..utils.sampling import patch_mlx_audio_samplers
+        patch_mlx_audio_samplers()
+
         model_name = self._model_name
 
         def _load_sync():

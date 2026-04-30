@@ -165,3 +165,50 @@ def make_sampler(
         return categorical_sampling(logprobs, temp)
 
     return sampler
+
+
+# Tracks which mlx-audio modules have been patched so the swap is idempotent.
+_patched_modules: set[str] = set()
+
+
+def patch_mlx_audio_samplers() -> None:
+    """Replace mlx-audio's mx.compile-decorated sampler imports with omlx versions.
+
+    mlx-audio's qwen3-tts and qwen3-asr modules import ``categorical_sampling``,
+    ``apply_top_p``, ``apply_top_k``, ``apply_min_p``, and ``make_sampler``
+    directly from ``mlx_lm.sample_utils``. The mlx-lm versions are decorated
+    with ``@partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)``,
+    which fails to advance the RNG state in the worker-thread executor used by
+    omlx — every call returns the same token id, so qwen3-tts mode-collapses
+    to constant tones or first-sentence-then-silence outputs (and qwen3-asr
+    transcriptions degrade similarly when temperature > 0).
+
+    Swap each module's bound names for the non-compile copies in this file.
+    Idempotent and a no-op if mlx-audio isn't installed yet — call it after
+    mlx-audio modules are imported (e.g. inside engine ``start()``).
+    """
+    targets = (
+        "mlx_audio.tts.models.qwen3_tts.qwen3_tts",
+        "mlx_audio.stt.models.qwen3_asr.qwen3_asr",
+    )
+    replacements = {
+        "categorical_sampling": categorical_sampling,
+        "apply_top_p": apply_top_p,
+        "apply_top_k": apply_top_k,
+        "apply_min_p": apply_min_p,
+        "make_sampler": make_sampler,
+    }
+    import importlib
+    import sys
+
+    for target in targets:
+        if target in _patched_modules:
+            continue
+        try:
+            mod = sys.modules.get(target) or importlib.import_module(target)
+        except ImportError:
+            continue
+        for name, fn in replacements.items():
+            if hasattr(mod, name):
+                setattr(mod, name, fn)
+        _patched_modules.add(target)
