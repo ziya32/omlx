@@ -137,6 +137,9 @@ def universal_quant_predicate(
     if _is_vision_tensor(path):
         return False
 
+    if _is_audio_tensor(path):
+        return False
+
     if any(
         p in path_l
         for p in ("ssm_alpha", "ssm_beta", "a_log", "time_decay", "time_faaaa")
@@ -285,6 +288,16 @@ def _is_vision_tensor(name: str) -> bool:
             "image_norm", "temporal_embed",
         )
     )
+
+
+def _is_audio_tensor(name: str) -> bool:
+    """Check if a tensor belongs to the audio encoder.
+
+    Mirrors `_is_vision_tensor`: matches `audio_tower.*` only, not
+    `embed_audio.*` (the projection from audio output to text hidden size,
+    which is quantized like `embed_vision.embedding_projection`).
+    """
+    return "audio_tower" in name
 
 
 def _is_moe_router(path: str) -> bool:
@@ -1378,11 +1391,6 @@ def estimate_bpw_and_size(model_path: str, oq_level: int, group_size: int = 64) 
     source_total = sum(
         sf.stat().st_size for sf in source.glob("*.safetensors")
     )
-    num_shards = len(list(source.glob("*.safetensors")))
-    max_shard_size = max(
-        (sf.stat().st_size for sf in source.glob("*.safetensors")),
-        default=0,
-    )
 
     streaming_peak = int(source_total * 1.5) + 5 * 1024**3
 
@@ -1480,9 +1488,17 @@ def _build_model_sanitizer(config: dict):
             model_config.vision_config = vision_config
             model_config.text_config = text_config
 
+            # Some VLM Model.sanitize implementations (e.g. Gemma 4) drop
+            # `audio_tower.*` / `embed_audio.*` weights when `self.audio_tower`
+            # is None. Set a truthy sentinel iff the source config carries an
+            # `audio_config` so the audio modality survives sanitize and stays
+            # in the quantization pipeline.
+            has_audio = config.get("audio_config") is not None
+            _AUDIO_SENTINEL = object() if has_audio else None
+
             def _vlm_sanitize(weights):
                 class _Proxy:
-                    audio_tower = None
+                    audio_tower = _AUDIO_SENTINEL
                 proxy = _Proxy()
                 proxy.config = model_config
                 w = model_module.Model.sanitize(proxy, weights)
@@ -1497,7 +1513,8 @@ def _build_model_sanitizer(config: dict):
 
             logger.info(
                 f"Using mlx-vlm full sanitize chain for "
-                f"{model_module.Model.__name__} (preserves vision weights)"
+                f"{model_module.Model.__name__} "
+                f"(preserves vision{', audio' if has_audio else ''} weights)"
             )
             return _vlm_sanitize
         except Exception as e:
@@ -1972,7 +1989,8 @@ def quantize_oq_streaming(
     named_shapes = _collect_named_weight_shapes_from_weights(all_weights)
     if text_only:
         named_shapes = {
-            k: v for k, v in named_shapes.items() if not _is_vision_tensor(k)
+            k: v for k, v in named_shapes.items()
+            if not _is_vision_tensor(k) and not _is_audio_tensor(k)
         }
     _level_targets = _bpw_targets_for_level(oq_level)
     if _level_targets is not None:
@@ -1992,7 +2010,6 @@ def quantize_oq_streaming(
     cb("loading", 20.0)
 
     tensor_names = list(all_weights.keys())
-    total_tensors = len(tensor_names)
     out_shard_data = {}
     out_shard_idx = 0
     weight_map = {}
@@ -2013,7 +2030,9 @@ def quantize_oq_streaming(
         tensor_bytes = w_mx.nbytes
         shape = w_mx.shape
 
-        if text_only and _is_vision_tensor(tensor_name):
+        if text_only and (
+            _is_vision_tensor(tensor_name) or _is_audio_tensor(tensor_name)
+        ):
             del w_mx
             processed_bytes += tensor_bytes
             continue
@@ -2146,7 +2165,9 @@ def quantize_oq_streaming(
         output_config.pop(temp_key, None)
     if text_only:
         for key in ("vision_config", "image_token_id", "video_token_id",
-                     "vision_start_token_id", "vision_end_token_id"):
+                     "vision_start_token_id", "vision_end_token_id",
+                     "audio_config", "audio_token_id",
+                     "boa_token_id", "eoa_token_id", "eoa_token_index"):
             output_config.pop(key, None)
     # Ensure eos_token_id is present (mlx-lm adds it from tokenizer)
     if "eos_token_id" not in output_config:
