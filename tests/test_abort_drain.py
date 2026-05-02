@@ -10,13 +10,12 @@ Covers:
 """
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
+from collections import deque
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from omlx.engine_pool import EngineEntry, EnginePool, EngineState
-from omlx.request import RequestOutput
-from omlx.scheduler import SchedulerConfig
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +45,7 @@ class TestPostDecodeAbort:
         scheduler._pending_abort_ids = {"req-1"}
         scheduler.memory_monitor = None
         scheduler._deferred_clear_at = None
+        scheduler._pending_async_removes = deque()
 
         # Mock batch_generator.next() returning a response for req-1
         mock_response = MagicMock()
@@ -68,7 +68,7 @@ class TestPostDecodeAbort:
                 scheduler._pending_abort_ids.clear()
         scheduler._process_pending_aborts.side_effect = process_aborts
 
-        output = scheduler.step()
+        scheduler.step()
 
         # _process_pending_aborts should be called at least twice:
         # once at the start, once after next()
@@ -158,7 +158,6 @@ class TestStepInFlightBlocksDrain:
 
         # Mock _unload_engine to track calls
         unload_calls = []
-        original_unload = pool._unload_engine
         async def mock_unload(model_id, *, reason="unload"):
             unload_calls.append(model_id)
             entry.state = EngineState.UNLOADING
@@ -239,7 +238,6 @@ class TestDeferredCleanup:
         removed after."""
         from omlx.engine_core import EngineCore, EngineConfig
         from omlx.output_collector import RequestOutputCollector
-        from omlx.scheduler import SchedulerConfig
 
         with patch("omlx.engine_core.get_registry") as mock_registry:
             mock_registry.return_value.acquire.return_value = True
@@ -362,7 +360,6 @@ class TestTwoPhaseUnload:
 
         states_during_cleanup = []
 
-        original_sync = None
         def mock_sync_and_clear():
             # Record state during Metal sync
             states_during_cleanup.append(entry.state)
@@ -370,7 +367,7 @@ class TestTwoPhaseUnload:
 
         pool._cleanup_tasks = []
 
-        with patch("omlx.engine_pool.get_mlx_executor") as mock_executor:
+        with patch("omlx.engine_pool.get_mlx_executor"):
             loop = asyncio.get_running_loop()
 
             # Make run_in_executor call the lambda synchronously
