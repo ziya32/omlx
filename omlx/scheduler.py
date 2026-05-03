@@ -811,6 +811,55 @@ class Scheduler:
                 "Async store_cache failed for %s: %s", request_id, e
             )
 
+    def _post_save_cleanup(
+        self,
+        request_id: str,
+        block_table: Optional[Any],
+    ) -> None:
+        """Release per-request block refs + clear request entry.
+
+        Used by both submit_store_cache_async paths: the no-async-needed
+        path calls this inline, and the async path chains it via
+        ``_chain_post_save_cleanup`` after Phase 2 completes.
+        Both paged_cache_manager and block_aware_cache use RLock, so this
+        is safe to call from either the inference thread or the worker.
+        """
+        try:
+            if block_table is None and self.paged_cache_manager is not None:
+                block_table = self.paged_cache_manager.get_block_table(request_id)
+            if block_table and self.paged_cache_manager is not None:
+                self.paged_cache_manager.release_for_eviction(block_table.block_ids)
+            if self.block_aware_cache is not None:
+                self.block_aware_cache.clear_request_entry(request_id)
+        except Exception as e:
+            logger.warning(
+                "Post-save cleanup failed for %s: %s", request_id, e
+            )
+
+    def _chain_post_save_cleanup(
+        self,
+        request_id: str,
+        block_table: Optional[Any],
+        store_future: "concurrent.futures.Future",
+    ) -> None:
+        """Run ``_post_save_cleanup`` once the Phase 2 future completes.
+
+        ``add_done_callback`` runs the callback on the executor thread
+        (or inline if already done). Splitting cleanup out of the worker
+        body lets the new ``submit_store_cache_async`` path keep the same
+        post-save semantics as the legacy ``_async_store_cache_worker``.
+        """
+        def _cb(fut: "concurrent.futures.Future") -> None:
+            # Surface unexpected worker exceptions; cleanup proceeds either way.
+            exc = fut.exception()
+            if exc is not None:
+                logger.warning(
+                    "Async store_cache phase 2 raised for %s: %s",
+                    request_id, exc,
+                )
+            self._post_save_cleanup(request_id, block_table)
+        store_future.add_done_callback(_cb)
+
     def _drain_pending_async_removes(self) -> None:
         """Process deferred batch_generator.remove() calls from prior steps.
 
@@ -3992,18 +4041,38 @@ class Scheduler:
                                         mx.eval(*pre_eval_arrays)
 
                             if self._store_cache_executor is not None:
-                                store_future = self._store_cache_executor.submit(
-                                    self._async_store_cache_worker,
-                                    request_id,
-                                    token_sequence_to_store,
-                                    cache_to_store,
-                                    model_cache_config,
-                                    intermediate_snapshots,
-                                    request.vlm_extra_keys_for_cache,
-                                    request.vlm_extra_key_token_start_for_cache,
-                                    request.vlm_extra_key_ranges_for_cache,
+                                # Two-phase: register block hashes + prefix
+                                # index synchronously (so the next request's
+                                # fetch_cache hits) and submit the SSD byte
+                                # writes to the worker. reconstruct_cache
+                                # waits on each block.write_future before
+                                # reading bytes.
+                                block_table, store_future = (
+                                    self.block_aware_cache.submit_store_cache_async(
+                                        request_id,
+                                        token_sequence_to_store,
+                                        cache_to_store,
+                                        executor=self._store_cache_executor,
+                                        model_cache_config=model_cache_config,
+                                        boundary_snapshots=intermediate_snapshots,
+                                        extra_keys=request.vlm_extra_keys_for_cache,
+                                        extra_key_token_start=request.vlm_extra_key_token_start_for_cache,
+                                        extra_key_ranges=request.vlm_extra_key_ranges_for_cache,
+                                    )
                                 )
-                                self._inflight_store_futures[request_id] = store_future
+                                if store_future is not None:
+                                    self._inflight_store_futures[request_id] = store_future
+                                    # release_for_eviction + clear_request_entry
+                                    # must run after the bytes land — chain via
+                                    # done callback. Callback runs on the worker
+                                    # thread (or inline if the future is already
+                                    # done); both paths take RLocks so it's safe.
+                                    self._chain_post_save_cleanup(request_id, block_table, store_future)
+                                else:
+                                    # Nothing scheduled — do post-save cleanup
+                                    # inline so the request's blocks become
+                                    # evictable immediately.
+                                    self._post_save_cleanup(request_id, block_table)
                             else:
                                 # Executor unavailable — synchronous fallback.
                                 self._async_store_cache_worker(

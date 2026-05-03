@@ -23,17 +23,23 @@ from .interface import CacheManager
 from .paged_ssd_cache import PagedSSDCacheManager
 from .paged_cache import (
     BlockTable,
-    CacheBlock,
     PagedCacheManager,
     compute_block_hash,
     resolve_block_extra_keys,
 )
-from .stats import BaseCacheStats, PrefixCacheStats
-from .type_handlers import CacheType, CacheTypeHandler
+from .stats import PrefixCacheStats
 from .type_registry import CacheTypeRegistry
-from .hybrid_cache import ModelCacheConfig, LayerCacheConfig
+from .hybrid_cache import ModelCacheConfig
 
 logger = logging.getLogger(__name__)
+
+# How long ``reconstruct_cache`` waits for an in-flight async store_cache
+# write before declaring the block missing. Sized well above the worst
+# legitimate case (large VLM writes piled up on the single-worker store
+# executor — rarely > 10s) and well below "the user notices the server is
+# hung." Hitting it is a real bug, not normal contention. Module-level so
+# tests can lower it without patching every call site.
+WRITE_FUTURE_WAIT_S: float = 30.0
 
 
 @dataclass
@@ -631,6 +637,325 @@ class BlockAwarePrefixCache(CacheManager):
             )
 
         return block_table
+
+    def submit_store_cache_async(
+        self,
+        request_id: str,
+        tokens: List[int],
+        cache_data: List[Any],
+        executor: "Any",
+        model_cache_config: Optional[ModelCacheConfig] = None,
+        boundary_snapshots: Optional[Dict[int, List[Any]]] = None,
+        extra_keys: Optional[Tuple[Any, ...]] = None,
+        extra_key_token_start: Optional[int] = None,
+        extra_key_ranges: Optional[List[Tuple[int, Tuple[Any, ...]]]] = None,
+    ) -> Tuple[Optional[BlockTable], Optional[Any]]:
+        """Two-phase store_cache: register sync, write bytes async via executor.
+
+        Phase 1 (sync, on caller thread): allocate blocks, compute and register
+        block hashes, update prefix index. Subsequent fetch_cache calls find
+        the new blocks immediately, so the next request's prefix lookup hits.
+
+        Phase 2 (async, on executor thread): extract tensor slices and write
+        bytes to SSD. Per-block save failure flips block.write_failed = True
+        so reconstruct_cache treats the block as a missing-prefix break.
+
+        Each block allocated in Phase 1 has block.write_future set to the
+        Phase 2 future. reconstruct_cache awaits this future before reading
+        bytes.
+
+        Returns (block_table, future). future is None when there's nothing
+        to write asynchronously (e.g. all tokens already cached, no
+        SSD-eligible tensor data).
+        """
+        if not tokens:
+            return None, None
+
+        is_tensor_data = (
+            cache_data and
+            isinstance(cache_data, list) and
+            len(cache_data) > 0 and
+            isinstance(cache_data[0], dict) and
+            'state' in cache_data[0]
+        )
+
+        # Resolve cache type metadata (mirrors store_cache).
+        layer_cache_types = None
+        layer_meta_states = None
+        if model_cache_config:
+            layer_cache_types = model_cache_config.get_type_names()
+            layer_meta_states = [
+                cache_data[i].get('meta_state', ())
+                if i < len(cache_data) else ()
+                for i in range(model_cache_config.num_layers)
+            ]
+        elif is_tensor_data:
+            layer_cache_types = [
+                layer_state.get('class_name', layer_state.get('cache_type', 'KVCache'))
+                if layer_state.get('class_name', '') in ('TurboQuantKVCache', 'BatchTurboQuantKVCache')
+                else layer_state.get('cache_type', 'KVCache')
+                for layer_state in cache_data
+            ]
+            layer_meta_states = [
+                layer_state.get('meta_state', ())
+                for layer_state in cache_data
+            ]
+
+        block_table = self.paged_cache.get_block_table(request_id)
+        if not block_table:
+            block_table = self.paged_cache.create_block_table(request_id)
+
+        existing_tokens = block_table.num_tokens
+        new_tokens = tokens[existing_tokens:]
+
+        if not new_tokens:
+            self._last_partial_tokens_skipped = 0
+            self._last_tokens_to_next_block = 0
+            return block_table, None
+
+        num_new_blocks = len(new_tokens) // self.block_size
+        trailing_partial_tokens = len(new_tokens) % self.block_size
+        self._last_partial_tokens_skipped = trailing_partial_tokens
+        self._last_tokens_to_next_block = (
+            self.block_size - trailing_partial_tokens
+            if trailing_partial_tokens > 0
+            else 0
+        )
+        if trailing_partial_tokens > 0:
+            self._partial_block_skips += 1
+            self._partial_tokens_skipped += trailing_partial_tokens
+
+        cache_seq_len = (
+            self._get_cache_seq_len(cache_data)
+            if (is_tensor_data and HAS_MLX and self.paged_ssd_cache is not None)
+            else 0
+        )
+
+        # Phase-2 specs: one per newly-allocated block (skip dedup hits).
+        save_specs: List[Dict[str, Any]] = []
+
+        for i in range(num_new_blocks):
+            start_idx = i * self.block_size
+            end_idx = min(start_idx + self.block_size, len(new_tokens))
+            block_tokens = new_tokens[start_idx:end_idx]
+
+            global_start = existing_tokens + start_idx
+            global_end = existing_tokens + end_idx
+
+            parent_hash = None
+            if block_table.block_ids:
+                prev_block_id = block_table.block_ids[-1]
+                prev_block = self.paged_cache.allocated_blocks.get(prev_block_id)
+                if prev_block and prev_block.block_hash:
+                    parent_hash = prev_block.block_hash
+
+            block_extra_keys = resolve_block_extra_keys(
+                global_end,
+                extra_keys=extra_keys,
+                extra_key_token_start=extra_key_token_start,
+                extra_key_ranges=extra_key_ranges,
+            )
+
+            # Dedup: reuse block if hash already present.
+            if len(block_tokens) == self.block_size:
+                existing_block = self.paged_cache.find_cached_block(
+                    block_tokens,
+                    parent_hash,
+                    extra_keys=block_extra_keys,
+                )
+                if existing_block:
+                    self.paged_cache.increment_ref(existing_block.block_id)
+                    block_table.block_ids.append(existing_block.block_id)
+                    block_table.num_tokens += len(block_tokens)
+                    continue
+
+            # Allocate new block.
+            block = self.paged_cache.allocate_block()
+            if not block:
+                if not self.paged_cache.handle_memory_pressure(1):
+                    logger.warning(f"Cannot allocate block for {request_id}")
+                    break
+                block = self.paged_cache.allocate_block()
+                if not block:
+                    break
+
+            # Reset write tracking — block may have been recycled from a
+            # previous request whose async write completed (success or fail).
+            block.write_future = None
+            block.write_failed = False
+
+            block.token_count = len(block_tokens)
+            block_table.block_ids.append(block.block_id)
+            block_table.num_tokens += len(block_tokens)
+
+            block.block_hash = compute_block_hash(
+                parent_hash, block_tokens,
+                extra_keys=block_extra_keys, model_name=self.paged_cache.model_name,
+            )
+
+            if len(block_tokens) == self.block_size:
+                self.paged_cache.register_block_hash(
+                    block, block_tokens, parent_hash, extra_keys=block_extra_keys,
+                )
+
+            # Capture Phase 2 args for SSD-eligible blocks.
+            if is_tensor_data and HAS_MLX and self.paged_ssd_cache is not None:
+                cache_uses_global_indices = (
+                    existing_tokens > 0 and cache_seq_len >= (existing_tokens + 1)
+                )
+                cache_start = global_start if cache_uses_global_indices else start_idx
+                cache_end = global_end if cache_uses_global_indices else end_idx
+
+                if cache_seq_len > 0 and cache_start >= cache_seq_len:
+                    # Continuity broken — drop this block (nothing scheduled yet).
+                    if __debug__:
+                        logger.debug(
+                            f"Cache continuity broken for {request_id}: "
+                            f"cache_seq_len={cache_seq_len} cache_start={cache_start}, "
+                            f"freeing block {block.block_id}"
+                        )
+                    self.paged_cache.free_block(block.block_id)
+                    block_table.block_ids.pop()
+                    block_table.num_tokens -= len(block_tokens)
+                    break
+
+                is_last_block = (i == num_new_blocks - 1)
+                block_boundary_tc = existing_tokens + end_idx
+                snapshot_cache_data = None
+                if boundary_snapshots and block_boundary_tc in boundary_snapshots:
+                    snapshot_cache_data = boundary_snapshots[block_boundary_tc]
+
+                save_specs.append({
+                    'block': block,
+                    'cache_start': cache_start,
+                    'cache_end': cache_end,
+                    'is_last_block': is_last_block,
+                    'snapshot_cache_data': snapshot_cache_data,
+                })
+
+        # Update prefix index + request table sync so the next fetch_cache
+        # finds the new blocks immediately.
+        self._update_prefix_index(tokens, block_table.block_ids, extra_keys=extra_keys)
+        self._request_tables[request_id] = BlockCacheEntry(
+            block_table=block_table,
+            last_access=time.time(),
+        )
+
+        if not save_specs:
+            if __debug__:
+                logger.debug(
+                    f"submit_store_cache_async for {request_id}: "
+                    f"no SSD writes scheduled (block_ids={block_table.block_ids})"
+                )
+            return block_table, None
+
+        save_future = executor.submit(
+            self._save_blocks_phase2,
+            save_specs,
+            cache_data,
+            layer_cache_types,
+            layer_meta_states,
+            model_cache_config,
+            request_id,
+        )
+
+        # Tag every newly allocated block so reconstruct_cache waits for the
+        # bytes before reading. Dedup hits keep their existing future (set by
+        # whichever request originally allocated them).
+        for spec in save_specs:
+            spec['block'].write_future = save_future
+
+        if __debug__:
+            logger.debug(
+                f"submit_store_cache_async for {request_id}: scheduled "
+                f"{len(save_specs)} block(s), block_ids={block_table.block_ids}"
+            )
+
+        return block_table, save_future
+
+    def _save_blocks_phase2(
+        self,
+        save_specs: List[Dict[str, Any]],
+        cache_data: List[Any],
+        layer_cache_types: Optional[List[str]],
+        layer_meta_states: Optional[List[Any]],
+        model_cache_config: Optional[ModelCacheConfig],
+        request_id: str,
+    ) -> int:
+        """Phase 2 worker for ``submit_store_cache_async``.
+
+        Runs on the executor thread. Extracts tensor slices and writes bytes
+        to SSD for each spec. On per-spec failure, flips block.write_failed
+        = True so reconstruct_cache treats the block as missing instead of
+        attempting a load that will only return None.
+
+        Returns the number of blocks saved successfully (for diagnostics).
+        """
+        saved = 0
+        for spec in save_specs:
+            block = spec['block']
+            try:
+                block_kv_data = self._extract_block_tensor_slice(
+                    cache_data,
+                    spec['cache_start'],
+                    spec['cache_end'],
+                    model_cache_config,
+                    is_last_block=spec['is_last_block'],
+                    snapshot_cache_data=spec['snapshot_cache_data'],
+                )
+                if not block_kv_data or not block.block_hash:
+                    logger.warning(
+                        "Phase 2 extract failed for block %s req=%s",
+                        block.block_id, request_id,
+                    )
+                    block.write_failed = True
+                    continue
+
+                block_meta = layer_meta_states
+                snapshot_cache_data = spec['snapshot_cache_data']
+                if snapshot_cache_data is not None and layer_meta_states is not None:
+                    per_block = []
+                    for lidx in range(len(layer_meta_states)):
+                        if (
+                            lidx < len(snapshot_cache_data)
+                            and isinstance(snapshot_cache_data[lidx], dict)
+                            and snapshot_cache_data[lidx].get("meta_state")
+                            and snapshot_cache_data[lidx]["meta_state"] != ()
+                        ):
+                            per_block.append(snapshot_cache_data[lidx]["meta_state"])
+                        else:
+                            per_block.append(layer_meta_states[lidx])
+                    block_meta = per_block
+
+                ok = self.paged_ssd_cache.save_block(
+                    block_hash=block.block_hash,
+                    cache_data=block_kv_data,
+                    token_count=block.token_count,
+                    model_name=self.paged_cache.model_name,
+                    layer_cache_types=layer_cache_types,
+                    layer_meta_states=block_meta,
+                )
+                if ok:
+                    saved += 1
+                else:
+                    logger.warning(
+                        "Failed to save block %s to SSD for %s",
+                        block.block_id, request_id,
+                    )
+                    block.write_failed = True
+            except Exception as exc:
+                logger.warning(
+                    "Phase 2 exception for block %s req=%s: %s",
+                    block.block_id, request_id, exc,
+                )
+                block.write_failed = True
+
+        if __debug__:
+            logger.debug(
+                "Phase 2 stored cache for %s: %d/%d blocks saved",
+                request_id, saved, len(save_specs),
+            )
+        return saved
 
     def _get_cache_seq_len(self, cache_data: List[Dict[str, Any]]) -> int:
         """
@@ -1313,6 +1638,49 @@ class BlockAwarePrefixCache(CacheManager):
                         )
                     break  # Stop here, use valid prefix
 
+                # If submit_store_cache_async tagged this block with an
+                # in-flight write future, wait for it before reading bytes.
+                # The 30s timeout is well above the worst legitimate case
+                # (large VLM writes piled up on the single-worker executor)
+                # and well below "the user notices the server is hung."
+                # Hitting it means a real worker stall — log loud and fall
+                # back to treating this as a missing prefix block.
+                wf = block.write_future
+                if wf is not None and not wf.done():
+                    import concurrent.futures as _cf
+                    # Look up the timeout at call time so tests can lower
+                    # the module-level constant without patching here.
+                    wait_s = globals().get("WRITE_FUTURE_WAIT_S", 30.0)
+                    try:
+                        wf.result(timeout=wait_s)
+                    except _cf.TimeoutError:
+                        logger.error(
+                            "store_cache worker did not finish block %s "
+                            "within %.1fs — treating as missing prefix. "
+                            "This indicates a worker stall, not normal contention.",
+                            block_id, wait_s,
+                        )
+                        break
+                    except Exception as exc:
+                        logger.warning(
+                            "Async store_cache for block %s raised: %s — "
+                            "treating as missing prefix.",
+                            block_id, exc,
+                        )
+                        break
+
+                if block.write_failed:
+                    if __debug__:
+                        logger.debug(
+                            f"Block {block_id} async write failed, "
+                            f"using {valid_block_count} valid blocks"
+                        )
+                    if block.block_hash is not None:
+                        self.paged_cache.cached_block_hash_to_block.pop(
+                            block.block_hash, block.block_id
+                        )
+                    break
+
                 # Load with metadata for type information
                 block_data, block_metadata = self.paged_ssd_cache.load_block_with_metadata(
                     block.block_hash
@@ -1462,13 +1830,6 @@ class BlockAwarePrefixCache(CacheManager):
                         f"{new_count} block(s) ({valid_token_count} tokens)"
                     )
 
-            # Build model cache config if we have type info
-            model_cache_config = None
-            if layer_cache_types and len(layer_cache_types) == num_layers:
-                model_cache_config = ModelCacheConfig.from_type_list(
-                    layer_cache_types, model_name=""
-                )
-
             # Reconstruct caches for each layer
             reconstructed_caches = []
 
@@ -1599,7 +1960,7 @@ class BlockAwarePrefixCache(CacheManager):
                     for s in value_states[1:]:
                         cat_vs = _concat_state(cat_vs, s)
                     try:
-                        from mlx_vlm.turboquant import TurboQuantKVCache, _build_codec
+                        from mlx_vlm.turboquant import TurboQuantKVCache
                         from mlx_lm.models.cache import KVCache
                         tq_bits = 4.0
                         tq_seed = 0

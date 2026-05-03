@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, NewType, Optional, Tuple
 
 from .interface import CacheManager
-from .stats import BaseCacheStats, PagedCacheStats
+from .stats import PagedCacheStats
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +160,15 @@ class CacheBlock:
     # Metadata
     token_count: int = 0
     last_access: float = field(default_factory=time.time)
+
+    # Async write tracking. Set by submit_store_cache_async at allocation
+    # time so reconstruct_cache can wait for the SSD bytes before reading
+    # them. None means the block is fully written (or was written sync).
+    # write_failed flips to True if Phase 2 save_block returned False or
+    # raised; reconstruct_cache then treats the block as a missing prefix
+    # break instead of attempting a load that will only return None.
+    write_future: Optional[Any] = None
+    write_failed: bool = False
 
     def is_full(self, block_size: int) -> bool:
         """Check if block is at capacity."""
@@ -1302,7 +1311,7 @@ class PagedCacheManager(CacheManager):
     # =========================================================================
 
     @property
-    def free_blocks(self) -> int:
+    def free_blocks(self) -> int:  # noqa: F811 -- shadows the legacy free_blocks(blocks) method (no callers); property wins at runtime
         """Number of free blocks available."""
         return self.free_block_queue.num_free_blocks
 
@@ -1487,7 +1496,7 @@ class PagedCacheManager(CacheManager):
                 return False
 
             if block.is_null:
-                logger.warning(f"Cannot mark null block")
+                logger.warning("Cannot mark null block")
                 return False
 
             # In paged SSD-only mode, data is already on paged SSD
@@ -1531,7 +1540,7 @@ class PagedCacheManager(CacheManager):
                 return False
 
             if block.is_null:
-                logger.warning(f"Cannot evict null block")
+                logger.warning("Cannot evict null block")
                 return False
 
             # Remove from hash cache

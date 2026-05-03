@@ -7,16 +7,12 @@ PagedCacheManager for block-based storage with SSD persistence.
 """
 
 import time
-from pathlib import Path
-from typing import Any, Dict, List, Optional
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock
 
 import pytest
 
 from omlx.cache.paged_cache import (
-    BlockHash,
     BlockTable,
-    CacheBlock,
     PagedCacheManager,
     compute_block_hash,
 )
@@ -2413,3 +2409,553 @@ class TestPerBlockMetaStates:
             f"Last block should use snapshot offset=8, not shared offset=11, "
             f"got {b2_meta[1]}"
         )
+
+
+class TestSubmitStoreCacheAsync:
+    """Tests for the two-phase async store_cache that fixes the
+    cold-prefill cache miss when Turn N+1's prefix lookup races Turn N's
+    deferred SSD write (omlx commit 22440be regression)."""
+
+    @pytest.fixture
+    def mx(self):
+        try:
+            import mlx.core as mx
+            return mx
+        except ImportError:
+            pytest.skip("MLX not available")
+
+    @pytest.fixture
+    def paged_cache(self):
+        return PagedCacheManager(
+            block_size=4,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+
+    def _build_cache(self, paged_cache, save_block_return=True):
+        """Build a BlockAwarePrefixCache wired to a mock SSD."""
+        from unittest.mock import MagicMock
+        mock_ssd = MagicMock()
+        mock_ssd.save_block.return_value = save_block_return
+        mock_ssd.load_block_with_metadata.return_value = (
+            None, {"model_name": "test-model", "num_layers": 1},
+        )
+        model = MockModel(num_layers=1)
+        cache = BlockAwarePrefixCache(
+            model=model,
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=mock_ssd,
+        )
+        return cache, mock_ssd
+
+    def _build_cache_data(self, mx, num_tokens: int):
+        """Two-token-dim KVCache state large enough for slicing tests."""
+        return [
+            {
+                "state": (
+                    mx.ones((1, 8, num_tokens, 64)),
+                    mx.ones((1, 8, num_tokens, 64)),
+                ),
+                "cache_type": "KVCache",
+                "class_name": "KVCache",
+            }
+        ]
+
+    def test_phase1_registers_blocks_synchronously(self, paged_cache, mx):
+        """fetch_cache MUST hit on the same prefix immediately after
+        submit_store_cache_async returns, even before Phase 2 finishes —
+        this is the whole point of the fix."""
+        import concurrent.futures
+        import threading
+
+        cache, mock_ssd = self._build_cache(paged_cache)
+        # Block save_block until we say so so Phase 2 stays in flight.
+        gate = threading.Event()
+        def _slow_save(**kwargs):
+            gate.wait(timeout=10)
+            return True
+        mock_ssd.save_block.side_effect = _slow_save
+
+        tokens = list(range(8))  # 2 full blocks
+        cache_data = self._build_cache_data(mx, num_tokens=8)
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            block_table, future = cache.submit_store_cache_async(
+                "req-1", tokens, cache_data, executor=executor,
+            )
+            assert block_table is not None
+            assert len(block_table.block_ids) == 2
+            assert future is not None
+            assert not future.done(), "Phase 2 should still be in flight"
+
+            # Phase 1 effect: a fresh fetch on the same prefix finds the blocks.
+            hit_table, remaining = cache.fetch_cache("req-2", tokens)
+            assert hit_table is not None, "fetch_cache should hit immediately"
+            assert hit_table.num_tokens == 8
+            assert remaining == []
+
+            # Each newly allocated block carries the future.
+            for bid in block_table.block_ids:
+                blk = paged_cache.allocated_blocks[bid]
+                assert blk.write_future is future
+                assert blk.write_failed is False
+        finally:
+            gate.set()
+            executor.shutdown(wait=True)
+
+    def test_reconstruct_waits_for_pending_write(self, paged_cache, mx):
+        """reconstruct_cache must block on block.write_future before
+        attempting load_block_with_metadata."""
+        import concurrent.futures
+        import threading
+
+        cache, mock_ssd = self._build_cache(paged_cache)
+        gate = threading.Event()
+        save_observed_at = []
+        load_observed_at = []
+
+        def _slow_save(**kwargs):
+            save_observed_at.append(time.monotonic())
+            gate.wait(timeout=10)
+            return True
+        def _load(block_hash):
+            load_observed_at.append(time.monotonic())
+            # After save unblocks, return a minimal-but-valid block payload.
+            # reconstruct_cache only checks "block_data is None" to decide
+            # the load failed; non-None is enough for the wait-then-load
+            # ordering assertion we care about here.
+            return ([{"state": (mx.ones((1, 8, 4, 64)), mx.ones((1, 8, 4, 64))),
+                       "cache_type": "KVCache"}],
+                    {"model_name": "test-model", "num_layers": 1,
+                     "layer_cache_types": ["KVCache"], "layer_meta_states": [()]})
+        mock_ssd.save_block.side_effect = _slow_save
+        mock_ssd.load_block_with_metadata.side_effect = _load
+
+        tokens = list(range(8))
+        cache_data = self._build_cache_data(mx, num_tokens=8)
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            block_table, future = cache.submit_store_cache_async(
+                "req-1", tokens, cache_data, executor=executor,
+            )
+            assert future is not None
+
+            # Kick off reconstruct on a background thread; release the save gate
+            # after a short wait so we can prove reconstruct waited.
+            recon_done = threading.Event()
+            def _recon():
+                cache.reconstruct_cache(block_table)
+                recon_done.set()
+            t = threading.Thread(target=_recon, daemon=True)
+            t.start()
+
+            # Give reconstruct a moment to enter the wait.
+            time.sleep(0.1)
+            assert not recon_done.is_set(), "reconstruct must not return until write completes"
+
+            gate.set()
+            t.join(timeout=5)
+            assert recon_done.is_set(), "reconstruct should finish once write is done"
+
+            # save_block was observed before any load_block_with_metadata —
+            # i.e. the wait actually held off the load.
+            assert save_observed_at, "save_block should have been called"
+            assert load_observed_at, "load_block_with_metadata should have been called"
+            assert load_observed_at[0] >= save_observed_at[0], (
+                "reconstruct loaded bytes before the save started — wait broke"
+            )
+        finally:
+            gate.set()
+            executor.shutdown(wait=True)
+
+    def test_reconstruct_times_out_on_stuck_writer(self, paged_cache, mx, monkeypatch):
+        """If the write_future never completes, reconstruct must hit the
+        timeout, log loud, and treat the block as a missing prefix break."""
+        import concurrent.futures
+        from omlx.cache import prefix_cache as pc_mod
+
+        # Shorten the wait so the test runs in <1s.
+        monkeypatch.setattr(pc_mod, "WRITE_FUTURE_WAIT_S", 0.2)
+
+        cache, mock_ssd = self._build_cache(paged_cache)
+
+        # Build a block_table with one block tagged with a future that
+        # never completes.
+        tokens = list(range(4))
+        block_table = paged_cache.create_block_table("req-stuck")
+        block = paged_cache.allocate_block()
+        block.token_count = 4
+        block.block_hash = compute_block_hash(None, tokens, model_name="test-model")
+        paged_cache.register_block_hash(block, tokens, None)
+        block_table.block_ids.append(block.block_id)
+        block_table.num_tokens = 4
+
+        never_done = concurrent.futures.Future()
+        block.write_future = never_done
+
+        result = cache.reconstruct_cache(block_table)
+
+        # Reconstruct breaks on the stuck block with no valid prefix preceding
+        # it — same outcome as a missing block. ``load_block_with_metadata``
+        # must NOT have been called (we'd have served stale/empty bytes).
+        assert result is None, "stuck writer should not produce a reconstructed cache"
+        mock_ssd.load_block_with_metadata.assert_not_called()
+        # The future is still pending (we did not cancel it); cleanup.
+        never_done.cancel()
+
+    def test_reconstruct_treats_write_failed_as_missing(self, paged_cache, mx):
+        """When Phase 2 marks block.write_failed=True (e.g. save_block
+        returned False), reconstruct breaks at that block."""
+        import concurrent.futures
+
+        cache, mock_ssd = self._build_cache(paged_cache, save_block_return=False)
+        tokens = list(range(8))
+        cache_data = self._build_cache_data(mx, num_tokens=8)
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            block_table, future = cache.submit_store_cache_async(
+                "req-fail", tokens, cache_data, executor=executor,
+            )
+            assert future is not None
+            future.result(timeout=5)  # let Phase 2 finish
+
+            for bid in block_table.block_ids:
+                blk = paged_cache.allocated_blocks[bid]
+                assert blk.write_failed is True
+
+            # First failed block aborts reconstruction; with no preceding
+            # valid blocks, reconstruct returns None.
+            result = cache.reconstruct_cache(block_table)
+            assert result is None
+            mock_ssd.load_block_with_metadata.assert_not_called()
+        finally:
+            executor.shutdown(wait=True)
+
+    def test_reconstruct_skips_wait_when_future_done(self, paged_cache, mx):
+        """When write_future.done() is True, reconstruct must not call
+        result() — steady-state lookups pay zero latency from this fix."""
+        import concurrent.futures
+
+        cache, mock_ssd = self._build_cache(paged_cache)
+        tokens = list(range(8))
+        cache_data = self._build_cache_data(mx, num_tokens=8)
+
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            block_table, future = cache.submit_store_cache_async(
+                "req-1", tokens, cache_data, executor=executor,
+            )
+            assert future is not None
+            future.result(timeout=5)  # Phase 2 done; future.done() == True
+
+            # Replace each block's future with a sentinel whose .result()
+            # would explode if called. .done() is the only legal check on
+            # the wait path when state is settled — exercising .result()
+            # would mean the fast-path short-circuit broke.
+            class _ExplodingFuture:
+                def done(self): return True
+                def result(self, timeout=None):
+                    raise AssertionError(
+                        "reconstruct should not call result() on a done future"
+                    )
+            for bid in block_table.block_ids:
+                paged_cache.allocated_blocks[bid].write_future = _ExplodingFuture()
+
+            # Don't care whether downstream reconstruction succeeds (mocked
+            # block bytes won't survive the real concatenate code path) —
+            # only that reconstruct made it past the wait into the loader.
+            cache.reconstruct_cache(block_table)
+            assert mock_ssd.load_block_with_metadata.call_count >= 1, (
+                "reconstruct never reached load_block_with_metadata — "
+                "the .done() short-circuit appears to have broken"
+            )
+        finally:
+            executor.shutdown(wait=True)
+
+    def test_no_async_work_returns_none_future(self, paged_cache, mx):
+        """When tokens fit in trailing-partial blocks only, no Phase 2
+        work is scheduled and the returned future is None."""
+        import concurrent.futures
+
+        cache, _mock_ssd = self._build_cache(paged_cache)
+        tokens = [1, 2, 3]  # < block_size=4 -> 0 full blocks
+        cache_data = self._build_cache_data(mx, num_tokens=3)
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            block_table, future = cache.submit_store_cache_async(
+                "req-1", tokens, cache_data, executor=executor,
+            )
+            assert block_table is not None
+            assert len(block_table.block_ids) == 0
+            assert future is None
+        finally:
+            executor.shutdown(wait=True)
+
+
+class TestRegression_22440be_BackToBackPrefixCacheHit:
+    """Regression test for the async store_cache race introduced by 22440be.
+
+    Background: 22440be ("perf(cache): Async store_cache and SSD evict
+    unlink off inference thread") moved the post-finish KV write to a
+    worker thread — a real win on its own, ~96% reduction in main-thread
+    store_cache time. But it also moved the IN-MEMORY block-hash
+    registration to the worker thread. The next request's fetch_cache
+    then raced the in-flight worker: if Request B started before Request
+    A's worker finished, B's fetch_cache MISSED on a prefix that was
+    logically written but not yet visible. B re-paid full cold prefill.
+
+    The integration symptom was a 77% regression on the nanobot cold-chat
+    e2e (197s → 348s). Both Turn 1 and Turn 2 of "hello" paid cold
+    prefill cost because Turn 2's admission ran before Turn 1's worker
+    had registered the cache — see commit message of the fix for details.
+
+    The fix splits store_cache into Phase 1 (sync metadata register,
+    runs on inference thread) and Phase 2 (async byte write, runs on
+    executor). Phase 1 makes the prefix immediately visible to subsequent
+    fetch_cache; Phase 2's per-block future is awaited inside
+    reconstruct_cache before bytes are read.
+
+    This test pins the post-fix contract end-to-end. It WILL FAIL if a
+    future change moves the metadata register back behind the executor,
+    skips the per-block wait in reconstruct, or otherwise regresses the
+    "back-to-back requests hit prefix cache" guarantee.
+    """
+
+    @pytest.fixture
+    def mx(self):
+        try:
+            import mlx.core as mx
+            return mx
+        except ImportError:
+            pytest.skip("MLX not available")
+
+    def test_request_b_hits_prefix_cache_while_request_a_write_inflight(self, mx):
+        """The smoking-gun scenario: A finishes, A's bytes are still being
+        written, B arrives with the same prefix, B must hit the cache."""
+        import concurrent.futures
+        import threading
+        from unittest.mock import MagicMock
+
+        block_size = 4
+        paged_cache = PagedCacheManager(
+            block_size=block_size,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+
+        # A controllable SSD: writes block on a gate (simulates slow
+        # worker), reads return realistic-ish payload metadata so we can
+        # observe the load-vs-write ordering.
+        write_gate = threading.Event()
+        write_observed_at: list = []
+        load_observed_at: list = []
+
+        ssd = MagicMock()
+        def _slow_save(**_kwargs):
+            write_observed_at.append(time.monotonic())
+            # Block until the test releases — simulates a worker that
+            # hasn't finished writing bytes when B arrives.
+            assert write_gate.wait(timeout=10), "test bug: gate never set"
+            return True
+        def _load(block_hash):
+            load_observed_at.append(time.monotonic())
+            # Returning None makes reconstruct_cache treat as missing —
+            # which is exactly the failure mode we want to NOT see.
+            # Return a non-None payload so reconstruct can complete.
+            return (
+                [
+                    {
+                        "state": (
+                            mx.ones((1, 8, block_size, 64)),
+                            mx.ones((1, 8, block_size, 64)),
+                        ),
+                        "cache_type": "KVCache",
+                    }
+                ],
+                {
+                    "model_name": "test-model",
+                    "num_layers": 1,
+                    "layer_cache_types": ["KVCache"],
+                    "layer_meta_states": [()],
+                },
+            )
+        ssd.save_block.side_effect = _slow_save
+        ssd.load_block_with_metadata.side_effect = _load
+
+        cache = BlockAwarePrefixCache(
+            model=MockModel(num_layers=1),
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=ssd,
+        )
+
+        # Request A finishes, hands its prefill cache to the worker.
+        # Use a real ThreadPoolExecutor (max_workers=1, mirroring the
+        # production scheduler) so Phase 2 lands on a different thread
+        # and sits behind the gate.
+        tokens = list(range(block_size * 2))  # 2 full blocks
+        cache_data = [
+            {
+                "state": (
+                    mx.ones((1, 8, len(tokens), 64)),
+                    mx.ones((1, 8, len(tokens), 64)),
+                ),
+                "cache_type": "KVCache",
+                "class_name": "KVCache",
+            }
+        ]
+        executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="omlx-store-cache-test",
+        )
+        try:
+            block_table_a, future_a = cache.submit_store_cache_async(
+                "req-a", tokens, cache_data, executor=executor,
+            )
+            assert future_a is not None
+            assert not future_a.done(), (
+                "Phase 2 worker should be sitting on the write gate; if it "
+                "already finished, the test no longer exercises the race"
+            )
+
+            # === Regression assertion #1 ===
+            # Request B's admission. fetch_cache MUST hit on the same
+            # prefix even though A's bytes haven't landed. Pre-fix code
+            # missed here because metadata register was deferred to the
+            # worker.
+            block_table_b, remaining = cache.fetch_cache("req-b", tokens)
+            assert block_table_b is not None, (
+                "REGRESSION: fetch_cache missed the prefix that Request A "
+                "wrote. Phase 1 metadata register is no longer synchronous — "
+                "back-to-back chats will pay duplicate cold prefill."
+            )
+            assert block_table_b.num_tokens == len(tokens)
+            assert remaining == []
+
+            # === Regression assertion #2 ===
+            # reconstruct_cache for B must wait for A's worker before
+            # reading bytes. Run reconstruct in a background thread, prove
+            # it's blocked on the gate, then release.
+            recon_done = threading.Event()
+            recon_result: list = []
+            def _recon():
+                recon_result.append(cache.reconstruct_cache(block_table_b))
+                recon_done.set()
+            t = threading.Thread(target=_recon, daemon=True)
+            t.start()
+
+            # Give reconstruct a moment to enter the wait. If the wait
+            # was skipped, recon_done would already be set.
+            time.sleep(0.1)
+            assert not recon_done.is_set(), (
+                "REGRESSION: reconstruct_cache returned before the in-flight "
+                "write finished. Per-block wait on block.write_future is "
+                "missing — Request B will read torn / empty bytes."
+            )
+
+            # Release the worker and let reconstruct complete.
+            write_gate.set()
+            t.join(timeout=5)
+            assert recon_done.is_set(), "reconstruct should finish once write completes"
+
+            # === Regression assertion #3 ===
+            # Ordering: save happened before load. If load_observed_at[0]
+            # < write_observed_at[0], the wait broke and reconstruct
+            # racy-read the SSD before bytes were there. We don't assert
+            # the final reconstructed cache is non-None — the mocked
+            # block payload doesn't survive MLX's real concatenate, and
+            # the load ordering above is the actual race signal.
+            assert write_observed_at, "save_block was never called"
+            assert load_observed_at, "load_block_with_metadata was never called"
+            assert load_observed_at[0] >= write_observed_at[0], (
+                "REGRESSION: reconstruct loaded SSD bytes BEFORE the write "
+                "started. The wait on block.write_future is broken or skipped."
+            )
+        finally:
+            write_gate.set()
+            executor.shutdown(wait=True)
+
+    def test_legacy_store_cache_via_executor_misses_fetch_window(self, mx):
+        """Demonstrate that the PRE-FIX pattern (store_cache submitted
+        whole-hog to a worker thread) WOULD lose the fetch_cache window
+        — confirms this regression test class actually catches the bug.
+
+        Replays the historical broken behavior: submit ``store_cache``
+        (the original method, single function) to the executor; while it
+        sits behind a gate, fetch_cache for the same prefix returns a
+        MISS. This is exactly the failure mode 22440be introduced and
+        ``submit_store_cache_async`` fixed.
+
+        If a future change tries to "simplify" by routing back through
+        the single-function store_cache on the executor, the regression
+        test above catches the resulting cache miss.
+        """
+        import concurrent.futures
+        import threading
+        from unittest.mock import MagicMock
+
+        block_size = 4
+        paged_cache = PagedCacheManager(
+            block_size=block_size,
+            max_blocks=100,
+            model_name="test-model",
+            initial_blocks=100,
+        )
+        write_gate = threading.Event()
+        ssd = MagicMock()
+        def _slow_save(**_kwargs):
+            assert write_gate.wait(timeout=10)
+            return True
+        ssd.save_block.side_effect = _slow_save
+        cache = BlockAwarePrefixCache(
+            model=MockModel(num_layers=1),
+            paged_cache_manager=paged_cache,
+            paged_ssd_cache_manager=ssd,
+        )
+
+        tokens = list(range(block_size * 2))
+        cache_data = [
+            {
+                "state": (
+                    mx.ones((1, 8, len(tokens), 64)),
+                    mx.ones((1, 8, len(tokens), 64)),
+                ),
+                "cache_type": "KVCache",
+                "class_name": "KVCache",
+            }
+        ]
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            # Pre-fix pattern: whole-hog submit. Metadata register is
+            # blocked behind the gate inside the worker.
+            future = executor.submit(
+                cache.store_cache, "req-a", tokens, cache_data,
+            )
+            # Give the worker a moment to enter the gate.
+            time.sleep(0.05)
+            assert not future.done(), "worker should be sitting on the gate"
+
+            # Simulate Request B's admission: same prefix, different ID.
+            block_table_b, remaining_b = cache.fetch_cache("req-b", tokens)
+
+            # This is the bug 22440be introduced. store_cache walks
+            # blocks sequentially: register hash 1 -> save 1 -> register
+            # hash 2 -> save 2 -> ... With save 1 stuck on the gate,
+            # only block 1's hash made it into the index. fetch_cache
+            # then partial-hits block 1 and misses everything after,
+            # so Request B has to re-prefill most of the prefix. The
+            # post-fix submit_store_cache_async registers ALL hashes up
+            # front before any save runs — fetch_cache hits the full
+            # prefix even mid-write.
+            hit_tokens = block_table_b.num_tokens if block_table_b else 0
+            assert hit_tokens < len(tokens), (
+                f"Sanity check: legacy pattern should NOT hit the full "
+                f"prefix while the worker is still mid-write. Got {hit_tokens}"
+                f"/{len(tokens)} tokens — if this is the full prefix, the "
+                f"executor scheduled both register+save eagerly enough that "
+                f"the race window closed; adjust the gate timing."
+            )
+        finally:
+            write_gate.set()
+            executor.shutdown(wait=True)
