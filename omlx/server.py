@@ -165,6 +165,7 @@ from .exceptions import (
     ModelLoadingError,
     ModelNotFoundError,
     ModelTooLargeError,
+    RequestAbortedError,
     SchedulerQueueFullError,
 )
 from .model_discovery import format_size
@@ -554,6 +555,34 @@ async def scheduler_queue_full_handler(
         content=content,
         headers={"Retry-After": "1"},
     )
+
+
+@app.exception_handler(RequestAbortedError)
+async def request_aborted_handler(
+    request: FastAPIRequest, exc: RequestAbortedError
+):
+    """Translate in-flight request aborts to HTTP 503.
+
+    Typical trigger: the process memory enforcer called
+    abort_all_requests() on an engine the handler was mid-call on,
+    so EngineCore.generate() raised RequestAbortedError with the
+    abort message. This handler only fires for non-streaming paths —
+    streaming paths deliver the error inside the SSE stream with
+    finish_reason="error" and terminate cleanly, because headers are
+    already flushed by the time the abort arrives.
+    """
+    message = str(exc) or "Request aborted"
+    logger.warning(
+        "%s %s → 503 (request aborted): %s",
+        request.method,
+        request.url.path,
+        message,
+    )
+    if _is_api_route(request):
+        content = _openai_error_body(message, 503)
+    else:
+        content = {"detail": message}
+    return JSONResponse(status_code=503, content=content)
 
 
 @app.exception_handler(Exception)
