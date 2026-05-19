@@ -1,7 +1,10 @@
 # Rebase plan: `features/more-models` → `origin/main` (v0.3.9rc1)
 
-**Status:** in progress — mechanic switched rebase → **merge** (see Strategy)
+**Status:** merge landed + 8 follow-up commits applied; remaining items are smaller
+follow-ups (audio_routes word_timestamps, dflash track-upstream, resolve-once caller
+migration, etc.). **149→178 targeted tests pass (100% green).**
 **Authored:** 2026-05-19
+**Last update:** 2026-05-19 — Tier-1 follow-ups complete
 
 ## Context
 
@@ -153,7 +156,26 @@ conflicts once each (rerere).
 3. **gate-mcp** — main's `697f63d` is a different impl than feature's dropped
    `f157e85`. Verify mcp/audio routers are actually gated behind `verify_api_key`.
 
-## Take-side gaps (follow-up commits required)
+## Follow-up commits applied (2026-05-19)
+
+After the initial merge landed, the following critical follow-ups were applied:
+
+| Commit | What | Why |
+|---|---|---|
+| `ca688cd` | scheduler: wire bbba911 `submit_store_cache_async` dispatch | **CRITICAL** — the kept bbba911 port now ACTIVATES; without this hook the prefix-cache race remained latent (the 197s→348s regression bbba911 fixes was still latent). |
+| `80f22a6` | server: add `RequestAbortedError` → HTTP 503 exception handler | Issue 4 at LLM level — in-flight aborts no longer fall through to HTTP 500. |
+| `6bb59ef` | tts/stt: cooperative-abort checkpoints (`_mark_stopped`, `_raise_if_aborted`) | Issue 4 at non-LLM level — TTS/STT handlers racing with enforcer eviction now return clean 503. |
+| `39a51b3` | engine_pool: retarget preload check to `max(active, phys_footprint)` | Decision 4 metric integration — load gate now uses the same jetsam-accurate metric the enforcer uses. |
+| `a6ed4b0` | server: `POST /v1/cancel/{request_id}` out-of-band cancel | Re-applies feature `25e3dda` — out-of-band cancel for clients that can't rely on TCP-close. |
+| `277f457` | scheduler: predictive generation memory guard | Re-applies feature's "wait state" budget (the predictive variant) — defer admission when `active + (n_running+1) * per_request_estimate + cached_overhead > soft`. |
+| `9e8de7d` | tests(enforcer): align 3 cascade-eviction tests with one-per-tick contract | The feature design doc explicitly predicted these would need updating. Now 149/149 enforcer+cache+admission+memory tests pass. |
+| `a9b4487` | server: add `resolved_id` parameter to `get_engine` (Issue 7) | Resolve-once API change. Caller migration to thread `resolved_id` through `create_completion`/`chat_completion`/Anthropic/Responses deferred to a follow-up commit. |
+
+**Already closed by auto-merge** (not actually gaps, despite earlier flag):
+- `skip_api_key_verification` admin plumbing — fully merged.
+- `OCR_MODEL_TYPES` / `OCR_MODEL_PROMPTS` in vlm.py — fully merged.
+
+## Take-side gaps (remaining follow-up work)
 
 The following resolutions used a wholesale `--ours`/`--theirs` for tractability. The
 discarded side's substance must be re-applied as targeted follow-up commits before this
