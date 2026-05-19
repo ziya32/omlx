@@ -1,6 +1,6 @@
 # Rebase plan: `features/more-models` → `origin/main` (v0.3.9rc1)
 
-**Status:** in progress
+**Status:** in progress — mechanic switched rebase → **merge** (see Strategy)
 **Authored:** 2026-05-19
 
 ## Context
@@ -20,9 +20,22 @@ sequence → **`pre-039-rebase`**.
 
 ## Strategy
 
-Granular interactive `git rebase --onto origin/main <merge-base>`, preserving history.
-`rerere` enabled; conflict style `zdiff3`. Squash-the-remainder is the documented
-fallback if conflict volume becomes unmanageable.
+**`git merge origin/main` into `features/more-models`** (one resolution pass).
+`rerere` enabled; conflict style `zdiff3`. No force-push (merge commit on the branch).
+
+### Why not rebase (decision log)
+
+Initial plan was granular interactive `rebase --onto origin/main`. Aborted at commit
+**1 of 73**: the branch's oldest replay commit is `21f99a6` — a *squash of 59 commits*
+(`104 files, +26693/-3367`) that conflicted across 24 files (~120 hunks: server.py 29,
+audio_routes.py 16, scheduler.py 13, engine_pool.py 12, prefix_cache.py 10,
+process_memory_enforcer.py 9, …). The granular-history rationale does not hold when the
+base is already a squash: rebase would force resolving the *entire* feature-vs-main
+reconciliation in one mega-conflict **and then** replay 71 more re-conflicting commits.
+`git merge` does the same total reconciliation **once**, against final main, with
+both-sides context, and no force-push. Decisions below are applied *within* the single
+merge resolution rather than per-commit (take-main = take `origin/main` side; keep-feature
+= take `HEAD` side; hand-merge zones = union by hand).
 
 ## Safety
 
@@ -31,7 +44,7 @@ git branch backup/features/more-models-pre-039-rebase   # pre-rewrite snapshot
 git config rerere.enabled true
 git config merge.conflictStyle zdiff3
 ```
-Rollback at any point: `git rebase --abort` (mid-rebase) or
+Rollback at any point: `git merge --abort` (mid-merge) or
 `git reset --hard backup/features/more-models-pre-039-rebase`.
 
 ## Decision 1 — DROP 15 superseded commits (take main's copy)
@@ -119,17 +132,23 @@ Main and the feature branch solve **different halves** and neither subsumes the 
 | `omlx/process_memory_enforcer.py` | 237 | 324 |
 | `omlx/engine/tts.py` · `stt.py` | high | high |
 
-## Remaining ~54 commits
+## Remaining unique feature work
 
 Genuinely-unique feature work (more-models, dflash routing, cancel endpoint, enforcer,
-VLM mRoPE, test rebases). Replay as-is; resolve hotspot conflicts once each (rerere).
+VLM mRoPE, test rebases) carries via the merge from the `HEAD` side; resolve hotspot
+conflicts once each (rerere).
 
 ## Execution
 
 ```
-git rebase -i --onto origin/main cb33a76 features/more-models   # drop the 15 via GIT_SEQUENCE_EDITOR
-# resolve hotspots; reconcile Decision 3 & 4 zones by hand
+git merge origin/main                 # one resolution pass
+# resolve ~24-file conflict per Decisions 1-4:
+#   Decision 1 (15 superseded) -> take origin/main side
+#   Decision 2 (qwen3_5)       -> take HEAD (feature) side
+#   Decision 3 (cache race)    -> hand-merge bbba911 onto main's cache
+#   Decision 4 (mem enforcer)  -> hand-merge both; retarget to max(active,phys)
 # build + run suite (esp. test_prefix_cache.py, bbba911 regression tests,
 #   test_process_memory_enforcer.py, test_scheduler_admission.py, test_proc_memory.py)
-git push --force-with-lease
+git commit                            # merge commit; no force-push
+git push                              # fast-forward of origin/features/more-models
 ```
