@@ -2063,8 +2063,12 @@ async def create_completion(
             status_code=503,
             detail="Server is busy with oQ quantization. Please try again after quantization completes.",
         )
+    # Resolve once and thread through get_engine_for_model so the engine
+    # lookup uses the same id any subsequent settings/state lookups
+    # against ``resolved_model`` will use (Issue 7).
+    resolved_model = resolve_model_id(request.model) or request.model
     load_start = time.perf_counter()
-    engine = await get_engine_for_model(request.model)
+    engine = await get_engine_for_model(request.model, resolved_id=resolved_model)
     model_load_duration = time.perf_counter() - load_start
 
     # Handle single prompt or list of prompts
@@ -2204,12 +2208,12 @@ async def create_chat_completion(
             detail="Server is busy with oQ quantization. Please try again after quantization completes.",
         )
 
-    load_start = time.perf_counter()
-    engine = await get_engine_for_model(request.model)
-    model_load_duration = time.perf_counter() - load_start
-
-    # Resolve alias to real model ID for settings lookups
+    # Resolve once and thread through get_engine_for_model so the engine
+    # lookup uses the same id as the settings lookups below (Issue 7).
     resolved_model = resolve_model_id(request.model) or request.model
+    load_start = time.perf_counter()
+    engine = await get_engine_for_model(request.model, resolved_id=resolved_model)
+    model_load_duration = time.perf_counter() - load_start
 
     # Get per-model settings
     max_tool_result_tokens = None
