@@ -1,10 +1,15 @@
 # Rebase plan: `features/more-models` → `origin/main` (v0.3.9rc1)
 
-**Status:** merge + 13 follow-up commits + uv.lock regen applied. **235 targeted tests
-pass (100% green).** Remaining items are deferrable polish (engine_pool diagnostic
-fields, dflash track-upstream, Anthropic/Responses resolve-once migration).
+**Status:** merge + 22 follow-up commits applied. **513 unit tests pass (100% green)**
+on the expanded sweep. Post-merge review found and fixed 1 CRITICAL bug
+(`is_dflash_compatible` missing — silently broke admin UI DFlash detection), 4
+IMPORTANT vlm.py main-feature gaps (torch-free OCR, nested-visual remap, ParoQuant
+dispatch, per-layer quant), the engine_pool fallback-error chaining, a hot-path
+perf optimization (per-tick memory-metric caching), and removed dead code. Remaining
+items are deferrable polish (engine_pool diagnostic fields, dflash track-upstream
+proper, Anthropic/Responses resolve-once migration, format-utility consolidation).
 **Authored:** 2026-05-19
-**Last update:** 2026-05-19 — Tier-1 + smaller follow-ups complete
+**Last update:** 2026-05-19 — post-merge review + hardening complete
 
 ## Context
 
