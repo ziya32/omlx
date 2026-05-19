@@ -140,17 +140,14 @@ conflicts once each (rerere).
 
 ## Flagged risks (verification-phase blockers)
 
-1. **mlx-vlm pin moved under the kept GatedDeltaNet patch.** Merge auto-took main's
-   `mlx-vlm@f96138e` (feature tested against `@e41cd25`). We kept feature's
-   `gated_delta_advance.py` + `qwen3_5_attention.py` (Decision 2), which call
-   `cache.advance(S)` on the assumption mlx-vlm does *not*. If `f96138e`'s
-   `Qwen3_5GatedDeltaNet` already advances upstream → **double-advance / cache
-   corruption** on Qwen3.5/3.6 GatedDeltaNet batched decode. Pinning mlx-vlm back to
-   `e41cd25` is **not** viable — main's MTP/Gemma4 work depends on `f96138e`.
-   **Action:** inspect `f96138e` `Qwen3_5GatedDeltaNet.__call__` for `cache.advance`;
-   if present, make feature's patch idempotent/conditional (detect upstream advance)
-   rather than unconditionally calling it. Verify via `tests/test_gated_delta_advance.py`
-   + a Qwen3.5/3.6 A3B batched-decode run.
+1. ~~**mlx-vlm pin moved under the kept GatedDeltaNet patch.**~~ **RESOLVED — false alarm.**
+   Feature's `gated_delta_advance.py` docstring explicitly states: *"As of mlx-vlm
+   191d7c8 (target), upstream ships `cache.advance(S)` on its own, so the original
+   ed7884c fix is no longer carried by this patch."* The patch only carries the
+   `mx.contiguous` wrap on `cache[0]` write + `cache.lengths is not None` per-element
+   slicing + drops mlx-vlm silent fallbacks. **It does NOT call `cache.advance(S)`
+   redundantly** — feature designed for upstream evolution. All 7
+   `tests/test_gated_delta_advance.py` tests pass against pinned `mlx-vlm@f96138e`.
 2. **anthropic extra `except`** — feature's dropped `bbf0f90` had an extra
    `except (json.JSONDecodeError, AttributeError)`; main's `c5b91b5` won. Re-check.
 3. **gate-mcp** — main's `697f63d` is a different impl than feature's dropped
