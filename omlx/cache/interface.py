@@ -7,7 +7,7 @@ should follow for consistency across the codebase.
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Optional, Tuple
 
 from .stats import BaseCacheStats
 

@@ -464,7 +464,6 @@ def _build_long_vlm_messages(tokenizer, question: str = "Describe this image in 
 
 
 def _test_vlm_image_cache_consistency(vlm_model, processor, adapter):
-    import mlx.core as mx
 
     print("\n  [Test 1] VLM image cache: store → hit → identical...")
 
@@ -597,7 +596,6 @@ def _test_text_only_cache_consistency(adapter, tokenizer):
 # ---------------------------------------------------------------------------
 
 def _test_image_to_text_transition(vlm_model, processor, adapter):
-    import mlx.core as mx
 
     print("\n  [Test 3] Image → text-only state transition...")
 
@@ -641,7 +639,6 @@ def _test_image_to_text_transition(vlm_model, processor, adapter):
 # ---------------------------------------------------------------------------
 
 def _test_mixed_batch(vlm_model, processor, adapter):
-    import mlx.core as mx
 
     print("\n  [Test 4] Mixed batch: 2 image + 2 text-only concurrent...")
 
@@ -701,7 +698,6 @@ def _test_mixed_batch(vlm_model, processor, adapter):
 # ---------------------------------------------------------------------------
 
 def _test_mixed_batch_cache(vlm_model, processor, adapter):
-    import mlx.core as mx
 
     print("\n  [Test 5] Mixed batch + SSD cache: fresh → hit → identical...")
 

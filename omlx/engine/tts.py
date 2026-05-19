@@ -6,130 +6,23 @@ This module provides an engine for speech synthesis using mlx-audio.
 Unlike LLM engines, TTS engines don't support streaming or chat completion.
 mlx-audio is imported lazily inside start() to avoid module-level import errors
 when mlx-audio is not installed.
-
-Supports chunked yielding: each audio segment is generated in a separate
-executor submission so LLM token generation can interleave between segments.
 """
 
 import asyncio
 import gc
-import inspect
-import json
 import logging
-import time
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Dict, Optional
 
 import mlx.core as mx
 import numpy as np
 
 from ..engine_core import get_mlx_executor
-from ..exceptions import AudioError, VoiceCloningError
 from .audio_utils import DEFAULT_SAMPLE_RATE as _DEFAULT_SAMPLE_RATE
 from .audio_utils import audio_to_wav_bytes as _audio_to_wav_bytes
 from .base import BaseNonStreamingEngine
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class SpeechOutput:
-    """Output from TTS synthesis."""
-
-    audio_bytes: bytes  # WAV file bytes
-    sample_rate: int = 24000
-    duration: float = 0.0  # seconds
-
-
-
-_SUPPORTED_FORMATS = {"wav", "mp3", "opus", "flac", "pcm"}
-
-_FORMAT_MEDIA_TYPES = {
-    "wav": "audio/wav",
-    "mp3": "audio/mpeg",
-    "opus": "audio/opus",
-    "flac": "audio/flac",
-    "pcm": "audio/pcm",
-}
-
-_FORMAT_EXTENSIONS = {
-    "wav": "wav",
-    "mp3": "mp3",
-    "opus": "opus",
-    "flac": "flac",
-    "pcm": "pcm",
-}
-
-
-def _convert_wav(wav_bytes: bytes, output_format: str, speed: float = 1.0) -> bytes:
-    """Convert WAV bytes to another audio format using ffmpeg.
-
-    Args:
-        wav_bytes: Input WAV audio bytes.
-        output_format: Target format ("mp3", "opus", "flac").
-        speed: Playback speed multiplier (0.25-4.0). 1.0 = no change.
-
-    Returns:
-        Converted audio bytes.
-
-    Raises:
-        AudioError: If ffmpeg is not available or conversion fails.
-    """
-    import shutil
-    import subprocess
-
-    ffmpeg_path = shutil.which("ffmpeg")
-    if not ffmpeg_path:
-        raise AudioError(
-            "ffmpeg is required for audio format conversion but was not found. "
-            "Install with: brew install ffmpeg"
-        )
-
-    cmd = [ffmpeg_path, "-i", "pipe:0", "-f", output_format]
-
-    # Apply speed change via atempo filter
-    if speed != 1.0:
-        # atempo only supports 0.5-100.0; chain filters for extreme values
-        filters = []
-        remaining = speed
-        while remaining > 2.0:
-            filters.append("atempo=2.0")
-            remaining /= 2.0
-        while remaining < 0.5:
-            filters.append("atempo=0.5")
-            remaining *= 2.0
-        filters.append(f"atempo={remaining}")
-        cmd.extend(["-af", ",".join(filters)])
-
-    cmd.extend(["-y", "pipe:1"])
-
-    try:
-        result = subprocess.run(
-            cmd,
-            input=wav_bytes,
-            capture_output=True,
-            timeout=300,
-        )
-    except FileNotFoundError:
-        raise AudioError("ffmpeg not found")
-    except subprocess.TimeoutExpired:
-        raise AudioError("Audio conversion timed out (>5 min)")
-
-    if result.returncode != 0:
-        stderr = result.stderr.decode("utf-8", errors="replace")[-500:]
-        raise AudioError(f"ffmpeg conversion failed: {stderr}")
-
-    return result.stdout
-
-
-def _audio_to_pcm(audio_array) -> bytes:
-    """Convert audio samples to raw 16-bit PCM bytes (for streaming segments)."""
-    samples = np.array(audio_array, dtype=np.float32).flatten()
-    samples = np.clip(samples, -1.0, 1.0)
-    return (samples * 32767).astype(np.int16).tobytes()
-
 
 
 class TTSEngine(BaseNonStreamingEngine):
@@ -138,11 +31,6 @@ class TTSEngine(BaseNonStreamingEngine):
 
     This engine wraps mlx-audio TTS models and provides async methods
     for integration with the oMLX server.
-
-    Supports multiple model variants (auto-detected from config.json):
-    - CustomVoice: preset speakers with emotional/tonal control via instruct
-    - VoiceDesign: arbitrary voice synthesis from natural-language descriptions
-    - Base: reference audio voice cloning
 
     Unlike BaseEngine, this doesn't support streaming or chat
     since synthesis is computed in a single forward pass.
@@ -160,10 +48,6 @@ class TTSEngine(BaseNonStreamingEngine):
         self._model_name = model_name
         self._model = None
         self._kwargs = kwargs
-        self._variant: str = "custom_voice"  # "custom_voice" | "voice_design" | "base"
-        self._total_operations: int = 0
-        self._total_audio_seconds: float = 0.0
-        self._total_processing_seconds: float = 0.0
 
     @staticmethod
     def _audio_array_to_pcm_bytes(audio: Any) -> bytes:
@@ -176,26 +60,11 @@ class TTSEngine(BaseNonStreamingEngine):
         """Get the model name."""
         return self._model_name
 
-    def _detect_variant(self, model_path: str) -> str:
-        """Detect TTS variant from config.json tts_model_type field."""
-        config_path = Path(model_path) / "config.json"
-        if config_path.exists():
-            try:
-                with open(config_path) as f:
-                    config = json.load(f)
-                tts_type = config.get("tts_model_type", "")
-                if tts_type == "voice_design":
-                    return "voice_design"
-                if tts_type == "base":
-                    return "base"
-            except Exception:
-                pass
-        return "custom_voice"
-
     def supports_native_tts_streaming(self) -> bool:
         """Return whether the loaded model exposes model-native audio streaming."""
         if self._model is None:
             return False
+        import inspect
 
         try:
             gen_params = inspect.signature(self._model.generate).parameters
@@ -224,19 +93,9 @@ class TTSEngine(BaseNonStreamingEngine):
                 'Install it with: pip install "omlx[audio]"'
             ) from exc
 
-        # mlx-audio's qwen3-tts imports `categorical_sampling` etc. from
-        # mlx-lm, which are decorated with @mx.compile and fail to advance
-        # the RNG state inside our worker-thread executor — the model then
-        # mode-collapses (constant tone) or cuts off mid-utterance.  Swap
-        # in the non-compile copies before any synthesize call runs.
-        from ..utils.sampling import patch_mlx_audio_samplers
-        patch_mlx_audio_samplers()
-
         model_name = self._model_name
 
         def _load_sync():
-            if __debug__:
-                logger.debug(f"[TTS] Loading model on MLX executor thread: {model_name}")
             try:
                 return _load_model(model_name, strict=True)
             except ValueError as exc:
@@ -255,10 +114,7 @@ class TTSEngine(BaseNonStreamingEngine):
 
         loop = asyncio.get_running_loop()
         self._model = await loop.run_in_executor(get_mlx_executor(), _load_sync)
-        self._variant = self._detect_variant(self._model_name)
-        logger.info(
-            f"TTS engine started: {self._model_name} (variant={self._variant})"
-        )
+        logger.info(f"TTS engine started: {self._model_name}")
 
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
@@ -266,11 +122,6 @@ class TTSEngine(BaseNonStreamingEngine):
             return
 
         logger.info(f"Stopping TTS engine: {self._model_name}")
-        # Mark terminal BEFORE clearing the model ref so any handler
-        # racing with stop() sees RequestAbortedError via
-        # _raise_if_aborted instead of a RuntimeError from the model
-        # guard. See docs/enforcer-eviction-review.md #4.
-        self._mark_stopped()
         self._model = None
 
         gc.collect()
@@ -279,63 +130,6 @@ class TTSEngine(BaseNonStreamingEngine):
             get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
         )
         logger.info(f"TTS engine stopped: {self._model_name}")
-
-    def _build_generate_kwargs(
-        self,
-        text: str,
-        voice: Optional[str] = None,
-        instructions: Optional[str] = None,
-        ref_audio: Optional[str] = None,
-        ref_text: Optional[str] = None,
-        speed: float = 1.0,
-        **extra,
-    ) -> dict:
-        """Build kwargs for model.generate() based on variant and model signature.
-
-        Uses inspect.signature to route voice/instruct to the correct parameter
-        name, ensuring compatibility across Qwen3-TTS, Kokoro, VibeVoice, etc.
-        """
-        model = self._model
-        gen_params = inspect.signature(model.generate).parameters
-
-        # Base variant with reference audio (voice cloning)
-        if self._variant == "base" and ref_audio:
-            kw: dict = {"text": text, "ref_audio": ref_audio}
-            if ref_text:
-                kw["ref_text"] = ref_text
-            kw.update(extra)
-            return kw
-
-        # VoiceDesign variant
-        if self._variant == "voice_design":
-            return {
-                "text": text,
-                "instruct": instructions or "A neutral narrator",
-                **extra,
-            }
-
-        # Default: CustomVoice / generic — route via model signature
-        gen_kwargs: Dict[str, Any] = {"text": text, "verbose": False}
-
-        if voice is not None:
-            if "voice" in gen_params:
-                gen_kwargs["voice"] = voice
-            elif "instruct" in gen_params:
-                gen_kwargs["instruct"] = voice
-        if instructions is not None and "instruct" in gen_params:
-            gen_kwargs["instruct"] = instructions
-        if speed != 1.0:
-            gen_kwargs["speed"] = speed
-        # Forward voice-cloning kwargs when the model's generate()
-        # signature accepts them (e.g. some CustomVoice variants support
-        # both speaker-name routing AND ref_audio cloning in the same call).
-        if ref_audio is not None and "ref_audio" in gen_params:
-            gen_kwargs["ref_audio"] = ref_audio
-        if ref_text is not None and "ref_text" in gen_params:
-            gen_kwargs["ref_text"] = ref_text
-        gen_kwargs.update(extra)
-
-        return gen_kwargs
 
     async def synthesize(
         self,
@@ -351,21 +145,17 @@ class TTSEngine(BaseNonStreamingEngine):
         repetition_penalty: Optional[float] = None,
         max_tokens: Optional[int] = None,
         **kwargs,
-    ) -> SpeechOutput:
+    ) -> bytes:
         """
         Synthesize speech from text.
-
-        Uses chunked yielding: each audio segment is generated in a separate
-        executor submission so LLM token generation can interleave between
-        segments instead of being blocked for the entire synthesis.
 
         Args:
             text: Input text to synthesize
             voice: Optional voice/speaker identifier
             speed: Speech speed multiplier (1.0 = normal)
             instructions: Optional voice description for instruct-capable models
-            ref_audio: For Base variant: path to reference audio (voice cloning)
-            ref_text: For Base variant: transcript of the reference audio
+            ref_audio: Optional path to reference audio file (voice cloning)
+            ref_text: Optional transcript of the reference audio
             temperature: Sampling temperature for generation
             top_k: Top-k sampling parameter
             top_p: Top-p (nucleus) sampling parameter
@@ -374,14 +164,12 @@ class TTSEngine(BaseNonStreamingEngine):
             **kwargs: Additional model-specific parameters
 
         Returns:
-            SpeechOutput with WAV audio bytes, sample_rate, and duration
+            WAV-encoded bytes (RIFF header + 16-bit mono PCM)
         """
-        # Check abort FIRST so a handler racing with stop() sees the
-        # typed RequestAbortedError (→ HTTP 503) rather than the plain
-        # RuntimeError from the model guard (→ HTTP 500).
-        self._raise_if_aborted()
         if self._model is None:
             raise RuntimeError("Engine not started. Call start() first.")
+
+        import time
 
         logger.info(
             "TTS synthesize: model=%s, text_len=%d, voice=%s, speed=%.1f, ref_audio=%s",
@@ -390,205 +178,92 @@ class TTSEngine(BaseNonStreamingEngine):
         )
 
         model = self._model
-        # Inject sampling params (only non-None) into kwargs so they
-        # flow through _build_generate_kwargs's **extra path.
-        for _name, _val in (
-            ("temperature", temperature),
-            ("top_k", top_k),
-            ("top_p", top_p),
-            ("repetition_penalty", repetition_penalty),
-            ("max_tokens", max_tokens),
-        ):
-            if _val is not None:
-                kwargs[_name] = _val
-        gen_kwargs = self._build_generate_kwargs(
-            text, voice, instructions, ref_audio, ref_text, speed, **kwargs
+        t0 = time.monotonic()
+
+        def _build_generate_kwargs() -> Dict[str, Any]:
+            gen_kwargs: Dict[str, Any] = {
+                "text": text,
+                "verbose": False,
+            }
+            import inspect
+            gen_params = inspect.signature(model.generate).parameters
+            if voice is not None:
+                # Route voice to the correct generate() kwarg.
+                # Models with 'voice' param (CustomVoice, Kokoro) get it as
+                # a speaker name. Models with only 'instruct' (non-Qwen TTS)
+                # get it as a voice description fallback.
+                if "voice" in gen_params:
+                    gen_kwargs["voice"] = voice
+                elif "instruct" in gen_params:
+                    gen_kwargs["instruct"] = voice
+            if instructions is not None and "instruct" in gen_params:
+                gen_kwargs["instruct"] = instructions
+            if speed != 1.0:
+                gen_kwargs["speed"] = speed
+            if ref_audio is not None and "ref_audio" in gen_params:
+                gen_kwargs["ref_audio"] = ref_audio
+                gen_kwargs["ref_text"] = ref_text
+            # Generation params (only add non-None values)
+            if temperature is not None:
+                gen_kwargs["temperature"] = temperature
+            if top_k is not None:
+                gen_kwargs["top_k"] = top_k
+            if top_p is not None:
+                gen_kwargs["top_p"] = top_p
+            if repetition_penalty is not None:
+                gen_kwargs["repetition_penalty"] = repetition_penalty
+            if max_tokens is not None:
+                gen_kwargs["max_tokens"] = max_tokens
+            gen_kwargs.update(kwargs)
+            return gen_kwargs
+
+        def _synthesize_sync():
+            # model.generate() returns an iterable of results,
+            # each with .audio (array) and .sample_rate (int).
+            gen_kwargs = _build_generate_kwargs()
+
+            results = model.generate(**gen_kwargs)
+
+            # Use model.sample_rate if available (e.g. Qwen3-TTS)
+            sample_rate = getattr(model, "sample_rate", _DEFAULT_SAMPLE_RATE)
+            audio_chunks = []
+
+            for result in results:
+                audio = result.audio
+                if isinstance(audio, mx.array) and audio.dtype == mx.bfloat16:
+                    audio = audio.astype(mx.float32)
+                audio_chunks.append(np.array(audio))
+
+            if not audio_chunks:
+                raise RuntimeError("TTS model produced no audio output")
+
+            audio = np.concatenate(audio_chunks, axis=0)
+            return _audio_to_wav_bytes(audio, int(sample_rate))
+
+        activity_id = self._begin_activity(
+            "synthesizing speech",
+            detail="Synthesizing speech",
+            metadata={"text_length": len(text)},
         )
-        loop = asyncio.get_running_loop()
-        executor = get_mlx_executor()
-        start_time = time.perf_counter()
-
-        with self._active_lock:
-            self._active_count += 1
         try:
-            # Step 1: Create generator on executor (quick).
-            # Wrap with iter() so model.generate() returning a list
-            # (test mocks, or eager iterables) supports next(g, None).
-            def _create_gen():
-                if __debug__:
-                    logger.debug(f"[TTS] Synthesizing: variant={self._variant}")
-                try:
-                    return iter(model.generate(**gen_kwargs))
-                except Exception as e:
-                    if self._variant == "base" and ref_audio:
-                        raise VoiceCloningError(
-                            f"Voice cloning failed: {e}"
-                        ) from e
-                    raise AudioError(
-                        f"TTS generation failed: {e}"
-                    ) from e
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                get_mlx_executor(), _synthesize_sync
+            )
 
-            gen = await loop.run_in_executor(executor, _create_gen)
-            self._raise_if_aborted()
-
-            # Step 2: Consume one segment at a time, yielding executor between
-            # each so LLM scheduler.step() calls can interleave
-            segments = []
-
-            def _next_seg(g):
-                try:
-                    return next(g, None)
-                except Exception as e:
-                    raise AudioError(
-                        f"TTS segment generation failed: {e}"
-                    ) from e
-
-            while True:
-                seg = await loop.run_in_executor(executor, _next_seg, gen)
-                # Abort between segments — discards any already-computed
-                # segments and raises to the handler.
-                self._raise_if_aborted()
-                if seg is None:
-                    break
-                segments.append(seg)
-
-            if not segments:
-                raise AudioError("TTS produced no audio segments")
-
-            # Step 3: Concatenate and encode WAV (quick)
-            def _finalize(segs):
-                audio_chunks = []
-                sample_rate = _DEFAULT_SAMPLE_RATE
-                for s in segs:
-                    audio_chunks.append(np.array(s.audio))
-                    if hasattr(s, "sample_rate"):
-                        sample_rate = s.sample_rate
-                audio = np.concatenate(audio_chunks, axis=0)
-                duration = len(audio) / sample_rate
-                return SpeechOutput(
-                    audio_bytes=_audio_to_wav_bytes(audio, int(sample_rate)),
-                    sample_rate=int(sample_rate),
-                    duration=duration,
-                )
-
-            result = await loop.run_in_executor(executor, _finalize, segments)
-            self._raise_if_aborted()
-            self._total_audio_seconds += result.duration
-            self._total_operations += 1
-            self._total_processing_seconds += time.perf_counter() - start_time
-
-            elapsed = time.perf_counter() - start_time
+            elapsed = time.monotonic() - t0
             logger.info(
                 "TTS synthesize done: model=%s, %.2fs, %d bytes output",
-                self._model_name, elapsed, len(result.audio_bytes),
+                self._model_name, elapsed, len(result),
             )
             return result
         finally:
-            if self._decrement_active():
+            if self._end_activity(activity_id):
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
                     get_mlx_executor(),
                     lambda: (mx.synchronize(), mx.clear_cache()),
                 )
-
-    async def stream_synthesize(
-        self,
-        text: str,
-        voice: Optional[str] = None,
-        speed: float = 1.0,
-        instructions: Optional[str] = None,
-        ref_audio: Optional[str] = None,
-        ref_text: Optional[str] = None,
-        **kwargs,
-    ) -> AsyncIterator[SpeechOutput]:
-        """
-        Generate speech audio from text, yielding each segment as it's produced.
-
-        Each segment is independently eval'd and converted to WAV/PCM so the
-        client can begin playback before the full synthesis completes.
-
-        Args:
-            Same as synthesize().
-
-        Yields:
-            SpeechOutput for each audio segment
-        """
-        # Check abort FIRST so a handler racing with stop() sees the
-        # typed RequestAbortedError (→ HTTP 503) rather than the plain
-        # RuntimeError from the model guard (→ HTTP 500).
-        self._raise_if_aborted()
-        if self._model is None:
-            raise RuntimeError("Engine not started. Call start() first.")
-
-        model = self._model
-        gen_kwargs = self._build_generate_kwargs(
-            text, voice, instructions, ref_audio, ref_text, speed, **kwargs
-        )
-        loop = asyncio.get_running_loop()
-        executor = get_mlx_executor()
-        with self._active_lock:
-            self._active_count += 1
-
-        try:
-            def _create_stream_gen():
-                try:
-                    # iter() so list-returning mocks support next(g, None)
-                    return iter(model.generate(**gen_kwargs))
-                except Exception as e:
-                    if self._variant == "base" and ref_audio:
-                        raise VoiceCloningError(
-                            f"Voice cloning failed: {e}"
-                        ) from e
-                    raise AudioError(
-                        f"TTS generation failed: {e}"
-                    ) from e
-
-            gen = await loop.run_in_executor(executor, _create_stream_gen)
-            self._raise_if_aborted()
-
-            def _next_seg(g):
-                try:
-                    return next(g, None)
-                except Exception as e:
-                    raise AudioError(
-                        f"TTS segment generation failed: {e}"
-                    ) from e
-
-            def _segment_to_pcm(seg):
-                audio = np.array(seg.audio)
-                sr = getattr(seg, "sample_rate", _DEFAULT_SAMPLE_RATE)
-                dur = len(audio) / sr
-                return SpeechOutput(
-                    audio_bytes=_audio_to_pcm(audio),
-                    sample_rate=int(sr),
-                    duration=dur,
-                )
-
-            while True:
-                seg = await loop.run_in_executor(executor, _next_seg, gen)
-                # Abort between segments — terminates the stream on the
-                # very next yield point without serving a stale chunk.
-                self._raise_if_aborted()
-                if seg is None:
-                    break
-                chunk = await loop.run_in_executor(executor, _segment_to_pcm, seg)
-                self._raise_if_aborted()
-                yield chunk
-        finally:
-            with self._active_lock:
-                self._active_count -= 1
-
-    def get_speakers(self) -> list[str]:
-        """List available speakers (CustomVoice only)."""
-        if self._model is None or self._variant != "custom_voice":
-            return []
-        try:
-            talker_config = getattr(self._model.config, "talker_config", None)
-            if talker_config and "spk_id" in talker_config:
-                return list(talker_config["spk_id"].keys())
-        except Exception:
-            pass
-        return []
 
     async def stream_synthesize_pcm(
         self,
@@ -606,18 +281,14 @@ class TTSEngine(BaseNonStreamingEngine):
         streaming_interval: float = 0.4,
         **kwargs,
     ) -> AsyncIterator[tuple[int, int, int, bytes]]:
-        """Stream synthesized PCM chunks from models that natively support it.
-
-        Complements stream_synthesize (which yields SpeechOutput segments) by
-        forwarding model.generate(stream=True) directly to the client as raw
-        PCM tuples (sample_rate, channels, sample_width, pcm_bytes). Only
-        models whose generate() exposes both ``stream`` and
-        ``streaming_interval`` parameters are supported.
-        """
+        """Stream synthesized PCM chunks from models that natively support it."""
         if self._model is None:
             raise RuntimeError("Engine not started. Call start() first.")
         if not self.supports_native_tts_streaming():
             raise NotImplementedError("Loaded TTS model does not expose native streaming")
+
+        import inspect
+        import time
 
         logger.info(
             "TTS native stream start: model=%s, text_len=%d, voice=%s, interval=%.2fs",
@@ -627,7 +298,7 @@ class TTSEngine(BaseNonStreamingEngine):
         model = self._model
         t0 = time.monotonic()
 
-        def _build_native_stream_kwargs() -> Dict[str, Any]:
+        def _build_generate_kwargs() -> Dict[str, Any]:
             gen_kwargs: Dict[str, Any] = {
                 "text": text,
                 "verbose": False,
@@ -669,7 +340,7 @@ class TTSEngine(BaseNonStreamingEngine):
         def _next_pcm_chunk():
             nonlocal iterator
             if iterator is None:
-                iterator = iter(model.generate(**_build_native_stream_kwargs()))
+                iterator = iter(model.generate(**_build_generate_kwargs()))
             try:
                 result = next(iterator)
             except StopIteration:
@@ -682,16 +353,15 @@ class TTSEngine(BaseNonStreamingEngine):
             )
             return sample_rate, 1, 2, self._audio_array_to_pcm_bytes(audio)
 
-        with self._active_lock:
-            self._active_count += 1
+        activity_id = self._begin_activity(
+            "streaming speech",
+            detail="Streaming speech",
+            metadata={"text_length": len(text)},
+        )
         try:
             loop = asyncio.get_running_loop()
             while True:
-                # Abort between chunks so a stop() racing with the stream
-                # surfaces RequestAbortedError instead of serving stale audio.
-                self._raise_if_aborted()
                 chunk = await loop.run_in_executor(get_mlx_executor(), _next_pcm_chunk)
-                self._raise_if_aborted()
                 if chunk is sentinel:
                     break
                 if chunk is None:
@@ -701,9 +371,14 @@ class TTSEngine(BaseNonStreamingEngine):
                     continue
                 chunk_count += 1
                 total_bytes += len(pcm_bytes)
+                self._update_activity(
+                    activity_id,
+                    chunk_count=chunk_count,
+                    output_bytes=total_bytes,
+                )
                 yield sample_rate, channels, sample_width, pcm_bytes
         finally:
-            if self._decrement_active():
+            if self._end_activity(activity_id):
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
                     get_mlx_executor(),
@@ -719,23 +394,8 @@ class TTSEngine(BaseNonStreamingEngine):
         return {
             "model_name": self._model_name,
             "loaded": self._model is not None,
-            "variant": self._variant,
-            "active_operations": self._active_count,
-            "total_operations": self._total_operations,
-            "total_audio_seconds": round(self._total_audio_seconds, 2),
-            "total_processing_seconds": round(self._total_processing_seconds, 2),
-        }
-
-    def get_model_info(self) -> Dict[str, Any]:
-        if self._model is None:
-            return {"loaded": False, "model_name": self._model_name}
-        return {
-            "loaded": True,
-            "model_name": self._model_name,
-            "variant": self._variant,
-            "speakers": self.get_speakers(),
         }
 
     def __repr__(self) -> str:
         status = "running" if self._model is not None else "stopped"
-        return f"<TTSEngine model={self._model_name} variant={self._variant} status={status}>"
+        return f"<TTSEngine model={self._model_name} status={status}>"

@@ -138,6 +138,88 @@ Genuinely-unique feature work (more-models, dflash routing, cancel endpoint, enf
 VLM mRoPE, test rebases) carries via the merge from the `HEAD` side; resolve hotspot
 conflicts once each (rerere).
 
+## Flagged risks (verification-phase blockers)
+
+1. **mlx-vlm pin moved under the kept GatedDeltaNet patch.** Merge auto-took main's
+   `mlx-vlm@f96138e` (feature tested against `@e41cd25`). We kept feature's
+   `gated_delta_advance.py` + `qwen3_5_attention.py` (Decision 2), which call
+   `cache.advance(S)` on the assumption mlx-vlm does *not*. If `f96138e`'s
+   `Qwen3_5GatedDeltaNet` already advances upstream → **double-advance / cache
+   corruption** on Qwen3.5/3.6 GatedDeltaNet batched decode. Pinning mlx-vlm back to
+   `e41cd25` is **not** viable — main's MTP/Gemma4 work depends on `f96138e`.
+   **Action:** inspect `f96138e` `Qwen3_5GatedDeltaNet.__call__` for `cache.advance`;
+   if present, make feature's patch idempotent/conditional (detect upstream advance)
+   rather than unconditionally calling it. Verify via `tests/test_gated_delta_advance.py`
+   + a Qwen3.5/3.6 A3B batched-decode run.
+2. **anthropic extra `except`** — feature's dropped `bbf0f90` had an extra
+   `except (json.JSONDecodeError, AttributeError)`; main's `c5b91b5` won. Re-check.
+3. **gate-mcp** — main's `697f63d` is a different impl than feature's dropped
+   `f157e85`. Verify mcp/audio routers are actually gated behind `verify_api_key`.
+
+## Take-side gaps (follow-up commits required)
+
+The following resolutions used a wholesale `--ours`/`--theirs` for tractability. The
+discarded side's substance must be re-applied as targeted follow-up commits before this
+merge is considered semantically complete:
+
+### `scheduler.py` ← `--theirs` (main's chunked prefill, queue cap, phase timers, etc.)
+Lost feature work to re-add:
+- **Predictive generation memory guard** (was at feature's `scheduler.py:3281-3344`) —
+  the "wait state" budget that defers admission when projected concurrent cost would
+  exceed limit. Integrate with main's `_admission_paused` mechanism, retargeted to
+  `max(active, phys_footprint)`.
+- **Deferred-abort plumbing** — `_do_abort_request` / `_pending_async_aborts` set,
+  `cancel_request(request_id)` exposed through engines.
+- **`bbba911` scheduler hits** — dispatch through `submit_store_cache_async` instead of
+  `store_cache` so the kept prefix-cache race fix actually activates. **WITHOUT THIS
+  THE PREFIX-CACHE REGRESSION REMAINS LATENT** (per Decision 3 finding).
+- **`4baf965`** scheduler cache-corruption traceback when retries exhausted.
+
+### `server.py` ← `--theirs` (main's 503, native reasoning Responses, anthropic, gate-mcp)
+Lost feature work to re-add:
+- **`POST /v1/cancel/{request_id}`** endpoint (`25e3dda`).
+- **`RequestAbortedError` exception handler** translating to HTTP 503 (Issue 4).
+- **`server.use_engine` resolve-once** threading via `resolved_id` (Issue 7) for
+  `create_completion` / `create_chat_completion` / `create_message` (anthropic) /
+  `create_response` (Responses).
+- **`preserve_thinking` for `/v1/responses`** (`64e522f`).
+- **`_with_json_keepalive` on non-streaming endpoints** (`a124a1f`) + body-encoded
+  error after keepalive byte (`16445e1`).
+
+### `tts.py`, `stt.py` ← `--theirs` (main's STT/TTS evolution)
+Lost feature work to re-add (Decision 4 cooperative-abort protocol gaps):
+- `_raise_if_aborted()` checkpoints at every public entry point + after each
+  `run_in_executor` boundary (`embed`, `rerank`, `transcribe`, `_do_transcribe`,
+  `_transcribe_single`, `synthesize`, `stream_synthesize`, `process`).
+- `_mark_stopped()` call at the top of each engine's `stop()` method before clearing
+  `self._model`.
+- Without these: an in-flight TTS/STT/embed/rerank racing with enforcer eviction
+  returns HTTP 500 instead of the typed 503 (the exact regression Issue 4 fixes).
+
+### `admin/routes.py` ← `--theirs` (main's admin rework)
+Lost feature work: `admin: expose skip_api_key_verification in GlobalSettingsRequest`
+(`31ee562`). Re-add as a small targeted patch.
+
+### `audio_routes.py`, `vlm.py`, `engine_pool.py`, `dflash.py` ← `--ours` (feature's restructuring)
+Lost main work to re-layer:
+- `audio_routes.py`: main's `word_timestamps` (`19bb34e`), `max_tokens` for
+  transcriptions (`6993c5a`/`84ef801`).
+- `vlm.py`: main's Gemma4 OCR torch-gated bypass (`a1987ed`), Qwen3.6 nested-visual
+  sanitize (`29c9341`).
+- `engine_pool.py`: main's phys_footprint preload check (`max(active, phys)` instead
+  of bare `mx.get_active_memory()`), `actual_size`/`loading_started_at`/`_load_seconds_per_gb_ema`
+  diagnostic fields, `#1276` DFlash `draft_window_size`/`draft_sink_size`/`verify_mode`,
+  `#1283` fallback error surfacing.
+- `dflash.py`: main's track-upstream dflash-mlx + Gemma4 support (`ee5edc4`,
+  `496a248`), draft quant settings.
+
+### Tests
+Several test files (`test_audio_stt.py`, `test_audio_tts.py`, `test_server.py`,
+`test_process_memory_enforcer.py`, `test_admin_auth.py`, `integration/test_server_endpoints.py`)
+took `--theirs`. Feature's test additions for kept work (cancel endpoint regression,
+cooperative-abort protocol contract tests, abort-during-eviction integration tests)
+need re-adding alongside the corresponding code re-adds above.
+
 ## Execution
 
 ```

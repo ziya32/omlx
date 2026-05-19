@@ -7,8 +7,7 @@ recovery from cache corruption, and hybrid model cache configurations.
 """
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock
 
 import pytest
 

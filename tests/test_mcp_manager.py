@@ -3,10 +3,8 @@
 Tests for MCP client manager (omlx/mcp/manager.py).
 """
 
-import asyncio
 import json
-from typing import Any, Dict, List
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -14,11 +12,9 @@ from omlx.mcp.client import MCPClient
 from omlx.mcp.manager import MCPClientManager
 from omlx.mcp.types import (
     MCPConfig,
-    MCPServerConfig,
     MCPServerState,
     MCPTool,
     MCPToolResult,
-    MCPTransport,
 )
 
 

@@ -6,7 +6,6 @@ These tests cover the _inject_json_instruction function from server.py
 which is used for injecting JSON schema instructions into messages.
 """
 
-import pytest
 from omlx.server import _inject_json_instruction
 
 

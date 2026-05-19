@@ -25,7 +25,6 @@ from pathlib import Path
 from typing import Optional
 
 import pytest
-import pytest_asyncio
 
 pytestmark = [
     pytest.mark.slow,

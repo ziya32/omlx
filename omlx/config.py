@@ -12,7 +12,7 @@ This module provides unified configuration management with:
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 
 def parse_size(size_str: str) -> int:

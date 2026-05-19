@@ -657,7 +657,7 @@ async def _bench_timed(model, grammar, thinking, concurrency, duration, family):
                 result.durations.append(dur)
                 result.ttfts.append(ttft)
                 result.token_counts.append(tokens)
-            except Exception as e:
+            except Exception:
                 pass  # skip failed requests
 
     async def _dispatcher(client):

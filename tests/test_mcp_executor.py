@@ -4,8 +4,7 @@ Tests for MCP tool executor (omlx/mcp/executor.py).
 """
 
 import asyncio
-from typing import Any, Dict
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -13,11 +12,9 @@ from omlx.mcp.executor import ToolExecutor, execute_single_tool
 from omlx.mcp.manager import MCPClientManager
 from omlx.mcp.types import (
     MCPConfig,
-    MCPServerConfig,
     MCPServerState,
     MCPTool,
     MCPToolResult,
-    MCPTransport,
 )
 
 

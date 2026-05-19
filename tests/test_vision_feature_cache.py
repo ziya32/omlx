@@ -1,18 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for VisionFeatureSSDCache (memory LRU + SSD persistence)."""
 
-import shutil
-import tempfile
 import time
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import mlx.core as mx
 import pytest
 
 from omlx.cache.vision_feature_cache import (
     VisionFeatureSSDCache,
-    VisionFeatureSSDEntry,
     _composite_hash,
     _composite_key,
 )

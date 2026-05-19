@@ -3,13 +3,9 @@
 Tests for oMLX auto-update module (packaging/omlx_app/updater.py).
 """
 
-import os
-import shutil
-import subprocess
 import sys
-import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, Mock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 

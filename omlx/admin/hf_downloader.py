@@ -17,7 +17,6 @@ from typing import Callable, Optional
 
 from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 from huggingface_hub.utils import (
-    EntryNotFoundError,
     GatedRepoError,
     RepositoryNotFoundError,
 )
@@ -152,6 +151,8 @@ _SORT_MAP = {
     "updated": "lastModified",
     "most_params": "downloads",  # fetch by downloads, re-sort in Python
     "least_params": "downloads",  # fetch by downloads, re-sort in Python
+    "largest": "downloads",  # fetch by downloads, re-sort by size in Python
+    "smallest": "downloads",  # fetch by downloads, re-sort by size in Python
 }
 
 
@@ -245,32 +246,53 @@ class HFDownloader:
         sort: str = "trending",
         limit: int = 100,
         mlx_only: bool = True,
+        # Filtering options
+        min_params: Optional[int] = None,
+        max_params: Optional[int] = None,
+        min_size: Optional[int] = None,
+        max_size: Optional[int] = None,
+        # Sorting options
+        sort_by_size: bool = False,
+        sort_ascending: bool = False,
     ) -> dict:
-        """Search HuggingFace models by query string.
+        """Search HuggingFace models by query string with filtering and sorting.
 
         When mlx_only is True, results are restricted to the MLX library
         (same as https://huggingface.co/models?library=mlx).
 
         Args:
             query: Search query string.
-            sort: Sort order (trending/downloads/created/updated/most_params/least_params).
+            sort: Sort order (trending/downloads/created/updated/most_params/least_params/largest/smallest).
             limit: Maximum number of results to return.
             mlx_only: If True, restrict to MLX library models only.
+            min_params: Minimum parameter count filter.
+            max_params: Maximum parameter count filter.
+            min_size: Minimum model size in bytes filter.
+            max_size: Maximum model size in bytes filter.
+            sort_by_size: Sort results by size instead of default sort.
+            sort_ascending: Sort in ascending order (for size/params sorting).
 
         Returns:
             Dict with 'models' list and 'total' count.
         """
         api, _endpoint = _get_hf_api()
-        sort_key = _SORT_MAP.get(sort, "trendingScore")
+
+        # Determine base sort - for Python-side sorting, we fetch by downloads
+        # which tends to return more results, then sort in Python
+        if sort in ("most_params", "least_params", "largest", "smallest"):
+            base_sort = "downloads"
+        else:
+            base_sort = _SORT_MAP.get(sort, "trendingScore")
 
         kwargs = {
             "search": query,
-            "sort": sort_key,
+            "sort": base_sort,
             "limit": limit,
             "expand": ["safetensors", "downloads", "likes", "trendingScore"],
         }
         if mlx_only:
             kwargs["filter"] = "mlx"
+
         models = await asyncio.wait_for(
             asyncio.to_thread(api.list_models, **kwargs),
             timeout=_HF_API_TIMEOUT,
@@ -281,12 +303,23 @@ class HFDownloader:
             params = None
             params_formatted = None
             size = 0
+
             if m.safetensors and m.safetensors.get("parameters"):
                 params = _get_param_count(m.safetensors)
                 params_formatted = _format_param_count(params) if params > 0 else None
                 size = _calc_safetensors_disk_size(m.safetensors)
                 if params and params <= 0:
                     params = None
+
+            # Apply filters
+            if min_params is not None and (params is None or params < min_params):
+                continue
+            if max_params is not None and (params is None or params > max_params):
+                continue
+            if min_size is not None and size < min_size:
+                continue
+            if max_size is not None and size > max_size:
+                continue
 
             results.append(
                 {
@@ -302,11 +335,18 @@ class HFDownloader:
                 }
             )
 
-        # Re-sort in Python for parameter-based sorting
+        # Apply Python-side sorting
         if sort == "most_params":
             results.sort(key=lambda x: x["params"] or 0, reverse=True)
         elif sort == "least_params":
             results.sort(key=lambda x: x["params"] or 0)
+        elif sort in ("largest", "smallest") or sort_by_size:
+            # Sort by size, putting unknown-size entries at the end
+            results.sort(
+                key=lambda x: x["size"] if x["size"] > 0 else -1,
+                reverse=(sort == "largest" or (sort_by_size and not sort_ascending)),
+            )
+        # Otherwise, keep original HF API ordering (trending, downloads, created, updated)
 
         return {
             "models": results[:limit],
@@ -529,7 +569,7 @@ class HFDownloader:
     ) -> DownloadTask:
         """Retry a failed or cancelled download, resuming from existing files.
 
-        Since partial files are preserved on disk, snapshot_download will
+        Finalized shards are preserved on disk so snapshot_download will
         automatically skip already-completed files.
 
         Args:
@@ -607,9 +647,10 @@ class HFDownloader:
                 task.status = DownloadStatus.DOWNLOADING
                 task.started_at = time.time()
 
-                # Derive model name from repo_id (last part)
-                model_name = task.repo_id.split("/")[-1]
-                target_dir = self._model_dir / model_name
+                # Preserve {owner}/{model} layout to match other tools
+                # (LMStudio, huggingface-cli) and avoid duplicate downloads
+                # when sharing a model directory.
+                target_dir = self._model_dir / task.repo_id
 
                 api, endpoint = _get_hf_api()
 
@@ -710,6 +751,12 @@ class HFDownloader:
                 DownloadStatus.FAILED,
             ):
                 task.status = DownloadStatus.CANCELLED
+            try:
+                self._cleanup_partial(task)
+            except Exception as e:
+                logger.error(
+                    f"Failed to clean up cancelled download {task.repo_id}: {e}"
+                )
         except RepositoryNotFoundError:
             task.status = DownloadStatus.FAILED
             task.error = (
@@ -838,12 +885,19 @@ class HFDownloader:
         return total
 
     def _cleanup_partial(self, task: DownloadTask) -> None:
-        """Remove partially downloaded model directory."""
-        model_name = task.repo_id.split("/")[-1]
-        target_dir = self._model_dir / model_name
-        if target_dir.exists():
+        """Remove in-progress shards while keeping finalized files for resume.
+
+        Hub stages partial downloads inside a hidden ``._____temp`` directory
+        and only renames a shard into the target on completion. Wiping the
+        whole target dir would also nuke shards the user has already paid
+        for; finalized files are visible in the file browser, so users can
+        keep them for auto-resume on retry or remove them themselves.
+        """
+        target_dir = self._model_dir / task.repo_id
+        temp_dir = target_dir / "._____temp"
+        if temp_dir.exists():
             try:
-                shutil.rmtree(target_dir)
-                logger.info(f"Cleaned up partial download: {target_dir}")
+                shutil.rmtree(temp_dir)
+                logger.info(f"Cleaned up in-progress shards: {temp_dir}")
             except Exception as e:
-                logger.error(f"Failed to clean up {target_dir}: {e}")
+                logger.error(f"Failed to clean up {temp_dir}: {e}")

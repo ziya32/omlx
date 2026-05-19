@@ -7,7 +7,7 @@ from omlx.eval.datasets import deterministic_sample, stratified_sample
 from omlx.eval.gsm8k import GSM8KBenchmark, _extract_numeric_answer, _normalize_number
 from omlx.eval.hellaswag import HellaSwagBenchmark
 from omlx.eval.livecodebench import _extract_code
-from omlx.eval.mmlu import MMLUBenchmark, _parse_choices
+from omlx.eval.mmlu import MMLUBenchmark
 from omlx.eval.truthfulqa import TruthfulQABenchmark
 
 

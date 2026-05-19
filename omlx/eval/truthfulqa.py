@@ -8,7 +8,6 @@ Dataset bundled from truthfulqa/truthful_qa on HuggingFace.
 
 import logging
 import random
-import re
 from pathlib import Path
 from typing import Optional
 

@@ -8,7 +8,6 @@ Dataset bundled from winogrande (winogrande_xl) on HuggingFace.
 """
 
 import logging
-import re
 from pathlib import Path
 from typing import Optional
 

@@ -10,70 +10,12 @@ required. Integration tests (marked @pytest.mark.slow) need a real model.
 
 import base64
 import io
-import json
-import os
 import struct
 import wave
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
-
-
-def _resolve_local_tts_model() -> tuple[str | None, str | None]:
-    """Find a local TTS model in OMLX_MODEL_DIR.  Returns (path, voice_hint).
-
-    Override with OMLX_TEST_TTS_MODEL (path) and OMLX_TEST_TTS_VOICE.
-    Voice hint is auto-derived from the model name when a CustomVoice
-    variant is picked (those reject calls with no voice; the model
-    error message lists the valid speakers explicitly).  Returns None
-    when the chosen model auto-selects a default (Kokoro, VoiceDesign).
-    """
-    voice_hint = os.environ.get("OMLX_TEST_TTS_VOICE")
-    if env := os.environ.get("OMLX_TEST_TTS_MODEL"):
-        return env, voice_hint
-    base = Path(os.environ.get("OMLX_MODEL_DIR") or Path.home() / ".myemee" / "models")
-    if not base.is_dir():
-        return None, voice_hint
-    tts_signals = ("tts", "kokoro", "qwen3_tts", "vibevoice", "chatterbox")
-    candidates: list[tuple[int, str]] = []
-    for sub in sorted(base.iterdir()):
-        if not sub.is_dir():
-            continue
-        cfg_path = sub / "config.json"
-        if not cfg_path.exists():
-            continue
-        try:
-            cfg = json.loads(cfg_path.read_text())
-        except Exception:
-            continue
-        archs = " ".join(cfg.get("architectures") or []).lower()
-        mt = (cfg.get("model_type") or "").lower()
-        name_lower = sub.name.lower()
-        is_tts = (
-            any(s in archs for s in tts_signals)
-            or mt in tts_signals
-            or any(s in name_lower for s in tts_signals)
-        )
-        if not is_tts:
-            continue
-        try:
-            size = sum(f.stat().st_size for f in sub.iterdir() if f.is_file())
-        except OSError:
-            size = 0
-        candidates.append((size, str(sub)))
-    if not candidates:
-        return None, voice_hint
-    candidates.sort()
-    chosen = candidates[0][1]
-    # Auto-supply a voice for CustomVoice variants which reject empty
-    # voice with: "CustomVoice model requires 'voice' (speaker name)".
-    # Only set when the caller didn't already pin one via env var.
-    if voice_hint is None and "customvoice" in Path(chosen).name.lower():
-        voice_hint = "Vivian"
-    return chosen, voice_hint
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -98,14 +40,10 @@ MAX_WAV_CHUNK_SIZE = 0xFFFFFFFF
 
 
 def _make_mock_tts_engine(wav_bytes: bytes = None) -> MagicMock:
-    """Build a mock TTSEngine that returns SpeechOutput with the given WAV bytes."""
-    from omlx.engine.tts import TTSEngine, SpeechOutput
+    """Build a mock TTSEngine that returns the given WAV bytes."""
+    from omlx.engine.tts import TTSEngine
     engine = MagicMock(spec=TTSEngine)
-    engine.synthesize = AsyncMock(return_value=SpeechOutput(
-        audio_bytes=wav_bytes or DUMMY_WAV,
-        sample_rate=22050,
-        duration=0.1,
-    ))
+    engine.synthesize = AsyncMock(return_value=wav_bytes or DUMMY_WAV)
     engine.supports_native_tts_streaming.return_value = False
     return engine
 
@@ -149,13 +87,6 @@ def server_tts_client():
 
     mock_pool = _make_mock_pool()
 
-    mock_settings = MagicMock()
-    mock_settings.get_settings.return_value = MagicMock(
-        display_name=None, default_language="auto", aliases=None,
-        default_voice=None, default_instruct=None,
-    )
-    mock_settings.resolve_model_id = MagicMock(side_effect=lambda m, _: m)
-
     with patch("omlx.server._server_state") as mock_state:
         mock_state.engine_pool = mock_pool
         mock_state.global_settings = None
@@ -163,13 +94,12 @@ def server_tts_client():
         mock_state.hf_downloader = None
         mock_state.ms_downloader = None
         mock_state.mcp_manager = None
-        mock_state.api_key = "test-key"
-        mock_state.settings_manager = mock_settings
-        with TestClient(
-            app,
-            raise_server_exceptions=False,
-            headers={"Authorization": "Bearer test-key"},
-        ) as client:
+        mock_state.api_key = None
+        mock_state.settings_manager = MagicMock()
+        mock_state.settings_manager.resolve_model_id = MagicMock(
+            side_effect=lambda m, _: m
+        )
+        with TestClient(app, raise_server_exceptions=False) as client:
             yield client, mock_pool
 
 
@@ -582,18 +512,16 @@ class TestTTSModelAliasResolution:
             mock_state.hf_downloader = None
             mock_state.ms_downloader = None
             mock_state.mcp_manager = None
-            mock_state.api_key = "test-key"
+            mock_state.api_key = None
             mock_state.settings_manager = mock_settings_manager
             with TestClient(app, raise_server_exceptions=False) as client:
-                client.headers["Authorization"] = "Bearer test-key"
                 response = client.post(
                     "/v1/audio/speech",
                     json={"model": "qwen3-tts", "input": "Hello"},
                 )
                 assert response.status_code == 200
                 # Verify pool.get_engine was called with the resolved ID
-                # (called twice: once for validation, once via _use_engine)
-                mock_pool.get_engine.assert_awaited_with(
+                mock_pool.get_engine.assert_awaited_once_with(
                     "Qwen3-TTS-12Hz-1.7B-Base-bf16"
                 )
 
@@ -615,10 +543,9 @@ class TestTTSModelAliasResolution:
             mock_state.hf_downloader = None
             mock_state.ms_downloader = None
             mock_state.mcp_manager = None
-            mock_state.api_key = "test-key"
+            mock_state.api_key = None
             mock_state.settings_manager = MagicMock()
             with TestClient(app, raise_server_exceptions=False) as client:
-                client.headers["Authorization"] = "Bearer test-key"
                 response = client.post(
                     "/v1/audio/speech",
                     json={
@@ -627,8 +554,7 @@ class TestTTSModelAliasResolution:
                     },
                 )
                 assert response.status_code == 200
-                # (called twice: once for validation, once via _use_engine)
-                mock_pool.get_engine.assert_awaited_with(
+                mock_pool.get_engine.assert_awaited_once_with(
                     "Qwen3-TTS-12Hz-1.7B-Base-bf16"
                 )
 
@@ -725,8 +651,8 @@ class TestTTSVoiceRouting:
                     "Hello", voice=voice_value, instructions=instructions_value,
                     **synth_kwargs,
                 ))
-            except Exception:
-                pass  # AudioError("no audio segments") is expected with empty generate
+            except RuntimeError:
+                pass  # "no audio output" is expected with empty generate
 
             return fake_model.generate.call_args
 
@@ -824,10 +750,8 @@ class TestTTSVoiceClonePassthrough:
                 asyncio.run(engine.synthesize(
                     "Hello", ref_audio=ref_audio_path, ref_text=ref_text,
                 ))
-            except Exception:
-                pass  # mock returns [] → engine raises AudioError; we
-                       # only care about the kwargs the mock saw before
-                       # the engine bailed.
+            except RuntimeError:
+                pass  # "no audio output" expected
 
             return fake_model.generate.call_args
 
@@ -878,13 +802,9 @@ class TestTTSVoiceCloneEndpoint:
             mock_state.hf_downloader = None
             mock_state.ms_downloader = None
             mock_state.mcp_manager = None
-            mock_state.api_key = "test-key"
+            mock_state.api_key = None
             mock_state.settings_manager = MagicMock()
-            with TestClient(
-                app,
-                raise_server_exceptions=False,
-                headers={"Authorization": "Bearer test-key"},
-            ) as client:
+            with TestClient(app, raise_server_exceptions=False) as client:
                 yield client, mock_pool
 
     def test_ref_audio_base64_accepted(self, clone_client):
@@ -1087,8 +1007,8 @@ class TestTTSGenerationParams:
 
             try:
                 asyncio.run(engine.synthesize("Hello", **synth_kwargs))
-            except Exception:
-                pass  # mock returns [] → AudioError; only generate kwargs matter
+            except RuntimeError:
+                pass
 
             return fake_model.generate.call_args
 
@@ -1159,24 +1079,15 @@ class TestTTSIntegration:
 
         from omlx.engine.tts import TTSEngine
 
-        model_name, voice = _resolve_local_tts_model()
-        if model_name is None:
-            pytest.skip(
-                "No local TTS model found in OMLX_MODEL_DIR — "
-                "set OMLX_TEST_TTS_MODEL to override."
-            )
+        model_name = "mlx-community/Kokoro-82M-mlx"
 
         try:
             import asyncio
             engine = TTSEngine(model_name)
             asyncio.run(engine.start())
-            kwargs: dict = {}
-            if voice is not None:
-                kwargs["voice"] = voice
-            result = asyncio.run(engine.synthesize("Hello world", **kwargs))
-            audio_bytes = result.audio_bytes if hasattr(result, "audio_bytes") else result
-            assert isinstance(audio_bytes, bytes)
-            assert audio_bytes[:4] == RIFF_MAGIC
+            result = asyncio.run(engine.synthesize("Hello world", voice="af_heart"))
+            assert isinstance(result, bytes)
+            assert result[:4] == RIFF_MAGIC
             asyncio.run(engine.stop())
         except Exception as e:
             pytest.skip(f"Could not run integration test: {e}")

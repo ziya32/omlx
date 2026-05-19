@@ -110,7 +110,6 @@ class TestHeterogeneousMergeReproduction:
         because they harden the loop with ``or []``), it's safe to
         relax our caller-side guard. Until then, the guard is required.
         """
-        import mlx.core as mx
         from mlx_lm.generate import BatchGenerator
 
         model, tokenizer = small_model

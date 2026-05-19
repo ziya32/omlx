@@ -14,7 +14,7 @@ class _FakeResponse:
 
     def __init__(self, status_code, data=None):
         self.status_code = status_code
-        self._data = data or {}
+        self._data = data if data is not None else []
 
     def json(self):
         return self._data
@@ -38,8 +38,6 @@ class TestCheckUpdate:
     @pytest.mark.asyncio
     async def test_update_available(self):
         """Should return update_available=True when newer version exists."""
-        # /releases returns a list; the endpoint picks the highest stable
-        # PEP 440 tag via select_latest_stable_release (#981).
         fake_resp = _FakeResponse(200, [{
             "tag_name": "v99.0.0",
             "html_url": "https://github.com/jundot/omlx/releases/tag/v99.0.0",

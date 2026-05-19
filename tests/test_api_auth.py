@@ -2,7 +2,6 @@
 """Tests for API key authentication."""
 
 import pytest
-from fastapi.testclient import TestClient
 from unittest.mock import MagicMock
 
 # Note: These tests need a mock server setup since the actual server requires models
@@ -344,7 +343,6 @@ class TestAdminAuth:
     def test_verify_api_key_constant_time(self):
         """Test that API key comparison uses constant time."""
         from omlx.admin.auth import verify_api_key
-        import secrets
 
         server_key = "test-api-key-12345"
 

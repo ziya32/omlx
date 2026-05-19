@@ -13,12 +13,12 @@ Note: Uses pytest-asyncio for async tests.
 """
 
 import asyncio
-from unittest.mock import MagicMock, patch, AsyncMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from omlx.engine_core import EngineCore, AsyncEngineCore, EngineConfig
-from omlx.request import Request, RequestOutput, RequestStatus, SamplingParams
+from omlx.request import RequestOutput, SamplingParams
 from omlx.scheduler import SchedulerConfig
 
 

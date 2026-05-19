@@ -26,7 +26,7 @@ import gc
 import os
 import sys
 from pathlib import Path
-from typing import Iterator, List, Optional
+from typing import List, Optional
 
 import pytest
 

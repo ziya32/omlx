@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 from .base import BaseBenchmark
-from .datasets import deterministic_sample, stratified_sample, load_jsonl
+from .datasets import stratified_sample, load_jsonl
 
 logger = logging.getLogger(__name__)
 

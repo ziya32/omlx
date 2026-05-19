@@ -7,7 +7,7 @@ cache types across layers (e.g., Qwen3-Next with ArraysCache + KVCache).
 """
 
 from dataclasses import dataclass, field
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Tuple
 import logging
 
 from .type_handlers import CacheType, CacheTypeHandler

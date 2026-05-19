@@ -20,7 +20,6 @@ from omlx.api.adapters.openai import OpenAIAdapter
 from omlx.api.openai_models import (
     ChatCompletionRequest,
     ChatCompletionResponse,
-    ContentPart,
     Message,
     ToolDefinition,
 )

@@ -651,7 +651,6 @@ def _prepare_vlm_inputs(
 
 def _test_9k_cache_consistency(model, tokenizer, label: str = "LLM"):
     """Test boundary cache and SSD cache produce consistent outputs."""
-    import mlx.core as mx
 
     print(f"\n  [Test 1/{label}] 9K context cache consistency...")
     prompt_token_ids = _build_9k_prompt(tokenizer)
@@ -908,7 +907,6 @@ def _test_vlm_engine_basics(adapter, tokenizer):
 
 def _test_vlm_image_caching(vlm_model, processor, adapter):
     """Test image caching works across multi-turn VLM conversations."""
-    import mlx.core as mx
 
     from omlx.utils.image import compute_image_hash
 
@@ -990,7 +988,6 @@ def _test_vlm_image_caching(vlm_model, processor, adapter):
 
 def _test_vlm_multiturn_quality(vlm_model, processor, adapter):
     """Test coherent responses across 3 multi-turn VLM conversations with images."""
-    import mlx.core as mx
 
     print("\n  [Test 6] VLM multi-turn image quality...")
 
@@ -1073,7 +1070,6 @@ def _test_vlm_multiturn_quality(vlm_model, processor, adapter):
 
 def _test_vlm_image_batch(vlm_model, processor, adapter):
     """Test image caching during concurrent VLM batch processing."""
-    import mlx.core as mx
 
     print("\n  [Test 7] VLM image caching with 4-request batching...")
 

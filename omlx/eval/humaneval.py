@@ -11,7 +11,6 @@ machine. Mitigations: subprocess with timeout, memory limits, temp file cleanup.
 """
 
 import asyncio
-import json
 import logging
 import os
 import re

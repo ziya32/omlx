@@ -13,7 +13,6 @@ actually dispatch to the executor rather than running inline on the
 asyncio event loop thread.
 """
 
-import asyncio
 import threading
 import wave
 from unittest.mock import MagicMock, patch

@@ -6,13 +6,11 @@ Tests the AnthropicAdapter class for converting between Anthropic Messages API
 format and internal oMLX format.
 """
 
-import json
 import pytest
 
 from omlx.api.adapters.anthropic import AnthropicAdapter
 from omlx.api.adapters.base import (
     BaseAdapter,
-    InternalMessage,
     InternalRequest,
     InternalResponse,
     StreamChunk,
@@ -20,9 +18,6 @@ from omlx.api.adapters.base import (
 from omlx.api.anthropic_models import (
     AnthropicMessage,
     AnthropicTool,
-    ContentBlockText,
-    ContentBlockToolResult,
-    ContentBlockToolUse,
     MessagesRequest,
 )
 

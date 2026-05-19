@@ -7,7 +7,6 @@ Dataset bundled from nlp-waseda/JMMLU on HuggingFace.
 """
 
 import logging
-import re
 from pathlib import Path
 from typing import Optional
 

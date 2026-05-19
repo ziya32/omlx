@@ -572,7 +572,7 @@ class TestExclusivePinnedConcurrent:
                 failures.append(f"{label}: {result}")
 
         assert not failures, (
-            f"Concurrent all-model test failures:\n"
+            "Concurrent all-model test failures:\n"
             + "\n".join(failures)
         )
 
@@ -619,7 +619,7 @@ class TestExclusivePinnedConcurrent:
                 failures.append(f"{label}: {result}")
 
         assert not failures, (
-            f"Post-VLM burst small model failures:\n"
+            "Post-VLM burst small model failures:\n"
             + "\n".join(failures)
         )
 
@@ -638,5 +638,5 @@ class TestExclusivePinnedConcurrent:
                 failures.append(f"VLM-{i}: {result}")
 
         assert not failures, (
-            f"Concurrent VLM failures:\n" + "\n".join(failures)
+            "Concurrent VLM failures:\n" + "\n".join(failures)
         )

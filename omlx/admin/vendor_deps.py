@@ -9,7 +9,6 @@ Usage:
     python vendor_deps.py
 """
 
-import re
 import ssl
 import urllib.request
 from pathlib import Path

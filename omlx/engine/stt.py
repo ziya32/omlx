@@ -2,35 +2,54 @@
 """
 STT (Speech-to-Text) engine for oMLX.
 
-This module provides an engine for speech-to-text transcription using
-mlx_audio.stt (Whisper, Qwen3-ASR, etc.). Unlike LLM engines, STT engines
-don't support streaming or chat completion.
+This module provides an engine for audio transcription using mlx-audio.
+Unlike LLM engines, STT engines don't support streaming or chat completion.
+mlx-audio is imported lazily inside start() to avoid module-level import errors
+when mlx-audio is not installed.
 """
 
 import asyncio
 import gc
 import logging
-import time
-from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any
 
 import mlx.core as mx
 
 from ..engine_core import get_mlx_executor
-from ..exceptions import AudioError, InvalidAudioFormatError
 from .base import BaseNonStreamingEngine
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class TranscriptionOutput:
-    """Output from STT transcription."""
+# Lowercase full-names work for both Qwen3-ASR (its _build_prompt lowercases
+# the supported-language list before lookup) and Whisper (its TO_LANGUAGE_CODE
+# normalizer maps lowercase names to ISO codes). Capitalized names would break
+# Whisper because `<|Chinese|>` is not a valid language token.
+_ISO_TO_STT_LANG: dict[str, str] = {
+    "zh": "chinese",
+    "yue": "cantonese",
+    "en": "english",
+    "de": "german",
+    "es": "spanish",
+    "fr": "french",
+    "it": "italian",
+    "pt": "portuguese",
+    "ru": "russian",
+    "ko": "korean",
+    "ja": "japanese",
+}
 
-    text: str
-    language: str | None = None
-    duration: float | None = None
-    segments: list[dict] | None = None  # Raw segment dicts from mlx-audio
+
+def _normalize_stt_generate_language(language: str | None) -> str | None:
+    """Map OpenAI-style ISO codes to language names accepted by mlx-audio backends."""
+    if language is None:
+        return None
+
+    normalized = language.strip()
+    if not normalized:
+        return None
+
+    return _ISO_TO_STT_LANG.get(normalized.lower(), normalized)
 
 
 # ---------------------------------------------------------------------------
@@ -84,17 +103,20 @@ def _validate_stt_processor(model_name: str, model: Any) -> None:
     # to None when WhisperProcessor.from_pretrained() failed on load.
     if not hasattr(model, "_processor"):
         return
-    if getattr(model, "_processor") is not None:
+    if model._processor is not None:
         return
     raise RuntimeError(_missing_processor_hint(model_name))
 
 
 class STTEngine(BaseNonStreamingEngine):
     """
-    Engine for speech-to-text transcription.
+    Engine for audio transcription (Speech-to-Text).
 
-    This engine wraps mlx_audio.stt and provides async methods
+    This engine wraps mlx-audio STT models and provides async methods
     for integration with the oMLX server.
+
+    Unlike BaseEngine, this doesn't support streaming or chat
+    since transcription is computed in a single forward pass.
     """
 
     def __init__(self, model_name: str, **kwargs):
@@ -108,15 +130,21 @@ class STTEngine(BaseNonStreamingEngine):
         super().__init__()
         self._model_name = model_name
         self._model = None
-        self._total_operations: int = 0
-        self._total_audio_seconds: float = 0.0
-        self._total_processing_seconds: float = 0.0
+        self._kwargs = kwargs
 
     @property
     def model_name(self) -> str:
+        """Get the model name."""
         return self._model_name
 
     async def start(self) -> None:
+        """Start the engine (load model if not loaded).
+
+        Model loading runs on the global MLX executor to avoid Metal
+        command buffer races with concurrent BatchGenerator steps.
+        mlx-audio is imported here (lazily) to avoid module-level errors
+        when the package is not installed.
+        """
         if self._model is not None:
             return
 
@@ -130,350 +158,175 @@ class STTEngine(BaseNonStreamingEngine):
                 'Install it with: pip install "omlx[audio]"'
             ) from exc
 
-        # See engine/tts.py: mlx-audio's qwen3-asr imports samplers from
-        # mlx-lm whose @mx.compile decorator freezes RNG state inside our
-        # worker-thread executor.  Swap in the non-compile copies before
-        # any transcribe call runs (no-op when temp == 0, but matters as
-        # soon as a caller raises temperature for noisy audio).
-        from ..utils.sampling import patch_mlx_audio_samplers
-        patch_mlx_audio_samplers()
-
         model_name = self._model_name
 
-        def _load_stt_sync():
-            if __debug__:
-                logger.debug(f"[STT] Loading model on MLX executor thread: {model_name}")
+        def _load_sync():
             # load_model returns a single nn.Module, not a tuple
             return _load_model(model_name)
 
         loop = asyncio.get_running_loop()
         try:
-            model = await loop.run_in_executor(get_mlx_executor(), _load_stt_sync)
+            model = await loop.run_in_executor(get_mlx_executor(), _load_sync)
         except Exception as exc:
             # #800: MLX-packaged repos (Qwen3-ASR-*-MLX-*, some mlx-community
             # whisper variants) often omit preprocessor_config.json, which
             # mlx-audio / HuggingFace AutoFeatureExtractor reports with an
             # opaque OSError. Re-raise with an actionable message instead.
-            raise _wrap_stt_load_error(self._model_name, exc) from exc
+            raise _wrap_stt_load_error(model_name, exc) from exc
 
         # #800: Whisper models in mlx-audio load silently without a
         # HuggingFace processor when preprocessor_config.json is missing
         # (mlx-audio only emits a warning). Fail fast at start so callers
         # see the real problem instead of a downstream "Processor not found"
         # 500 during transcribe.
-        _validate_stt_processor(self._model_name, model)
+        _validate_stt_processor(model_name, model)
 
         self._model = model
         logger.info(f"STT engine started: {self._model_name}")
 
     async def stop(self) -> None:
+        """Stop the engine and cleanup resources."""
         if self._model is None:
             return
 
         logger.info(f"Stopping STT engine: {self._model_name}")
-        # Mark terminal BEFORE clearing the model ref so any handler
-        # racing with stop() sees RequestAbortedError via
-        # _raise_if_aborted instead of a RuntimeError from the model
-        # guard. See docs/enforcer-eviction-review.md #4.
-        self._mark_stopped()
         self._model = None
+
         gc.collect()
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(get_mlx_executor(), mx.clear_cache)
+        await loop.run_in_executor(
+            get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
+        )
         logger.info(f"STT engine stopped: {self._model_name}")
 
     async def transcribe(
         self,
         audio_path: str,
-        language: str = "auto",
-        prompt: str | None = None,
-        on_progress: Any | None = None,
-    ) -> TranscriptionOutput:
+        language: str | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
         """
-        Transcribe audio file to text.
-
-        All MLX GPU operations run on the global MLX executor to prevent
-        Metal command buffer races with concurrent engine inference.
-
-        For language="auto", performs two-pass detection:
-          1. Quick 30s prefix for language detection
-          2. Full transcription with detected language
+        Transcribe an audio file.
 
         Args:
-            audio_path: Path to the audio file
-            language: ISO language code or "auto" for detection
-            prompt: Optional prompt to guide transcription (Whisper models)
+            audio_path: Path to the audio file to transcribe
+            language: Optional language code (e.g. 'en', 'fr')
+            **kwargs: Additional model-specific parameters
 
         Returns:
-            TranscriptionOutput with transcribed text, language, duration, and segments
+            Dictionary with keys:
+                text: Transcribed text
+                language: Detected or specified language
+                segments: List of timed segments (may be empty)
+                duration: Audio duration in seconds
         """
-        # Check abort FIRST so a handler racing with stop() sees the
-        # typed RequestAbortedError (→ HTTP 503) rather than the plain
-        # RuntimeError from the model guard (→ HTTP 500).
-        self._raise_if_aborted()
         if self._model is None:
             raise RuntimeError("Engine not started. Call start() first.")
 
-        model = self._model
-        start_time = time.perf_counter()
+        import os
+        import time
 
-        with self._active_lock:
-            self._active_count += 1
+        file_size = os.path.getsize(audio_path) if os.path.exists(audio_path) else 0
+        logger.info(
+            "STT transcribe: model=%s, file=%s (%d bytes), language=%s",
+            self._model_name, os.path.basename(audio_path), file_size, language,
+        )
+
+        model = self._model
+        t0 = time.monotonic()
+
+        def _normalize_segment(s) -> dict:
+            """Convert any segment type to a plain dict."""
+            if isinstance(s, dict):
+                return s
+            # dataclass → asdict
+            import dataclasses
+            if dataclasses.is_dataclass(s) and not isinstance(s, type):
+                return dataclasses.asdict(s)
+            # object with __dict__
+            if hasattr(s, "__dict__"):
+                return vars(s)
+            return {"text": str(s)}
+
+        def _normalize_language(raw_lang):
+            """Normalize language field from mlx-audio."""
+            if isinstance(raw_lang, list):
+                raw_lang = raw_lang[0] if raw_lang else None
+            if isinstance(raw_lang, str) and raw_lang.lower() == "none":
+                return None
+            return raw_lang
+
+        def _transcribe_sync():
+            # Call model.generate() directly instead of
+            # generate_transcription() which writes files to disk.
+            gen_kwargs = dict(kwargs)
+            generate_language = _normalize_stt_generate_language(language)
+            if generate_language is not None:
+                gen_kwargs["language"] = generate_language
+
+            result = model.generate(audio_path, **gen_kwargs)
+
+            # result is typically an STTOutput dataclass with:
+            # text, segments, language, total_time, etc.
+            if hasattr(result, "text"):
+                raw_lang = _normalize_language(
+                    getattr(result, "language", None)
+                )
+                if raw_lang is None:
+                    raw_lang = language
+
+                raw_segs = getattr(result, "segments", None)
+                segments = [
+                    _normalize_segment(s) for s in raw_segs
+                ] if raw_segs else []
+
+                return {
+                    "text": result.text or "",
+                    "language": raw_lang,
+                    "segments": segments,
+                    "duration": getattr(
+                        result, "total_time", 0.0
+                    ),
+                }
+            # Fallback for unexpected return types
+            return {
+                "text": str(result),
+                "language": language,
+                "segments": [],
+                "duration": 0.0,
+            }
+
+        activity_id = self._begin_activity(
+            "transcribing",
+            detail="Transcribing",
+            metadata={"file_size_bytes": file_size},
+        )
         try:
-            return await self._do_transcribe(model, audio_path, language, prompt, on_progress)
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                get_mlx_executor(), _transcribe_sync
+            )
+
+            elapsed = time.monotonic() - t0
+            text_len = len(result.get("text", ""))
+            logger.info(
+                "STT transcribe done: model=%s, %.2fs, %d chars output",
+                self._model_name, elapsed, text_len,
+            )
+            return result
         finally:
-            elapsed = time.perf_counter() - start_time
-            self._total_operations += 1
-            self._total_processing_seconds += elapsed
-            if self._decrement_active():
+            if self._end_activity(activity_id):
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
                     get_mlx_executor(),
                     lambda: (mx.synchronize(), mx.clear_cache()),
                 )
 
-    async def _do_transcribe(
-        self,
-        model: Any,
-        audio_path: str,
-        language: str,
-        prompt: str | None,
-        on_progress: Any | None = None,
-    ) -> TranscriptionOutput:
-        loop = asyncio.get_running_loop()
-        executor = get_mlx_executor()
-
-        # Step 1: Load audio and split into chunks on executor.
-        # For audio <= 60s this returns a single chunk and falls
-        # through to the fast single-call path.
-        def _load_and_split():
-            import numpy as np
-            from mlx_audio.stt.utils import load_audio
-            from mlx_audio.stt.models.qwen3_asr.qwen3_asr import (
-                split_audio_into_chunks,
-            )
-
-            if __debug__:
-                logger.debug(f"[STT] Loading audio: {audio_path}")
-            try:
-                audio = load_audio(audio_path)
-            except (OSError, IOError) as e:
-                raise InvalidAudioFormatError(
-                    f"Failed to read audio file: {e}"
-                ) from e
-            except Exception as e:
-                raise InvalidAudioFormatError(
-                    f"Invalid audio format: {e}"
-                ) from e
-            audio_np = (
-                np.array(audio) if isinstance(audio, mx.array) else audio
-            )
-            sr = getattr(model, "sample_rate", 16000)
-            # Use 60s chunks so each executor hold is ~2-5s, allowing
-            # other engines (LLM, embedding) to interleave.
-            return split_audio_into_chunks(
-                audio_np, sr=sr, chunk_duration=60.0
-            )
-
-        try:
-            chunks = await loop.run_in_executor(executor, _load_and_split)
-            self._raise_if_aborted()
-        except (ImportError, AttributeError, TypeError):
-            # Model doesn't support split_audio_into_chunks (not Qwen3-ASR)
-            # or has incompatible types (e.g. non-numeric sample_rate)
-            # — fall back to single-call path
-            chunks = None
-
-        if chunks is None or len(chunks) == 1:
-            # Short audio or unsupported model — single executor call
-            return await self._transcribe_single(
-                model, audio_path, language, prompt
-            )
-
-        # Step 2: Long audio — process each chunk separately, yielding
-        # the executor between chunks so LLM token generation can
-        # interleave during transcription of very long audio (20+ min).
-        logger.info(
-            f"[STT] Long audio split into {len(chunks)} chunks, "
-            "yielding executor between chunks"
-        )
-        all_texts: list[str] = []
-        all_segments: list[dict] = []
-        detected_lang: str | None = None
-
-        for chunk_audio, offset_sec in chunks:
-
-            def _transcribe_chunk(
-                audio_chunk=chunk_audio, offset=offset_sec
-            ):
-                from mlx_audio.stt.generate import generate_transcription
-
-                kw: dict[str, Any] = {}
-                if language and language != "auto":
-                    kw["language"] = language
-                if prompt:
-                    kw["initial_prompt"] = prompt
-
-                try:
-                    return generate_transcription(
-                        model=model, audio=audio_chunk, **kw
-                    ), offset
-                except Exception as e:
-                    raise AudioError(
-                        f"Transcription failed on chunk at {offset:.0f}s: {e}"
-                    ) from e
-
-            result, offset = await loop.run_in_executor(
-                executor, _transcribe_chunk
-            )
-            # Abort between chunks — discards the current chunk result
-            # and aborts the whole multi-chunk transcription.
-            self._raise_if_aborted()
-
-            all_texts.append(result.text or "")
-
-            if on_progress is not None:
-                await on_progress(
-                    chunk=len(all_texts),
-                    total_chunks=len(chunks),
-                    chunk_text=result.text or "",
-                )
-
-            raw_lang = result.language
-            if isinstance(raw_lang, list):
-                detected_lang = raw_lang[0] if raw_lang else detected_lang
-            elif raw_lang and raw_lang != "None":
-                detected_lang = raw_lang
-
-            if result.segments:
-                for seg in result.segments:
-                    if isinstance(seg, dict):
-                        adjusted = dict(seg)
-                        adjusted["start"] = seg.get("start", 0.0) + offset
-                        adjusted["end"] = seg.get("end", 0.0) + offset
-                        all_segments.append(adjusted)
-
-        # CJK languages don't use spaces between words
-        sep = "" if detected_lang in ("zh", "ja", "ko", "yue") else " "
-        full_text = sep.join(t for t in all_texts if t)
-        duration = all_segments[-1].get("end") if all_segments else None
-
-        output = TranscriptionOutput(
-            text=full_text,
-            language=detected_lang,
-            duration=duration,
-            segments=all_segments if all_segments else None,
-        )
-        if output.duration:
-            self._total_audio_seconds += output.duration
-        return output
-
-    async def _transcribe_single(
-        self,
-        model: Any,
-        audio_path: str,
-        language: str,
-        prompt: str | None,
-    ) -> TranscriptionOutput:
-        """Transcribe audio in a single executor call (short audio or fallback)."""
-
-        def _transcribe_sync() -> TranscriptionOutput:
-            from mlx_audio.stt.generate import generate_transcription
-
-            if __debug__:
-                logger.debug(f"[STT] Transcribing on MLX executor thread: {audio_path}")
-
-            kw: dict[str, Any] = {}
-            if language and language != "auto":
-                kw["language"] = language
-            if prompt:
-                kw["initial_prompt"] = prompt
-
-            try:
-                result = generate_transcription(
-                    model=model, audio=audio_path, **kw
-                )
-            except (OSError, IOError) as e:
-                raise InvalidAudioFormatError(
-                    f"Failed to read audio file: {e}"
-                ) from e
-            except Exception as e:
-                err_msg = str(e).lower()
-                if "audio" in err_msg or "wav" in err_msg or "format" in err_msg:
-                    raise InvalidAudioFormatError(
-                        f"Invalid audio format: {e}"
-                    ) from e
-                raise AudioError(
-                    f"Transcription failed: {e}"
-                ) from e
-
-            text = result.text or ""
-            raw_lang = result.language
-            if isinstance(raw_lang, list):
-                detected_lang = raw_lang[0] if raw_lang else None
-            else:
-                detected_lang = raw_lang
-            if detected_lang == "None":
-                detected_lang = None
-            duration = None
-            segments = None
-            if result.segments:
-                last_seg = result.segments[-1]
-                if isinstance(last_seg, dict):
-                    duration = last_seg.get("end")
-                segments = list(result.segments)
-
-            return TranscriptionOutput(
-                text=text,
-                language=detected_lang,
-                duration=duration,
-                segments=segments,
-            )
-
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(
-            get_mlx_executor(), _transcribe_sync
-        )
-        self._raise_if_aborted()
-        if result.duration:
-            self._total_audio_seconds += result.duration
-        return result
-
-    def get_languages(self) -> list[str]:
-        """List supported languages for this STT model."""
-        if self._model is None:
-            return []
-        try:
-            tokenizer = getattr(self._model, "tokenizer", None)
-            if tokenizer:
-                # Whisper tokenizer pattern
-                all_langs = getattr(tokenizer, "all_language_tokens", None)
-                if isinstance(all_langs, dict):
-                    return sorted(all_langs.keys())
-                # Fallback: check for language_to_id mapping
-                lang_map = getattr(tokenizer, "language_to_id", None)
-                if isinstance(lang_map, dict):
-                    return sorted(lang_map.keys())
-        except Exception:
-            pass
-        return []
-
-    def get_stats(self) -> Dict[str, Any]:
+    def get_stats(self) -> dict[str, Any]:
+        """Get engine statistics."""
         return {
             "model_name": self._model_name,
             "loaded": self._model is not None,
-            "active_operations": self._active_count,
-            "total_operations": self._total_operations,
-            "total_audio_seconds": round(self._total_audio_seconds, 2),
-            "total_processing_seconds": round(self._total_processing_seconds, 2),
-        }
-
-    def get_model_info(self) -> Dict[str, Any]:
-        if self._model is None:
-            return {"loaded": False, "model_name": self._model_name}
-        return {
-            "loaded": True,
-            "model_name": self._model_name,
         }
 
     def __repr__(self) -> str:

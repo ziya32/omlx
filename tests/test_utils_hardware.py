@@ -5,7 +5,6 @@ import platform
 import sys
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 from omlx.utils.hardware import (
     DEFAULT_MEMORY_BYTES,

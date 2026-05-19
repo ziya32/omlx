@@ -15,12 +15,11 @@ All tests run with mocked engines — mlx-audio is not required.
 
 import asyncio
 import json
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from omlx.engine_pool import EngineEntry, EnginePool, EngineState
+from omlx.engine_pool import EnginePool, EngineState
 
 
 # ---------------------------------------------------------------------------

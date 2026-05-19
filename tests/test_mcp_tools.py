@@ -5,7 +5,6 @@ Tests for MCP tool utilities (omlx/mcp/tools.py).
 
 import json
 
-import pytest
 
 from omlx.mcp.tools import (
     extract_tool_calls,

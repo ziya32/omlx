@@ -1,12 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for models/vlm.py — VLMModelAdapter for BatchGenerator compatibility."""
 
-from unittest.mock import MagicMock, PropertyMock, patch
+from unittest.mock import MagicMock
 
-import pytest
 
 # Mock mlx before importing the module
-import sys
 
 
 # Create mock mlx modules

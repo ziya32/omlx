@@ -3,10 +3,8 @@
 _model_status_entry, and error code propagation."""
 
 import json
-from pathlib import Path
 from unittest.mock import MagicMock
 
-import pytest
 
 from omlx.engine_pool import EngineEntry, EnginePool, EngineState
 

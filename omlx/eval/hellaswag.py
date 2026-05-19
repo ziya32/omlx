@@ -7,7 +7,6 @@ Dataset bundled from Rowan/hellaswag on HuggingFace.
 """
 
 import logging
-import re
 from pathlib import Path
 from typing import Optional
 

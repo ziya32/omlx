@@ -157,7 +157,6 @@ class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         """Format the log record as JSON."""
         import json
-        import time
 
         log_data = {
             "timestamp": self.formatTime(record, self.datefmt),

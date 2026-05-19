@@ -11,10 +11,8 @@ All tests run without mlx-audio installed — only config.json parsing is tested
 import json
 from pathlib import Path
 
-import pytest
 
 from omlx.model_discovery import (
-    DiscoveredModel,
     _is_unsupported_model,
     detect_model_type,
     discover_models,

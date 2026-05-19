@@ -1,9 +1,7 @@
 """Tests for the enable_thinking toggle and detect_thinking_default heuristic."""
 
 import json
-from pathlib import Path
 
-import pytest
 
 from omlx.model_discovery import detect_preserve_thinking, detect_thinking_default
 from omlx.model_settings import ModelSettings

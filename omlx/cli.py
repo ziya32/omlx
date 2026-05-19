@@ -97,7 +97,7 @@ def serve_command(args):
     import uvicorn
 
     from ._version import __version__
-    from .settings import init_settings, get_settings
+    from .settings import init_settings
     from .logging_config import configure_file_logging, AdminStatsAccessFilter
 
     try:
@@ -106,8 +106,8 @@ def serve_command(args):
         build_number = None
 
     # Print version banner
-    print(f"\033[33moMLX - LLM inference, optimized for your Mac\033[0m")
-    print(f"\033[33m├─ https://github.com/jundot/omlx\033[0m")
+    print("\033[33moMLX - LLM inference, optimized for your Mac\033[0m")
+    print("\033[33m├─ https://github.com/jundot/omlx\033[0m")
     if build_number:
         print(f"\033[33m├─ Version: {__version__}\033[0m")
         print(f"\033[33m└─ Build: {build_number}\033[0m")
@@ -324,8 +324,12 @@ def serve_command(args):
 
 
 
-def launch_command(args):
-    """Launch an external tool integrated with oMLX."""
+def launch_command(args, extra_args: list[str] | None = None):
+    """Launch an external tool integrated with oMLX.
+
+    extra_args are unknown CLI tokens forwarded to the underlying tool binary
+    (e.g. ``-r`` / ``--resume <id>`` for Claude Code).
+    """
     import requests
 
     from .integrations import get_integration, list_integrations
@@ -351,8 +355,13 @@ def launch_command(args):
     host = args.host or settings.server.host
     port = args.port or settings.server.port
 
+    # 0.0.0.0 is a valid bind address but not a valid connect address.
+    # Fall back to localhost so launch can reach the server regardless
+    # of which interface it was bound to.
+    connect_host = host if host and host != "0.0.0.0" else "127.0.0.1"
+
     # Check if oMLX server is running
-    base_url = f"http://{host}:{port}"
+    base_url = f"http://{connect_host}:{port}"
     try:
         resp = requests.get(f"{base_url}/health", timeout=3)
         resp.raise_for_status()
@@ -361,13 +370,23 @@ def launch_command(args):
         print("Start the server first: omlx serve")
         sys.exit(1)
 
-    # Get API key from CLI args
-    api_key = getattr(args, "api_key", None) or ""
+    # Get API key: CLI args > settings.json > empty
+    api_key = getattr(args, "api_key", None) or settings.auth.api_key or ""
 
     # Build headers for authenticated requests
     headers = {}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
+
+    # Pre-fetch model status (context_window, max_tokens, model_type per model)
+    models_status_map: dict[str, dict] = {}
+    try:
+        resp = requests.get(f"{base_url}/v1/models/status", headers=headers, timeout=5)
+        if resp.ok:
+            for m in resp.json().get("models", []):
+                models_status_map[m["id"]] = m
+    except Exception:
+        pass
 
     # Determine model
     model = args.model
@@ -393,19 +412,13 @@ def launch_command(args):
             model = models[0]
             print(f"Using model: {model}")
         else:
-            print("Available models:")
-            for i, m in enumerate(models, 1):
-                print(f"  {i}. {m}")
-            while True:
-                try:
-                    choice = input("Select model number: ").strip()
-                    idx = int(choice) - 1
-                    if 0 <= idx < len(models):
-                        model = models[idx]
-                        break
-                    print(f"Please enter 1-{len(models)}")
-                except (ValueError, EOFError):
-                    print(f"Please enter 1-{len(models)}")
+            models_info_list = [
+                {"id": m_id, **models_status_map.get(m_id, {})}
+                for m_id in models
+            ]
+            model = integration.select_model(
+                models_info_list, integration.display_name
+            )
 
     # Check if tool is installed
     if not integration.is_installed():
@@ -413,21 +426,11 @@ def launch_command(args):
         print(f"Install: {integration.install_hint}")
         sys.exit(1)
 
-    # Fetch model limits from server
-    context_window = None
-    max_tokens = None
-    model_type = None
-    try:
-        resp = requests.get(f"{base_url}/v1/models/status", headers=headers, timeout=5)
-        if resp.ok:
-            for m in resp.json().get("models", []):
-                if m["id"] == model:
-                    context_window = m.get("max_context_window")
-                    max_tokens = m.get("max_tokens")
-                    model_type = m.get("model_type")
-                    break
-    except Exception:
-        pass
+    # Resolve model limits from pre-fetched status
+    model_info = models_status_map.get(model, {})
+    context_window = model_info.get("max_context_window")
+    max_tokens = model_info.get("max_tokens")
+    model_type = model_info.get("model_type")
 
     # Launch
     print(f"Launching {integration.display_name} with model {model}...")
@@ -436,11 +439,12 @@ def launch_command(args):
         port=port,
         api_key=api_key,
         model=model,
-        host=host,
+        host=connect_host,
         tools_profile=tools_profile,
         context_window=context_window,
         max_tokens=max_tokens,
         model_type=model_type,
+        extra_args=extra_args,
     )
 
 
@@ -461,7 +465,7 @@ def diagnose_menubar() -> int:
 
     mac_ver = platform.mac_ver()[0] or "unknown"
     print(f"macOS:          {mac_ver}")
-    print(f"Bundle ID:      com.omlx.app")
+    print("Bundle ID:      com.omlx.app")
 
     app_path = Path("/Applications/oMLX.app")
     print(f"App installed:  {'yes' if app_path.exists() else 'NO (install DMG first)'}")
@@ -603,6 +607,16 @@ Example directory structure:
         default=None,
         help="Log level (default: info). trace includes full message content",
     )
+    serve_parser.add_argument(
+        "--sse-keepalive-mode",
+        type=str,
+        choices=["chunk", "comment", "off"],
+        default=None,
+        help="SSE keepalive emission mode (default: chunk). 'chunk' emits "
+        "protocol-aware no-op events compatible with strict clients like "
+        "OpenClaw / WorkBuddy; 'comment' emits the legacy ': keep-alive' SSE "
+        "comment; 'off' disables keepalive entirely",
+    )
 
     # Scheduler options (for BatchedEngine)
     serve_parser.add_argument(
@@ -726,13 +740,13 @@ Example directory structure:
     launch_parser = subparsers.add_parser(
         "launch",
         help="Launch an external tool with oMLX integration",
-        description="Configure and launch external coding tools (Codex, OpenCode, OpenClaw, Pi) "
+        description="Configure and launch external coding tools (Claude Code, Copilot, Codex, OpenCode, OpenClaw, Hermes Agent, Pi) "
         "to use the running oMLX server.",
     )
     launch_parser.add_argument(
         "tool",
         type=str,
-        help="Tool to launch: codex, opencode, openclaw, pi, or 'list' to show available",
+        help="Tool to launch: claude, copilot, codex, opencode, openclaw, hermes, pi, or 'list' to show available",
     )
     launch_parser.add_argument(
         "--model",
@@ -779,17 +793,23 @@ Example directory structure:
         help="What to diagnose. 'menubar' checks Tahoe ControlCenter visibility.",
     )
 
-    args = parser.parse_args()
+    # Use parse_known_args so `omlx launch <tool> -- ...` can forward unknown
+    # tokens (e.g. `-r`, `--resume <id>`) to the underlying tool binary.
+    # Non-launch commands keep the previous strictness by rejecting unknowns.
+    args, extra_args = parser.parse_known_args()
 
-    if args.command == "serve":
-        serve_command(args)
-    elif args.command == "launch":
-        launch_command(args)
-    elif args.command == "diagnose":
-        sys.exit(diagnose_command(args))
+    if args.command == "launch":
+        launch_command(args, extra_args=extra_args)
     else:
-        parser.print_help()
-        sys.exit(1)
+        if extra_args:
+            parser.error(f"unrecognized arguments: {' '.join(extra_args)}")
+        if args.command == "serve":
+            serve_command(args)
+        elif args.command == "diagnose":
+            sys.exit(diagnose_command(args))
+        else:
+            parser.print_help()
+            sys.exit(1)
 
 
 if __name__ == "__main__":

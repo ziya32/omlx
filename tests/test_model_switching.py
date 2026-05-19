@@ -15,11 +15,11 @@ import json
 import logging
 import time
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
-from omlx.engine_pool import EngineEntry, EnginePool, EngineState, LOAD_COOLDOWN
+from omlx.engine_pool import EnginePool, EngineState, LOAD_COOLDOWN
 from omlx.exceptions import (
     ModelLoadingError,
     ModelNotFoundError,

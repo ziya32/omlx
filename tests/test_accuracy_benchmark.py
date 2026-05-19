@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for accuracy benchmark orchestration."""
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -9,7 +8,6 @@ import pytest
 from omlx.admin.accuracy_benchmark import (
     VALID_BENCHMARKS,
     AccuracyBenchmarkRequest,
-    AccuracyBenchmarkRun,
     _accumulated_results,
     add_to_queue,
     cleanup_old_runs,

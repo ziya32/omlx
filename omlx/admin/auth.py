@@ -7,10 +7,8 @@ and API key verification for admin panel access.
 
 import os
 import secrets
-from typing import Optional
 
 from fastapi import HTTPException, Request
-from fastapi.responses import RedirectResponse
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
 # Session configuration

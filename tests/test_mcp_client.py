@@ -7,8 +7,7 @@ requiring actual MCP server connections.
 """
 
 import asyncio
-from typing import Any, Dict, List
-from unittest.mock import AsyncMock, MagicMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -17,7 +16,6 @@ from omlx.mcp.types import (
     MCPServerConfig,
     MCPServerState,
     MCPTool,
-    MCPToolResult,
     MCPTransport,
 )
 

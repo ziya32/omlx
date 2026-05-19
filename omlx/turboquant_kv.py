@@ -15,10 +15,7 @@ from typing import List, Optional
 
 import mlx.core as mx
 from mlx_lm.models.cache import (
-    KVCache,
-    _BaseCache,
     create_attention_mask,
-    create_causal_mask,
     dynamic_roll,
 )
 from mlx_vlm.turboquant import (
@@ -33,12 +30,8 @@ from mlx_vlm.turboquant import (
     _slice_state,
     _slice_state_range,
     _state_length,
-    _state_nbytes,
     _allocate_state_like,
-    _write_state,
-    _reserve_state_capacity,
     _QuantizedStateProxy,
-    _validate_bits,
     turboquant_enabled,
 )
 

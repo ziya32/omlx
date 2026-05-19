@@ -1,14 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for BoundarySnapshotSSDStore and _BoundarySnapshotProvider."""
 
-import json
-import shutil
-import tempfile
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-from unittest.mock import MagicMock, patch
+from typing import Any, Dict, List
+from unittest.mock import MagicMock
 
-import numpy as np
 import pytest
 
 # MLX may not be available in CI — tests skip gracefully.

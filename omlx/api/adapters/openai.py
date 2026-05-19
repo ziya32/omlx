@@ -6,10 +6,7 @@ This adapter handles conversion between OpenAI API format and the internal
 request/response format used by the inference engine.
 """
 
-import json
-import time
 import uuid
-from typing import Any, List, Optional
 
 from .base import (
     BaseAdapter,

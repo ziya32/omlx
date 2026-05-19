@@ -6,8 +6,7 @@ This module tests the abstract and concrete handlers for various cache types
 from mlx-lm, enabling type-aware cache operations like slicing and reconstruction.
 """
 
-from typing import Any, Dict, List, Optional, Tuple
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -16,7 +15,6 @@ from omlx.cache.type_handlers import (
     CacheListHandler,
     CacheStateInfo,
     CacheType,
-    CacheTypeHandler,
     DefaultCacheHandler,
     KVCacheHandler,
     RotatingKVCacheHandler,
@@ -1019,7 +1017,6 @@ class TestCacheListHandlerWithMLX:
         )
 
         import logging
-        from unittest.mock import patch
 
         with patch.object(
             logging.getLogger("omlx.cache.type_handlers"), "debug"

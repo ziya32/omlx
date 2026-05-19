@@ -6,11 +6,9 @@ These models define the request and response schemas for:
 - /v1/embeddings endpoint
 """
 
-import time
-import uuid
 from typing import List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, model_validator
 
 
 class EmbeddingInputItem(BaseModel):

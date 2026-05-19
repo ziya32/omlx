@@ -2,7 +2,6 @@
 """Tests for omlx.api.shared_models module."""
 
 import time
-import uuid
 
 import pytest
 

@@ -6,7 +6,6 @@ This module tests the unified cache statistics for oMLX, including
 base classes and implementation-specific metrics.
 """
 
-from typing import Any, Dict
 
 import pytest
 

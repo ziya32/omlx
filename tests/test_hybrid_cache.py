@@ -6,10 +6,7 @@ This module tests the last-block-only storage strategy for RotatingKVCache
 layers and strict partial-prefix rejection for boundary-safe restore.
 """
 
-import math
-import time
-from typing import Any, Dict, List, Optional
-from unittest.mock import MagicMock, PropertyMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -22,16 +19,14 @@ except ImportError:
     mx = None
 
 from omlx.cache.hybrid_cache import (
-    LayerCacheConfig,
     ModelCacheConfig,
     create_default_kvcache_config,
 )
 from omlx.cache.paged_cache import (
-    BlockTable,
     PagedCacheManager,
     compute_block_hash,
 )
-from omlx.cache.prefix_cache import BlockAwarePrefixCache, BlockCacheEntry
+from omlx.cache.prefix_cache import BlockAwarePrefixCache
 from omlx.cache.type_handlers import CacheType
 
 
@@ -1066,8 +1061,6 @@ class TestModelCacheConfigCacheList:
 
     def test_from_cache_list_with_cache_list(self):
         """Test from_cache_list detects CacheList."""
-        from omlx.cache.type_handlers import CacheType
-        from omlx.cache.type_registry import CacheTypeRegistry
 
         # CacheList mock: has .caches attribute
         mock_cache_list = MagicMock(spec=[])
@@ -1107,7 +1100,6 @@ class TestModelCacheConfigCacheList:
 
     def test_get_meta_states_cache_list(self):
         """Test get_meta_states extracts composite meta_state for CacheList."""
-        from omlx.cache.type_handlers import CacheType
 
         # Use real thin classes so type(obj).__name__ returns the correct name
         # (MagicMock(spec=[]) with __class__ override does not affect type().__name__)

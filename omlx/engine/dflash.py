@@ -473,7 +473,7 @@ class DFlashEngine(BaseEngine):
             # running — handler sees the typed abort instead of stale text.
             if self._abort_event.is_set():
                 raise RequestAbortedError(
-                    f"Request aborted during DFlash generation"
+                    "Request aborted during DFlash generation"
                 )
         finally:
             self._exit_active()
@@ -576,7 +576,7 @@ class DFlashEngine(BaseEngine):
                         # streaming handlers convert into a proper SSE error
                         # event instead of a silent close.
                         raise RequestAbortedError(
-                            f"Request aborted during DFlash generation"
+                            "Request aborted during DFlash generation"
                         )
 
                 yield GenerationOutput(

@@ -4,7 +4,7 @@
 import pytest
 from unittest.mock import MagicMock
 
-from openai_harmony import load_harmony_encoding, StreamableParser
+from openai_harmony import load_harmony_encoding
 
 from omlx.adapter.harmony import (
     HarmonyStreamingParser,

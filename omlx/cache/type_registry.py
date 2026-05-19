@@ -6,7 +6,7 @@ This module provides a registry for looking up cache type handlers
 by cache type enum or class name string.
 """
 
-from typing import Any, Dict, Optional, Type
+from typing import Any, Dict
 import logging
 
 from .type_handlers import (
@@ -60,6 +60,10 @@ class CacheTypeRegistry:
         # checks the class name first and routes to TQ-specific handling)
         "TurboQuantKVCache": CacheType.KVCACHE,
         "BatchTurboQuantKVCache": CacheType.KVCACHE,
+        # DeepSeek V4 compressed-attention pool. Handlers live in
+        # patches/deepseek_v4/cache_handlers.py and register on patch apply.
+        "PoolingCache": CacheType.POOLING_CACHE,
+        "BatchPoolingCache": CacheType.BATCH_POOLING_CACHE,
     }
 
     # Default handler instance
@@ -147,8 +151,9 @@ class CacheTypeRegistry:
             ):
                 return CacheType.ARRAYS_CACHE
 
-            if __debug__:
-                logger.debug(f"Could not detect cache type for {class_name}, assuming KVCache")
+            logger.debug(
+                f"Could not detect cache type for {class_name}, assuming KVCache"
+            )
             return CacheType.KVCACHE
 
         return cache_type

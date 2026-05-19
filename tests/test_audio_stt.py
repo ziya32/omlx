@@ -9,60 +9,12 @@ required. Integration tests (marked @pytest.mark.slow) need a real model.
 """
 
 import io
-import json
-import os
 import wave
-from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
-
-
-def _resolve_local_stt_model() -> str | None:
-    """Find a local STT model in OMLX_MODEL_DIR, or None.
-
-    Override with OMLX_TEST_STT_MODEL (absolute path or repo id).  The
-    discovery scans architectures/model_type for known STT signals so
-    we don't try to download a HuggingFace repo that may need auth.
-    """
-    if env := os.environ.get("OMLX_TEST_STT_MODEL"):
-        return env
-    base = Path(os.environ.get("OMLX_MODEL_DIR") or Path.home() / ".myemee" / "models")
-    if not base.is_dir():
-        return None
-    stt_signals = ("asr", "whisper", "qwen3_asr", "moonshine", "parakeet", "voxtral")
-    candidates: list[tuple[int, str]] = []
-    for sub in sorted(base.iterdir()):
-        if not sub.is_dir():
-            continue
-        cfg_path = sub / "config.json"
-        if not cfg_path.exists():
-            continue
-        try:
-            cfg = json.loads(cfg_path.read_text())
-        except Exception:
-            continue
-        archs = " ".join(cfg.get("architectures") or []).lower()
-        mt = (cfg.get("model_type") or "").lower()
-        name_lower = sub.name.lower()
-        is_stt = (
-            any(s in archs for s in stt_signals)
-            or mt in stt_signals
-            or any(s in name_lower for s in stt_signals)
-        )
-        if not is_stt:
-            continue
-        try:
-            size = sum(f.stat().st_size for f in sub.iterdir() if f.is_file())
-        except OSError:
-            size = 0
-        candidates.append((size, str(sub)))
-    if not candidates:
-        return None
-    candidates.sort()
-    return candidates[0][1]
-
 
 # ---------------------------------------------------------------------------
 # WAV fixture helpers
@@ -91,14 +43,14 @@ TINY_WAV = _make_wav_bytes()
 
 def _make_mock_stt_engine(transcript: str = "hello world") -> MagicMock:
     """Build a mock STTEngine that returns the given transcript."""
-    from omlx.engine.stt import STTEngine, TranscriptionOutput
+    from omlx.engine.stt import STTEngine
     engine = MagicMock(spec=STTEngine)
-    engine.transcribe = AsyncMock(return_value=TranscriptionOutput(
-        text=transcript,
-        language="en",
-        duration=0.1,
-        segments=[],
-    ))
+    engine.transcribe = AsyncMock(return_value={
+        "text": transcript,
+        "language": "en",
+        "duration": 0.1,
+        "segments": [],
+    })
     return engine
 
 
@@ -126,17 +78,20 @@ def _make_mock_pool(stt_engine=None, model_id: str = "whisper-tiny") -> MagicMoc
 @pytest.fixture
 def audio_client():
     """TestClient for the audio router with a mocked STT engine."""
+    from fastapi import FastAPI
+
     from omlx.api.audio_routes import router
 
-    from fastapi import FastAPI
     app = FastAPI()
     app.include_router(router)
 
     mock_pool = _make_mock_pool()
 
-    with patch("omlx.api.audio_routes._get_engine_pool", return_value=mock_pool):
-        with TestClient(app, raise_server_exceptions=False) as client:
-            yield client, mock_pool
+    with (
+        patch("omlx.api.audio_routes._get_engine_pool", return_value=mock_pool),
+        TestClient(app, raise_server_exceptions=False) as client,
+    ):
+        yield client, mock_pool
 
 
 def _ensure_audio_routes(app):
@@ -149,6 +104,106 @@ def _ensure_audio_routes(app):
         app.include_router(audio_router)
 
 
+class TestSTTEngineLanguageForwarding:
+    """Unit tests for STTEngine language handling."""
+
+    @pytest.mark.asyncio
+    async def test_transcribe_maps_iso_language_and_forwards_kwargs(self, tmp_path):
+        """OpenAI ISO language codes reach mlx-audio as lowercase full-names.
+
+        Lowercase is what both backends accept: Whisper's TO_LANGUAGE_CODE
+        normalizes "chinese" -> "zh" for the language token, and Qwen3-ASR
+        lowercases its supported-language list before matching.
+        """
+        from omlx.engine.stt import STTEngine
+
+        generate_call = {}
+
+        class FakeModel:
+            def generate(self, audio_path, **kwargs):
+                generate_call["audio_path"] = audio_path
+                generate_call["kwargs"] = kwargs
+                return SimpleNamespace(
+                    text="hello",
+                    language=None,
+                    segments=[],
+                    total_time=0.1,
+                )
+
+        audio_path = tmp_path / "sample.wav"
+        audio_path.write_bytes(TINY_WAV)
+
+        engine = STTEngine("qwen3-asr")
+        engine._model = FakeModel()
+
+        result = await engine.transcribe(
+            str(audio_path),
+            language="zh",
+            temperature=0.0,
+        )
+
+        assert generate_call["audio_path"] == str(audio_path)
+        assert generate_call["kwargs"] == {
+            "language": "chinese",
+            "temperature": 0.0,
+        }
+        assert result["language"] == "zh"
+
+    @pytest.mark.asyncio
+    async def test_transcribe_passes_unknown_language_through(self, tmp_path):
+        """Unknown / non-ISO inputs are forwarded as-is so backends can still try."""
+        from omlx.engine.stt import STTEngine
+
+        generate_kwargs = {}
+
+        class FakeModel:
+            def generate(self, audio_path, **kwargs):
+                generate_kwargs.update(kwargs)
+                return SimpleNamespace(
+                    text="hello",
+                    language=None,
+                    segments=[],
+                    total_time=0.1,
+                )
+
+        audio_path = tmp_path / "sample.wav"
+        audio_path.write_bytes(TINY_WAV)
+
+        engine = STTEngine("qwen3-asr")
+        engine._model = FakeModel()
+
+        await engine.transcribe(str(audio_path), language="Klingon")
+
+        assert generate_kwargs["language"] == "Klingon"
+
+    @pytest.mark.asyncio
+    async def test_transcribe_omits_empty_language(self, tmp_path):
+        """Empty language values keep mlx-audio in its default mode."""
+        from omlx.engine.stt import STTEngine
+
+        generate_kwargs = {}
+
+        class FakeModel:
+            def generate(self, audio_path, **kwargs):
+                generate_kwargs.update(kwargs)
+                return SimpleNamespace(
+                    text="hello",
+                    language=None,
+                    segments=[],
+                    total_time=0.1,
+                )
+
+        audio_path = tmp_path / "sample.wav"
+        audio_path.write_bytes(TINY_WAV)
+
+        engine = STTEngine("qwen3-asr")
+        engine._model = FakeModel()
+
+        await engine.transcribe(str(audio_path), language=" ")
+
+        assert "language" not in generate_kwargs
+
+
 @pytest.fixture
 def server_audio_client():
     """TestClient using the full omlx server app with mocked pool."""
@@ -158,13 +213,6 @@ def server_audio_client():
 
     mock_pool = _make_mock_pool()
 
-    mock_settings = MagicMock()
-    mock_settings.get_settings.return_value = MagicMock(
-        display_name=None, default_language="auto", aliases=None,
-        default_voice=None, default_instruct=None,
-    )
-    mock_settings.resolve_model_id = MagicMock(side_effect=lambda m, _: m)
-
     with patch("omlx.server._server_state") as mock_state:
         mock_state.engine_pool = mock_pool
         mock_state.global_settings = None
@@ -172,13 +220,12 @@ def server_audio_client():
         mock_state.hf_downloader = None
         mock_state.ms_downloader = None
         mock_state.mcp_manager = None
-        mock_state.api_key = "test-key"
-        mock_state.settings_manager = mock_settings
-        with TestClient(
-            app,
-            raise_server_exceptions=False,
-            headers={"Authorization": "Bearer test-key"},
-        ) as client:
+        mock_state.api_key = None
+        mock_state.settings_manager = MagicMock()
+        mock_state.settings_manager.resolve_model_id = MagicMock(
+            side_effect=lambda m, _: m
+        )
+        with TestClient(app, raise_server_exceptions=False) as client:
             yield client, mock_pool
 
 
@@ -213,10 +260,9 @@ class TestSTTEndpointBasic:
 
     def test_response_text_matches_engine_output(self, server_audio_client):
         """Response text matches what the engine returned."""
-        from omlx.engine.stt import TranscriptionOutput
         client, mock_pool = server_audio_client
         mock_pool.get_engine.return_value.transcribe = AsyncMock(
-            return_value=TranscriptionOutput(text="test transcription", language="en", duration=0.5, segments=[])
+            return_value={"text": "test transcription", "language": "en", "duration": 0.5, "segments": []}
         )
 
         response = client.post(
@@ -246,6 +292,167 @@ class TestSTTEndpointBasic:
             data={"model": "whisper-tiny", "language": "en"},
         )
         assert response.status_code == 200
+
+    def test_max_tokens_forwarded_to_engine(self, server_audio_client):
+        """max_tokens= form field is passed through to engine.transcribe()."""
+        client, mock_pool = server_audio_client
+        engine = mock_pool.get_engine.return_value
+
+        captured: dict = {}
+
+        async def capture(path, **kwargs):
+            captured.update(kwargs)
+            return {"text": "ok", "language": "en", "segments": [], "duration": 0.0}
+
+        engine.transcribe = AsyncMock(side_effect=capture)
+
+        response = client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("audio.wav", TINY_WAV, "audio/wav")},
+            data={"model": "whisper-tiny", "max_tokens": "32768"},
+        )
+
+        assert response.status_code == 200
+        assert captured.get("max_tokens") == 32768
+
+    def test_max_tokens_omitted_when_not_set_and_no_setting(self, server_audio_client):
+        """max_tokens is not passed when neither request nor per-model setting set it."""
+        from unittest.mock import patch
+
+        client, mock_pool = server_audio_client
+        engine = mock_pool.get_engine.return_value
+
+        captured: dict = {}
+
+        async def capture(path, **kwargs):
+            captured.update(kwargs)
+            return {"text": "ok", "language": "en", "segments": [], "duration": 0.0}
+
+        engine.transcribe = AsyncMock(side_effect=capture)
+
+        # No settings manager => model's own default applies; nothing forwarded.
+        with patch(
+            "omlx.api.audio_routes._get_settings_manager",
+            return_value=None,
+        ):
+            response = client.post(
+                "/v1/audio/transcriptions",
+                files={"file": ("audio.wav", TINY_WAV, "audio/wav")},
+                data={"model": "whisper-tiny"},
+            )
+
+        assert response.status_code == 200
+        assert "max_tokens" not in captured
+
+    def test_max_tokens_falls_back_to_per_model_setting(self, server_audio_client):
+        """When request omits max_tokens, ModelSettings.max_tokens is used."""
+        from unittest.mock import MagicMock, patch
+
+        client, mock_pool = server_audio_client
+        engine = mock_pool.get_engine.return_value
+
+        captured: dict = {}
+
+        async def capture(path, **kwargs):
+            captured.update(kwargs)
+            return {"text": "ok", "language": "en", "segments": [], "duration": 0.0}
+
+        engine.transcribe = AsyncMock(side_effect=capture)
+
+        # Stand in for ModelSettingsManager that returns max_tokens=65536
+        # for any model id.
+        fake_settings = MagicMock(max_tokens=65536)
+        fake_manager = MagicMock()
+        fake_manager.get_settings.return_value = fake_settings
+
+        with patch(
+            "omlx.api.audio_routes._get_settings_manager",
+            return_value=fake_manager,
+        ):
+            response = client.post(
+                "/v1/audio/transcriptions",
+                files={"file": ("audio.wav", TINY_WAV, "audio/wav")},
+                data={"model": "whisper-tiny"},
+            )
+
+        assert response.status_code == 200
+        assert captured.get("max_tokens") == 65536
+
+    def test_max_tokens_request_overrides_per_model_setting(self, server_audio_client):
+        """An explicit request max_tokens beats the per-model setting."""
+        from unittest.mock import MagicMock, patch
+
+        client, mock_pool = server_audio_client
+        engine = mock_pool.get_engine.return_value
+
+        captured: dict = {}
+
+        async def capture(path, **kwargs):
+            captured.update(kwargs)
+            return {"text": "ok", "language": "en", "segments": [], "duration": 0.0}
+
+        engine.transcribe = AsyncMock(side_effect=capture)
+
+        fake_settings = MagicMock(max_tokens=65536)
+        fake_manager = MagicMock()
+        fake_manager.get_settings.return_value = fake_settings
+
+        with patch(
+            "omlx.api.audio_routes._get_settings_manager",
+            return_value=fake_manager,
+        ):
+            response = client.post(
+                "/v1/audio/transcriptions",
+                files={"file": ("audio.wav", TINY_WAV, "audio/wav")},
+                data={"model": "whisper-tiny", "max_tokens": "4096"},
+            )
+
+        assert response.status_code == 200
+        assert captured.get("max_tokens") == 4096
+
+    def test_word_timestamps_forwarded_to_engine(self, server_audio_client):
+        """word_timestamps=true is passed through to engine.transcribe()."""
+        client, mock_pool = server_audio_client
+        engine = mock_pool.get_engine.return_value
+
+        captured: dict = {}
+
+        async def capture(path, **kwargs):
+            captured.update(kwargs)
+            return {"text": "ok", "language": "en", "segments": [], "duration": 0.0}
+
+        engine.transcribe = AsyncMock(side_effect=capture)
+
+        response = client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("audio.wav", TINY_WAV, "audio/wav")},
+            data={"model": "whisper-tiny", "word_timestamps": "true"},
+        )
+
+        assert response.status_code == 200
+        assert captured.get("word_timestamps") is True
+
+    def test_word_timestamps_omitted_by_default(self, server_audio_client):
+        """word_timestamps is not forwarded when the form field is absent."""
+        client, mock_pool = server_audio_client
+        engine = mock_pool.get_engine.return_value
+
+        captured: dict = {}
+
+        async def capture(path, **kwargs):
+            captured.update(kwargs)
+            return {"text": "ok", "language": "en", "segments": [], "duration": 0.0}
+
+        engine.transcribe = AsyncMock(side_effect=capture)
+
+        response = client.post(
+            "/v1/audio/transcriptions",
+            files={"file": ("audio.wav", TINY_WAV, "audio/wav")},
+            data={"model": "whisper-tiny"},
+        )
+
+        assert response.status_code == 200
+        assert "word_timestamps" not in captured
 
 
 # ---------------------------------------------------------------------------
@@ -397,10 +604,9 @@ class TestSTTModelAliasResolution:
             mock_state.hf_downloader = None
             mock_state.ms_downloader = None
             mock_state.mcp_manager = None
-            mock_state.api_key = "test-key"
+            mock_state.api_key = None
             mock_state.settings_manager = MagicMock()
             with TestClient(app, raise_server_exceptions=False) as client:
-                client.headers["Authorization"] = "Bearer test-key"
                 response = client.post(
                     "/v1/audio/transcriptions",
                     data={"model": "whisper"},
@@ -430,10 +636,9 @@ class TestSTTModelAliasResolution:
             mock_state.hf_downloader = None
             mock_state.ms_downloader = None
             mock_state.mcp_manager = None
-            mock_state.api_key = "test-key"
+            mock_state.api_key = None
             mock_state.settings_manager = MagicMock()
             with TestClient(app, raise_server_exceptions=False) as client:
-                client.headers["Authorization"] = "Bearer test-key"
                 response = client.post(
                     "/v1/audio/transcriptions",
                     data={"model": "Qwen3-ASR-1.7B-bf16"},
@@ -478,8 +683,6 @@ class TestSTTProcessorErrors:
         """``load_model`` raising ``Can't load feature extractor`` becomes a
         clear message pointing at ``preprocessor_config.json``."""
         import asyncio
-
-        from omlx.engine import stt as stt_mod
 
         def _failing_load(*args, **kwargs):
             raise OSError(
@@ -622,12 +825,7 @@ class TestSTTIntegration:
 
         from omlx.engine.stt import STTEngine
 
-        model_name = _resolve_local_stt_model()
-        if model_name is None:
-            pytest.skip(
-                "No local STT model found in OMLX_MODEL_DIR — "
-                "set OMLX_TEST_STT_MODEL to override."
-            )
+        model_name = "mlx-community/whisper-tiny"
         wav_path = tmp_path / "test.wav"
         wav_path.write_bytes(TINY_WAV)
 
@@ -635,18 +833,8 @@ class TestSTTIntegration:
             import asyncio
             engine = STTEngine(model_name)
             asyncio.run(engine.start())
-            # transcribe() declares ``audio_path: str`` — some backends
-            # (Qwen3-ASR) inspect a possibly-array argument via ``.ndim``
-            # before normalising, which crashes on a bare Path.  Pass the
-            # str form so all backends agree.
-            result = asyncio.run(engine.transcribe(str(wav_path)))
-            # transcribe() returns a TranscriptionOutput dataclass with
-            # a ``.text`` attribute; the upstream test (which used
-            # whisper-tiny) saw a dict shape via mlx_audio's older API.
-            text = getattr(result, "text", None)
-            if text is None and isinstance(result, dict):
-                text = result.get("text")
-            assert text is not None
+            result = asyncio.run(engine.transcribe(wav_path))
+            assert "text" in result
             asyncio.run(engine.stop())
         except Exception as e:
             pytest.skip(f"Could not run integration test: {e}")

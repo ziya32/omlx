@@ -18,7 +18,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 import mlx.core as mx
 import numpy as np
@@ -130,8 +130,8 @@ def test_model(model_path: str, ssd_dir: Optional[str] = None) -> bool:
     t_compute = time.perf_counter() - t0
 
     if features is None:
-        print(f"  _compute_vision_features returned None (unsupported model)")
-        print(f"  This model will use full pipeline without caching")
+        print("  _compute_vision_features returned None (unsupported model)")
+        print("  This model will use full pipeline without caching")
 
         # Verify full pipeline still works
         print("\n[3b/6] Verifying full pipeline works...")
@@ -162,7 +162,7 @@ def test_model(model_path: str, ssd_dir: Optional[str] = None) -> bool:
     except TypeError as e:
         print(f"  FAIL: cached_image_features not supported: {e}")
         print(f"\n{'='*60}")
-        print(f"RESULT: PARTIAL — _compute works but cached kwarg rejected")
+        print("RESULT: PARTIAL — _compute works but cached kwarg rejected")
         print(f"{'='*60}")
         return False
 
@@ -180,7 +180,7 @@ def test_model(model_path: str, ssd_dir: Optional[str] = None) -> bool:
     print(f"  max_diff: {max_diff:.2e}")
     print(f"  mean_diff: {mean_diff:.2e}")
     if max_diff > 1e-3:
-        print(f"  WARNING: significant difference between cached and fresh embeddings!")
+        print("  WARNING: significant difference between cached and fresh embeddings!")
 
     # ── Step 5: Test VisionFeatureSSDCache roundtrip ─────────────
     print("\n[5/6] Testing VisionFeatureSSDCache roundtrip...")
@@ -190,18 +190,18 @@ def test_model(model_path: str, ssd_dir: Optional[str] = None) -> bool:
     # Miss
     result = cache.get(image_hash, model_path)
     assert result is None, "Expected cache miss"
-    print(f"  cache miss: OK")
+    print("  cache miss: OK")
 
     # Store
     cache.put(image_hash, model_path, features)
-    print(f"  cache put: OK")
+    print("  cache put: OK")
 
     # Memory hit
     result = cache.get(image_hash, model_path)
     assert result is not None, "Expected cache hit"
     if isinstance(result, mx.array):
         assert mx.array_equal(result, features), "Memory cache returned different data"
-    print(f"  memory hit: OK")
+    print("  memory hit: OK")
 
     # SSD roundtrip
     time.sleep(1.0)  # wait for background writer
@@ -211,7 +211,7 @@ def test_model(model_path: str, ssd_dir: Optional[str] = None) -> bool:
     assert result is not None, "Expected SSD cache hit"
     if isinstance(result, mx.array) and isinstance(features, mx.array):
         assert mx.allclose(result, features, atol=1e-5), "SSD cache returned different data"
-    print(f"  SSD roundtrip: OK")
+    print("  SSD roundtrip: OK")
 
     stats = cache.stats
     print(f"  stats: {stats}")

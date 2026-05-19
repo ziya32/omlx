@@ -119,3 +119,6 @@ tests/fixtures/sample_speech_transcript.json
 
 # Test reports
 test-reports/
+
+# UV lockfile
+uv.lock

@@ -6,8 +6,6 @@ Run once to regenerate: python tests/fixtures/generate_test_audio.py
 The output file (test_audio.wav) is committed and used by test_audio_stt.py.
 """
 
-import io
-import struct
 import wave
 from pathlib import Path
 

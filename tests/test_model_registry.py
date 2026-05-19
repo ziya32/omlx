@@ -9,7 +9,6 @@ import pytest
 
 from omlx.model_registry import (
     ModelOwnershipError,
-    ModelRegistry,
     get_registry,
 )
 

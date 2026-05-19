@@ -17,16 +17,16 @@ import concurrent.futures
 import logging
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, AsyncIterator, Dict, List, Optional, Set, Tuple, Union
 
 import mlx.core as mx
 
 from .exceptions import RequestAbortedError
-from .request import Request, RequestOutput, RequestStatus, SamplingParams
-from .scheduler import Scheduler, SchedulerConfig, SchedulerOutput
+from .request import Request, RequestOutput, SamplingParams
+from .scheduler import Scheduler, SchedulerConfig
 from .output_collector import RequestOutputCollector, RequestStreamState
-from .model_registry import get_registry, ModelOwnershipError
+from .model_registry import get_registry
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +47,6 @@ def _init_mlx_thread() -> None:
     ``generation_stream`` in mlx_lm.generate and omlx.scheduler.
     """
     import sys
-    import mlx.core as mx
 
     stream = mx.new_thread_local_stream(mx.default_device())
 
@@ -776,9 +775,21 @@ class EngineCore:
 
         self._closed = True
 
-        # Shutdown scheduler (clears paged SSD cache if configured)
+        # Shutdown scheduler (clears paged SSD cache if configured).
+        # Both shutdown() and deep_reset() touch generation_stream (directly
+        # or via _drain_pending_async_removes / _do_abort_request). The
+        # stream is bound to the MLX executor thread, so dispatch both
+        # through the executor; fall back to a direct call if the executor
+        # is already shut down.
         if self.scheduler is not None:
-            self.scheduler.shutdown()
+            for fn in (self.scheduler.shutdown, self.scheduler.deep_reset):
+                try:
+                    self._mlx_executor.submit(fn).result()
+                except RuntimeError:
+                    try:
+                        fn()
+                    except RuntimeError:
+                        pass
             self.scheduler = None
 
         # Clear output collectors

@@ -6,9 +6,8 @@ import json
 import math
 import numpy as np
 import struct
-import tempfile
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -398,6 +397,37 @@ class TestExtractEmbeddingsArray:
 
         with pytest.raises(ValueError, match="expected embedding fields"):
             model._extract_embeddings_array(outputs)
+
+    def test_extract_text_embeds_3d_mean_pool(self):
+        """Per-token text_embeds (e.g. ModernBERT MaskedLM) should be mean pooled."""
+        import mlx.core as mx
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel("test-model")
+        outputs = MagicMock(spec=[])
+        # Shape (batch=1, seq_len=2, hidden=2). Mean over axis=1 → [[0.2, 0.3]].
+        outputs.text_embeds = mx.array([[[0.1, 0.2], [0.3, 0.4]]])
+        outputs.pooler_output = None
+        outputs.last_hidden_state = None
+
+        result = model._extract_embeddings_array(outputs)
+        mx.eval(result)
+        assert result.shape == (1, 2)
+        assert result.tolist()[0] == pytest.approx([0.2, 0.3])
+
+    def test_extract_pooler_output_3d_mean_pool(self):
+        """Per-token pooler_output should also be mean pooled to 2D."""
+        import mlx.core as mx
+        from omlx.models.embedding import MLXEmbeddingModel
+
+        model = MLXEmbeddingModel("test-model")
+        outputs = MagicMock(spec=[])
+        outputs.pooler_output = mx.ones((2, 4, 3))
+        outputs.last_hidden_state = None
+
+        result = model._extract_embeddings_array(outputs)
+        mx.eval(result)
+        assert result.shape == (2, 3)
 
 
 class TestEmbeddingCompileFallback:
@@ -1076,7 +1106,6 @@ class TestNativeEmbeddingLoading:
 
         self._write_full_native_checkpoint(tmp_path, config)
 
-        import mlx.core as mx
         from safetensors import safe_open
 
         weights = {}

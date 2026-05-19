@@ -7,7 +7,6 @@ Dataset bundled from allenai/ai2_arc (Challenge split) on HuggingFace.
 """
 
 import logging
-import re
 from pathlib import Path
 from typing import Optional
 

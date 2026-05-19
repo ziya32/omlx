@@ -8,7 +8,6 @@ internal request/response format used by the inference engine.
 
 import json
 import uuid
-from typing import Any, List, Optional
 
 from .base import (
     BaseAdapter,

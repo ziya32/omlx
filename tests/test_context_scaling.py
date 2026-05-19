@@ -4,7 +4,6 @@
 from dataclasses import dataclass, field
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 from omlx.settings import ClaudeCodeSettings, GlobalSettings
 

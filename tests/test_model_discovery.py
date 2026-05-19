@@ -2,7 +2,6 @@
 """Tests for model discovery functionality."""
 
 import json
-import tempfile
 from pathlib import Path
 
 import pytest

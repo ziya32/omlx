@@ -8,7 +8,7 @@ failures, enabling the scheduler to continue processing after encountering error
 
 import gc
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from ..exceptions import is_cache_corruption_error
 

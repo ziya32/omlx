@@ -171,6 +171,34 @@ class TestSchedulerInitialization:
         assert scheduler.total_prompt_tokens == 0
         assert scheduler.total_completion_tokens == 0
 
+    def test_snapshot_for_admin_is_isolated_from_live_state(
+        self, mock_model, mock_tokenizer
+    ):
+        """Published admin snapshot must not mutate when live state changes."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        request = Request(
+            request_id="req-snap",
+            prompt=[1, 2, 3],
+            sampling_params=SamplingParams(max_tokens=8),
+        )
+        request.prompt_token_ids = [1, 2, 3]
+        request.num_prompt_tokens = 3
+
+        scheduler.waiting.append(request)
+        scheduler.running["req-snap"] = request
+        scheduler._publish_admin_snapshot()
+
+        snap = scheduler.snapshot_for_admin()
+        assert snap["running_by_id"] == {"req-snap": request}
+        assert snap["waiting"] == [request]
+
+        scheduler.running.clear()
+        scheduler.waiting.clear()
+        # Snapshot reflects the published moment, not the live state.
+        assert snap["running_by_id"] == {"req-snap": request}
+        assert snap["waiting"] == [request]
+
 
 class TestSchedulerAddRequest:
     """Tests for Scheduler.add_request()."""
@@ -1332,6 +1360,67 @@ class TestSchedulerRotatingBlockAlignment:
         assert scheduler._deferred_clear_at > first_target
 
 
+class TestPeriodicClearGating:
+    """Tests for the conditional periodic clear (#978/#1040 mitigation)."""
+
+    def test_periodic_clear_skipped_when_cache_below_threshold(
+        self, mock_model, mock_tokenizer
+    ):
+        """Periodic clear should NOT fire when MLX buffer pool is small.
+
+        The pre-fix behavior fired every mlx_cache_cleanup_interval steps
+        unconditionally, producing IOGPUFamily refcount transitions even
+        when there was nothing meaningful to release. After the fix, the
+        clear only fires when accumulated cache memory exceeds the
+        threshold (memory_limit/3 or absolute 2 GiB floor).
+        """
+        from omlx import scheduler as sched_mod
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._step_counter = scheduler.config.mlx_cache_cleanup_interval
+        scheduler._memory_limit_bytes = 0  # → use absolute 2 GiB threshold
+
+        # 1 GiB cached, well under the 2 GiB threshold
+        with patch.object(
+            sched_mod.mx, "get_cache_memory", return_value=1 * 1024**3
+        ):
+            assert scheduler._should_periodic_clear_cache() is False
+
+    def test_periodic_clear_fires_when_cache_above_threshold(
+        self, mock_model, mock_tokenizer
+    ):
+        """Periodic clear must fire when MLX buffer pool exceeds threshold."""
+        from omlx import scheduler as sched_mod
+
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        scheduler._step_counter = scheduler.config.mlx_cache_cleanup_interval
+        scheduler._memory_limit_bytes = 0  # → 2 GiB absolute floor
+
+        # 3 GiB cached, exceeds the 2 GiB threshold
+        with patch.object(
+            sched_mod.mx, "get_cache_memory", return_value=3 * 1024**3
+        ):
+            assert scheduler._should_periodic_clear_cache() is True
+
+    def test_periodic_clear_threshold_scales_with_memory_limit(
+        self, mock_model, mock_tokenizer
+    ):
+        """Threshold must be max(memory_limit/3, 2 GiB) when limit is set."""
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        # Limit 30 GiB → threshold 10 GiB (memory_limit / 3)
+        scheduler._memory_limit_bytes = 30 * 1024**3
+        assert scheduler._periodic_clear_threshold_bytes() == 10 * 1024**3
+
+        # Limit 3 GiB → threshold 2 GiB (floor wins)
+        scheduler._memory_limit_bytes = 3 * 1024**3
+        assert scheduler._periodic_clear_threshold_bytes() == 2 * 1024**3
+
+        # No limit → 2 GiB absolute floor
+        scheduler._memory_limit_bytes = 0
+        assert scheduler._periodic_clear_threshold_bytes() == 2 * 1024**3
+
+
 class TestExtractCacheStatesCacheList:
     """Tests for CacheList handling in _extract_cache_states."""
 
@@ -1748,7 +1837,6 @@ class TestDetectNeedsThinkPrefix:
         Models like context-1 (harmony parser) have _think_start_tokens=None
         in their mlx-lm tokenizer, causing think_start_id to raise TypeError.
         """
-        from unittest.mock import PropertyMock
         from conftest import MockTokenizer
 
         tokenizer = MockTokenizer()
@@ -1939,3 +2027,79 @@ class TestVLMPositionStateClearing:
         scheduler._schedule_waiting()
 
         model.clear_vlm_position_state.assert_called_once()
+
+
+class TestBuildStateMachineStopStrings:
+    """Tests for _build_state_machine stop-string tokenization.
+
+    The scheduler must convert SamplingParams.stop (a list of strings)
+    into token-sequence transitions on the per-request state machine,
+    so mlx-lm's BatchGenerator can halt on user-supplied stop sequences.
+    """
+
+    def _make_scheduler(self, mock_model, mock_tokenizer):
+        return Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+    def _request_with_stop(self, stop):
+        return Request(
+            request_id="stop-001",
+            prompt="hello",
+            sampling_params=SamplingParams(max_tokens=10, stop=stop),
+        )
+
+    def test_no_stop_string_only_eos_transitions(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        sm = scheduler._build_state_machine(self._request_with_stop([]))
+        # SequenceStateMachine has internal _states dict; non-empty implies
+        # at least the EOS transitions are present.
+        assert sm._states
+
+    def test_stop_string_added_as_token_sequence(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        # MockTokenizer encodes "delta" to a single hash-derived token id.
+        expected_seq = mock_tokenizer.encode("delta", add_special_tokens=False)
+        assert expected_seq, "MockTokenizer must produce a token for 'delta'"
+
+        sm = scheduler._build_state_machine(self._request_with_stop(["delta"]))
+        # Walk the trie following expected_seq; the terminal node must
+        # have a __match__ entry, meaning the sequence is registered.
+        node = sm._states["normal"][0]
+        for tok in expected_seq:
+            assert tok in node, f"token {tok} missing from trie"
+            node = node[tok]
+        assert "__match__" in node, "stop sequence not terminated in trie"
+
+    def test_empty_or_non_string_entries_skipped(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        # Mixed list with empty string and non-string entry; only "real"
+        # should be tokenized.
+        sm = scheduler._build_state_machine(
+            self._request_with_stop(["", "real", 123])
+        )
+        real_seq = mock_tokenizer.encode("real", add_special_tokens=False)
+        node = sm._states["normal"][0]
+        for tok in real_seq:
+            assert tok in node
+            node = node[tok]
+        assert "__match__" in node
+
+    def test_multiple_stop_strings_all_registered(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = self._make_scheduler(mock_model, mock_tokenizer)
+        sm = scheduler._build_state_machine(
+            self._request_with_stop(["foo", "bar"])
+        )
+        for stop_str in ("foo", "bar"):
+            seq = mock_tokenizer.encode(stop_str, add_special_tokens=False)
+            node = sm._states["normal"][0]
+            for tok in seq:
+                assert tok in node
+                node = node[tok]
+            assert "__match__" in node

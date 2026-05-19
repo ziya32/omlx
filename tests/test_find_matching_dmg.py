@@ -7,7 +7,6 @@ test environment, we test the function by reimporting with mocked dependencies.
 import sys
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 
 def _make_asset(name: str, url: str | None = None) -> dict:
@@ -67,7 +66,6 @@ def _get_find_matching_dmg():
         sys.modules["omlx_app.config"] = MagicMock()
         sys.modules["omlx_app.server_manager"] = MagicMock()
 
-        import importlib
         import os
 
         # Add packaging to path temporarily

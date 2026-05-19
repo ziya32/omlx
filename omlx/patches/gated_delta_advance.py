@@ -1,30 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 """Replace mlx-vlm Qwen3_5GatedDeltaNet.__call__ body with the mlx-lm version.
 
-mlx-vlm's qwen3_5/language.py is missing two fixes that mlx-lm has shipped
-on its own qwen3_5.py:
+As of mlx-vlm 191d7c8 (target), upstream ships ``cache.advance(S)`` on its
+own, so the original ``ed7884c`` fix is no longer carried by this patch. Two
+items remain that upstream still does not have, both of which require touching
+the body mid-function:
 
-- ``ed7884c`` (2026-03-19) "Fix missing cache advance from qwen 3.5" —
-  always call ``cache.advance(S)`` after writing ``cache[1] = state`` so
-  ArraysCache.left_padding/lengths get decremented between prefill chunks.
+- ``9dcefa5`` "break shared-buffer memory leak in GatedDeltaNet cache" — wrap
+  the ``cache[0]`` write in ``mx.contiguous`` and add the ``cache.lengths is
+  not None`` per-element slicing branch.
 
-- ``9dcefa5`` (2026-03-31) "break shared-buffer memory leak in
-  GatedDeltaNet cache" — wrap the ``cache[0]`` write in ``mx.contiguous``
-  and add the ``cache.lengths is not None`` per-element slicing branch.
+- Drop the mlx-vlm silent fallbacks (``conv_state.shape[0] != B`` ⇒ zeros,
+  same shape for state and mask) that mask real bugs in favor of mlx-lm
+  semantics.
 
-mlx-vlm's e41cd25 layer also adds silent fallbacks (``conv_state.shape[0]
-!= B`` ⇒ zeros, same for state and mask) that diverge from mlx-lm and can
-mask real bugs, so we drop them in favor of mlx-lm semantics.
-
-The mlx-vlm-specific ``gdn_sink`` parameter is preserved: when given, we
-append the same tuple the rollback path consumes.
-
-This patch installs a new ``__call__`` body, not a post-hoc wrapper,
-because the differences are mid-function (cache write site) and cannot
-be corrected after the original returns.
+The mlx-vlm-specific ``gdn_sink`` parameter is preserved: when given, append
+the same tuple the rollback path consumes.
 
 Patch target (current upstream):
-- mlx_vlm.models.qwen3_5.language.Qwen3_5GatedDeltaNet (commit e41cd25)
+- mlx_vlm.models.qwen3_5.language.Qwen3_5GatedDeltaNet (commit 191d7c8)
 
   ``mlx_vlm.models.qwen3_5_moe.language`` re-exports the same class
   object as ``Qwen3_5MoeGatedDeltaNet`` (``from ..qwen3_5.language
@@ -37,7 +31,7 @@ mlx-lm's GatedDeltaNet already has both fixes, so we leave it untouched.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Dict, List, Optional, Tuple  # noqa: F401  (used in bbba911 port annotations)
 
 try:
     import mlx.core as mx
@@ -52,7 +46,6 @@ logger = logging.getLogger(__name__)
 
 
 _patched_classes: set[int] = set()
-_call_counter = {"n": 0}
 
 
 def _build_replacement_call():

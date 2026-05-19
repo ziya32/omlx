@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for omlx.exceptions module."""
 
-import pytest
 
 from omlx.exceptions import (
     # Base exception
