@@ -1841,7 +1841,14 @@ class EnginePool:
                         scheduler_config=self._scheduler_config,
                         model_settings=model_settings,
                     )
-                await engine.start()
+                try:
+                    await engine.start()
+                except Exception as fallback_error:
+                    raise RuntimeError(
+                        f"DFlash load failed: {start_error}. "
+                        f"{effective_type} fallback also failed: "
+                        f"{fallback_error}"
+                    ) from start_error
                 logger.info(
                     f"Successfully loaded {model_id} as {effective_type} "
                     f"(fallback from DFlash)"
@@ -1876,7 +1883,13 @@ class EnginePool:
                         getattr(enforcer, "max_bytes", 0) if enforcer else 0
                     ),
                 )
-                await engine.start()
+                try:
+                    await engine.start()
+                except Exception as fallback_error:
+                    raise RuntimeError(
+                        f"LM load failed (force_lm=True): {start_error}. "
+                        f"VLM fallback also failed: {fallback_error}"
+                    ) from start_error
 
                 logger.info(
                     f"Successfully loaded {model_id} as VLM "
@@ -1905,7 +1918,13 @@ class EnginePool:
                     scheduler_config=self._scheduler_config,
                     model_settings=model_settings,
                 )
-                await engine.start()
+                try:
+                    await engine.start()
+                except Exception as fallback_error:
+                    raise RuntimeError(
+                        f"VLM load failed: {start_error}. "
+                        f"LLM fallback also failed: {fallback_error}"
+                    ) from start_error
 
                 entry.model_type = "llm"
                 entry.engine_type = "batched"
