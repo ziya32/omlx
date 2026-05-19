@@ -11,10 +11,12 @@ or VLMBatchedEngine which have paged cache, SSD cache, and continuous batching.
 import asyncio
 import copy
 import gc
+import json
 import logging
 import os
 import threading
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
@@ -27,6 +29,45 @@ from .base import BaseEngine, GenerationOutput
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_DFLASH_CTX = 4096
+
+
+def is_dflash_compatible(model_path: str | Path) -> tuple[bool, str]:
+    """Decide whether ``model_path`` can run on the current dflash backend.
+
+    DFlash registers QwenGdnTargetOps and Gemma4TargetOps. The top-level
+    ``model_type`` is the canonical discriminator: Gemma4 multimodal
+    configs use ``gemma4`` at the top, while MTP-only variants (e.g. the
+    Gemma4 ``-assistant`` checkpoint) declare ``gemma4_assistant`` even
+    though their nested ``text_config.model_type`` is still
+    ``gemma4_text``. Reading top-level only keeps the gate aligned with
+    what dflash will actually load.
+
+    Imported by ``admin/routes.py`` to flag per-model DFlash compatibility
+    in the admin UI; that import is wrapped in try/except so a missing
+    symbol would degrade silently to "not compatible" for every model.
+
+    Returns:
+        (is_compatible, reason). ``reason`` is empty when compatible.
+    """
+    config_path = Path(model_path) / "config.json"
+    if not config_path.exists():
+        return False, f"config.json not found at {config_path}"
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        return False, f"failed to read config.json: {e}"
+
+    model_type = str(cfg.get("model_type") or "").lower()
+
+    is_qwen = "qwen" in model_type
+    is_gemma4 = model_type in ("gemma4", "gemma4_text")
+    if not (is_qwen or is_gemma4):
+        return False, (
+            f"DFlash supports only Qwen and Gemma4 models "
+            f"(model_type='{cfg.get('model_type', '')}')"
+        )
+    return True, ""
 
 
 class DFlashEngine(BaseEngine):
