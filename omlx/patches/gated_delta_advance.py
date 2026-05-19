@@ -48,6 +48,8 @@ logger = logging.getLogger(__name__)
 _patched_classes: set[int] = set()
 
 
+_call_counter = {"n": 0}
+
 def _build_replacement_call():
     """Construct the new __call__ matching mlx-lm semantics with mlx-vlm
     signature (gdn_sink) preserved.
