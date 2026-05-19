@@ -662,6 +662,7 @@ app.add_middleware(DebugRequestLoggingMiddleware)
 async def get_engine(
     model_id: str | None = None,
     engine_type: EngineType = EngineType.LLM,
+    resolved_id: str | None = None,
 ) -> Union[BaseEngine, EmbeddingEngine, RerankerEngine]:
     """
     Get engine for the specified model and type.
@@ -671,6 +672,12 @@ async def get_engine(
     Args:
         model_id: Model ID to get engine for, or None for default (LLM only)
         engine_type: Type of engine to retrieve (LLM, EMBEDDING, or RERANKER)
+        resolved_id: Optional pre-resolved model ID. When provided, skips
+            the internal ``pool.resolve_model_id`` call so a caller that
+            already resolved (e.g. to take an ``acquire_engine`` lease
+            atomically BEFORE this await) can guarantee that the lease
+            and the ``ensure_engine_alive`` check operate on the same id.
+            See Issue 7 in docs/enforcer-eviction-review.md.
 
     Returns:
         The loaded engine of the appropriate type
@@ -695,8 +702,13 @@ async def get_engine(
             detail="No model specified and no default model set"
         )
 
-    # Resolve alias to real model_id
-    model_id = pool.resolve_model_id(model_id, _server_state.settings_manager)
+    # Resolve alias to real model_id — unless the caller already resolved
+    # and passed the result in, in which case we must use that exact id
+    # to stay consistent with any lease they took (Issue 7).
+    if resolved_id is not None:
+        model_id = resolved_id
+    else:
+        model_id = pool.resolve_model_id(model_id, _server_state.settings_manager)
 
     try:
         engine = await pool.get_engine(model_id)
