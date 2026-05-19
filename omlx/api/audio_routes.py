@@ -634,6 +634,10 @@ async def create_transcription(
     prompt = form.get("prompt")
     response_format = str(form.get("response_format", "json"))
     stream = str(form.get("stream", "false")).lower() == "true"
+    # oMLX extension exposing mlx-audio's native word-level alignment for
+    # Whisper models. When True, each segment in the response includes a
+    # ``words`` array of ``{word, start, end, probability}`` objects.
+    word_timestamps = str(form.get("word_timestamps", "false")).lower() == "true"
 
     if audio_file is None:
         raise HTTPException(status_code=400, detail="Audio file is required")
@@ -688,11 +692,13 @@ async def create_transcription(
                     detail=f"Model '{model_str}' is not a speech-to-text model",
                 )
             try:
-                output = await engine.transcribe(
-                    tmp_path,
-                    language=language,
-                    prompt=str(prompt) if prompt else None,
-                )
+                transcribe_kwargs: dict[str, object] = {
+                    "language": language,
+                    "prompt": str(prompt) if prompt else None,
+                }
+                if word_timestamps:
+                    transcribe_kwargs["word_timestamps"] = True
+                output = await engine.transcribe(tmp_path, **transcribe_kwargs)
             except InvalidAudioFormatError as e:
                 raise HTTPException(status_code=400, detail=str(e))
             except AudioError as e:
