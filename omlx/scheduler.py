@@ -733,6 +733,10 @@ class Scheduler:
         # defer log line. The scheduler tick is ~200ms — without this the
         # log would emit dozens of duplicate lines per second under pressure.
         self._last_defer_log_time: float = 0.0
+        # Cached max(mx.get_active_memory(), get_phys_footprint()) snapshot
+        # taken at the start of each step() tick. Read via
+        # _current_tick_memory_bytes(); 0 outside a tick.
+        self._tick_memory_bytes: int = 0
 
         # SpecPrefill: draft model for attention-based sparse prefill
         self._specprefill_draft_model: Any | None = None
@@ -1818,7 +1822,10 @@ class Scheduler:
             # show in mx.get_active_memory() still trigger the guard.
             # See utils/proc_memory.py for why phys_footprint matters.
             if self._memory_limit_bytes > 0:
-                current = max(mx.get_active_memory(), get_phys_footprint())
+                # Reuse the per-tick memory snapshot taken at step() start.
+                current = self._tick_memory_bytes or max(
+                    mx.get_active_memory(), get_phys_footprint()
+                )
                 if (
                     self._memory_hard_limit_bytes > 0
                     and current > self._memory_hard_limit_bytes
@@ -1998,7 +2005,10 @@ class Scheduler:
         # phys_footprint, so the active-only check could miss the page
         # before the kernel kills us.
         if self._memory_limit_bytes > 0:
-            current = max(mx.get_active_memory(), get_phys_footprint())
+            # Reuse the per-tick memory snapshot taken at step() start.
+            current = self._tick_memory_bytes or max(
+                mx.get_active_memory(), get_phys_footprint()
+            )
             if (
                 self._memory_hard_limit_bytes > 0
                 and current > self._memory_hard_limit_bytes
@@ -4234,7 +4244,10 @@ class Scheduler:
         if peak == 0:
             return None  # can't estimate, skip
 
-        current = max(mx.get_active_memory(), get_phys_footprint())
+        # Reuse the per-tick memory snapshot taken at step() start.
+        current = self._tick_memory_bytes or max(
+            mx.get_active_memory(), get_phys_footprint()
+        )
 
         if current + peak > self._memory_hard_limit_bytes:
             from .utils.hardware import format_bytes
@@ -4309,7 +4322,10 @@ class Scheduler:
                 #      have KV state loaded from SSD during
                 #      reconstruct_cache(). The next request's
                 #      cached_tokens drives this estimate.
-                current = max(mx.get_active_memory(), get_phys_footprint())
+                # Reuse the per-tick memory snapshot taken at step() start.
+                current = self._tick_memory_bytes or max(
+                    mx.get_active_memory(), get_phys_footprint()
+                )
                 per_request_estimate = (
                     int(self._model_size_bytes * 0.08)
                     if self._model_size_bytes > 0
@@ -5508,6 +5524,18 @@ class Scheduler:
             SchedulerOutput with results of this step
         """
         output = SchedulerOutput()
+
+        # Snapshot the jetsam-accurate memory metric once at the start of
+        # the tick. Reused by _preflight_memory_check, _schedule_waiting's
+        # generation memory guard, _do_external_prefill, and
+        # _advance_chunked_prefills via _current_tick_memory_bytes().
+        # Saves 3-4 mx.get_active_memory()+get_phys_footprint() syscall
+        # pairs per step (these are kernel calls; over a 45-step decode
+        # this is 180+ syscalls eliminated for monitoring a value that
+        # changes only gradually within the ~200ms tick window).
+        self._tick_memory_bytes = max(
+            mx.get_active_memory(), get_phys_footprint()
+        )
 
         # Process pending aborts FIRST (thread-safe with hybrid executor)
         self._process_pending_aborts()
