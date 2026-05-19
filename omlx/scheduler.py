@@ -5141,19 +5141,57 @@ class Scheduler:
                                     if pre_eval_arrays:
                                         mx.async_eval(*pre_eval_arrays)
 
+                            # bbba911 fix: Phase 1 (sync, on this inference
+                            # thread) allocates blocks, computes & registers
+                            # block hashes, updates the prefix index. The
+                            # next request's fetch_cache hits the prefix
+                            # immediately. Phase 2 (bytes write) runs on the
+                            # store_cache executor. Without this split, the
+                            # whole store_cache ran on the worker and
+                            # back-to-back requests raced — nanobot
+                            # cold-chat e2e regressed 197s -> 348s.
                             if self._store_cache_executor is not None:
-                                store_future = self._store_cache_executor.submit(
-                                    self._async_store_cache_worker,
-                                    request_id,
-                                    token_sequence_to_store,
-                                    cache_to_store,
-                                    model_cache_config,
-                                    intermediate_snapshots,
-                                    request.vlm_extra_keys_for_cache,
-                                    request.vlm_extra_key_token_start_for_cache,
-                                    request.vlm_extra_key_ranges_for_cache,
-                                )
-                                self._inflight_store_futures[request_id] = store_future
+                                store_future = None
+                                try:
+                                    _bt, store_future = (
+                                        self.block_aware_cache.submit_store_cache_async(
+                                            request_id,
+                                            token_sequence_to_store,
+                                            cache_to_store,
+                                            self._store_cache_executor,
+                                            model_cache_config=model_cache_config,
+                                            boundary_snapshots=intermediate_snapshots,
+                                            extra_keys=request.vlm_extra_keys_for_cache,
+                                            extra_key_token_start=(
+                                                request.vlm_extra_key_token_start_for_cache
+                                            ),
+                                            extra_key_ranges=(
+                                                request.vlm_extra_key_ranges_for_cache
+                                            ),
+                                        )
+                                    )
+                                except Exception as e:
+                                    logger.warning(
+                                        "submit_store_cache_async failed for %s: %s",
+                                        request_id, e,
+                                    )
+                                if store_future is not None:
+                                    self._inflight_store_futures[request_id] = store_future
+
+                                    def _cleanup_after_phase2(_fut, _rid=request_id):
+                                        try:
+                                            self.block_aware_cache.clear_request_entry(_rid)
+                                        except Exception as exc:
+                                            logger.warning(
+                                                "clear_request_entry for %s raised: %s",
+                                                _rid, exc,
+                                            )
+                                    store_future.add_done_callback(_cleanup_after_phase2)
+                                else:
+                                    # Phase 1 had nothing to write
+                                    # asynchronously (dedup hits / no SSD-
+                                    # eligible tensor data) — clean up now.
+                                    self.block_aware_cache.clear_request_entry(request_id)
                             else:
                                 # Executor unavailable — synchronous fallback.
                                 self._async_store_cache_worker(
