@@ -673,6 +673,15 @@ def _strip_audio_config_if_orphaned(model_dir: Path):
 
     def _patched(path, **kwargs):
         cfg = original(path, **kwargs)
+
+        # Flatten per-layer quant configs for MLX nested model hierarchies
+        # (e.g. language_model.model.layers.N vs model.layers.N). oQ
+        # quantization needs the expanded keys so it reserves bits per
+        # actual model layer rather than per top-level config key.
+        # No-op on configs without per-layer quant data.
+        from ..utils.model_loading import expand_per_layer_quant_keys
+        expand_per_layer_quant_keys(cfg)
+
         if cfg.get("audio_config") is None:
             return cfg
         try:
