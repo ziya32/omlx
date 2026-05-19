@@ -186,6 +186,11 @@ class STTEngine(BaseNonStreamingEngine):
 
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
+        # Latch the cooperative-abort flag BEFORE clearing _model so any
+        # handler racing with stop sees RequestAbortedError (-> 503) on
+        # its next _raise_if_aborted checkpoint rather than the plain
+        # "Engine not started" RuntimeError (-> 500). Issue 4.
+        self._mark_stopped()
         if self._model is None:
             return
 
@@ -220,6 +225,10 @@ class STTEngine(BaseNonStreamingEngine):
                 segments: List of timed segments (may be empty)
                 duration: Audio duration in seconds
         """
+        # Cooperative-abort checkpoint BEFORE the model-None guard, so a
+        # handler racing with enforcer eviction sees RequestAbortedError
+        # (-> 503) rather than RuntimeError (-> 500).
+        self._raise_if_aborted()
         if self._model is None:
             raise RuntimeError("Engine not started. Call start() first.")
 

@@ -118,6 +118,11 @@ class TTSEngine(BaseNonStreamingEngine):
 
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
+        # Latch the cooperative-abort flag BEFORE clearing _model so any
+        # handler racing with stop sees RequestAbortedError (-> 503) on
+        # its next _raise_if_aborted checkpoint rather than the plain
+        # "Engine not started" RuntimeError (-> 500). Issue 4.
+        self._mark_stopped()
         if self._model is None:
             return
 
@@ -166,6 +171,8 @@ class TTSEngine(BaseNonStreamingEngine):
         Returns:
             WAV-encoded bytes (RIFF header + 16-bit mono PCM)
         """
+        # Cooperative-abort checkpoint BEFORE the model-None guard. Issue 4.
+        self._raise_if_aborted()
         if self._model is None:
             raise RuntimeError("Engine not started. Call start() first.")
 
@@ -282,6 +289,8 @@ class TTSEngine(BaseNonStreamingEngine):
         **kwargs,
     ) -> AsyncIterator[tuple[int, int, int, bytes]]:
         """Stream synthesized PCM chunks from models that natively support it."""
+        # Cooperative-abort checkpoint BEFORE the model-None guard. Issue 4.
+        self._raise_if_aborted()
         if self._model is None:
             raise RuntimeError("Engine not started. Call start() first.")
         if not self.supports_native_tts_streaming():
