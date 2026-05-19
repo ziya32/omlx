@@ -725,6 +725,14 @@ class Scheduler:
         # soft_threshold. Schedulers stop admitting new prefills while this is
         # set; in-flight requests proceed.
         self._admission_paused: bool = False
+        # Model weight size, plumbed by ProcessMemoryEnforcer when it
+        # propagates the soft limit. Used by the predictive generation
+        # memory guard to estimate per-request peak cost.
+        self._model_size_bytes: int = 0
+        # Throttle (monotonic timestamp) for the predictive memory guard's
+        # defer log line. The scheduler tick is ~200ms — without this the
+        # log would emit dozens of duplicate lines per second under pressure.
+        self._last_defer_log_time: float = 0.0
 
         # SpecPrefill: draft model for attention-based sparse prefill
         self._specprefill_draft_model: Any | None = None
@@ -4286,15 +4294,63 @@ class Scheduler:
                 and self._memory_limit_bytes > 0
                 and self.running
             ):
+                # Predictive variant: instead of waiting for current memory
+                # to cross the soft limit, estimate whether admitting the
+                # next request would push us over. Two components:
+                #
+                #   1. Per-request peak: ~8% of model weight size, times
+                #      (n_running + 1). 8% (vs the original 5%) reflects
+                #      that the actual per-request cost during concurrent
+                #      prefill is higher than just the KV cache — it
+                #      includes SDPA attention matrices, intermediate
+                #      buffers, and ongoing decode growth across all
+                #      concurrent requests.
+                #   2. Cache-hit overhead: requests with prefix-cache hits
+                #      have KV state loaded from SSD during
+                #      reconstruct_cache(). The next request's
+                #      cached_tokens drives this estimate.
                 current = max(mx.get_active_memory(), get_phys_footprint())
-                if current > self._memory_limit_bytes:
-                    logger.debug(
-                        "Generation memory guard: deferring scheduling "
-                        "(%s > %s), %d running",
-                        current,
-                        self._memory_limit_bytes,
-                        len(self.running),
-                    )
+                per_request_estimate = (
+                    int(self._model_size_bytes * 0.08)
+                    if self._model_size_bytes > 0
+                    else 0
+                )
+                n_running = len(self.running)
+                concurrent_cost = (n_running + 1) * per_request_estimate
+                next_request = self.waiting[0]
+                cached_overhead = 0
+                if (
+                    next_request.cached_tokens > 0
+                    and self.memory_monitor is not None
+                ):
+                    try:
+                        cached_overhead = (
+                            self.memory_monitor.estimate_prompt_kv_bytes(
+                                next_request.cached_tokens
+                            )
+                        )
+                    except Exception:
+                        cached_overhead = 0
+                if (
+                    current + concurrent_cost + cached_overhead
+                    > self._memory_limit_bytes
+                ):
+                    now = time.monotonic()
+                    if now - self._last_defer_log_time >= 5.0:
+                        self._last_defer_log_time = now
+                        logger.info(
+                            "Generation memory guard: deferring scheduling "
+                            "(active=%.1fGB + concurrent_cost=%.1fGB "
+                            "(%d×%.2fGB) + cached_overhead=%.2fGB "
+                            "> soft=%.1fGB), %d running",
+                            current / 1024**3,
+                            concurrent_cost / 1024**3,
+                            n_running + 1,
+                            per_request_estimate / 1024**3,
+                            cached_overhead / 1024**3,
+                            self._memory_limit_bytes / 1024**3,
+                            n_running,
+                        )
                     break
 
             request = self.waiting.popleft()

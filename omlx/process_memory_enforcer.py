@@ -210,6 +210,12 @@ class ProcessMemoryEnforcer:
                     scheduler._memory_hard_limit_bytes = hard_limit
                     scheduler._prefill_memory_guard = self._prefill_memory_guard
                     scheduler._admission_paused = admission_paused
+                    # Plumb the per-engine model weight size for the
+                    # predictive generation memory guard's per-request
+                    # peak estimate.
+                    scheduler._model_size_bytes = int(
+                        getattr(entry, "estimated_size", 0) or 0
+                    )
                     bg = getattr(scheduler, "batch_generator", None)
                     if bg is not None and hasattr(bg, "_memory_limit_bytes"):
                         bg._memory_limit_bytes = self._max_bytes
