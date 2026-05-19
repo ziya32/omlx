@@ -1,10 +1,10 @@
 # Rebase plan: `features/more-models` → `origin/main` (v0.3.9rc1)
 
-**Status:** merge landed + 8 follow-up commits applied; remaining items are smaller
-follow-ups (audio_routes word_timestamps, dflash track-upstream, resolve-once caller
-migration, etc.). **149→178 targeted tests pass (100% green).**
+**Status:** merge + 13 follow-up commits + uv.lock regen applied. **235 targeted tests
+pass (100% green).** Remaining items are deferrable polish (engine_pool diagnostic
+fields, dflash track-upstream, Anthropic/Responses resolve-once migration).
 **Authored:** 2026-05-19
-**Last update:** 2026-05-19 — Tier-1 follow-ups complete
+**Last update:** 2026-05-19 — Tier-1 + smaller follow-ups complete
 
 ## Context
 
