@@ -815,7 +815,10 @@ def _suggest_endpoint_for_engine(engine: object) -> str:
     return "Use the model's dedicated endpoint (see /v1/models)."
 
 
-async def get_engine_for_model(model: str | None = None) -> BaseEngine:
+async def get_engine_for_model(
+    model: str | None = None,
+    resolved_id: str | None = None,
+) -> BaseEngine:
     """
     Get LLM engine for the specified model (or default).
 
@@ -823,6 +826,9 @@ async def get_engine_for_model(model: str | None = None) -> BaseEngine:
 
     Args:
         model: Model ID to get engine for, or None for default
+        resolved_id: Optional pre-resolved id, threaded to skip a second
+            resolve. Pass this when the caller has already taken an
+            acquire_engine lease on the resolved alias (Issue 7).
 
     Returns:
         The loaded engine
@@ -830,10 +836,13 @@ async def get_engine_for_model(model: str | None = None) -> BaseEngine:
     Raises:
         HTTPException: If model not found or memory error
     """
-    return await get_engine(model, EngineType.LLM)
+    return await get_engine(model, EngineType.LLM, resolved_id=resolved_id)
 
 
-async def get_embedding_engine(model: str) -> EmbeddingEngine:
+async def get_embedding_engine(
+    model: str,
+    resolved_id: str | None = None,
+) -> EmbeddingEngine:
     """
     Get embedding engine for the specified model.
 
@@ -841,6 +850,7 @@ async def get_embedding_engine(model: str) -> EmbeddingEngine:
 
     Args:
         model: Model ID to get engine for
+        resolved_id: Optional pre-resolved id (Issue 7).
 
     Returns:
         The loaded embedding engine
@@ -848,10 +858,13 @@ async def get_embedding_engine(model: str) -> EmbeddingEngine:
     Raises:
         HTTPException: If model not found, is not an embedding model, or memory error
     """
-    return await get_engine(model, EngineType.EMBEDDING)
+    return await get_engine(model, EngineType.EMBEDDING, resolved_id=resolved_id)
 
 
-async def get_reranker_engine(model: str) -> RerankerEngine:
+async def get_reranker_engine(
+    model: str,
+    resolved_id: str | None = None,
+) -> RerankerEngine:
     """
     Get reranker engine for the specified model.
 
@@ -859,6 +872,7 @@ async def get_reranker_engine(model: str) -> RerankerEngine:
 
     Args:
         model: Model ID to get engine for
+        resolved_id: Optional pre-resolved id (Issue 7).
 
     Returns:
         The loaded reranker engine
@@ -866,7 +880,7 @@ async def get_reranker_engine(model: str) -> RerankerEngine:
     Raises:
         HTTPException: If model not found, is not a reranker model, or memory error
     """
-    return await get_engine(model, EngineType.RERANKER)
+    return await get_engine(model, EngineType.RERANKER, resolved_id=resolved_id)
 
 
 def get_sampling_params(
