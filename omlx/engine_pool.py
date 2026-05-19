@@ -52,6 +52,7 @@ from .exceptions import (
 )
 from .model_discovery import discover_models, format_size
 from .engine_core import get_mlx_executor
+from .utils.proc_memory import get_phys_footprint
 from .scheduler import SchedulerConfig
 
 logger = logging.getLogger(__name__)
@@ -1285,7 +1286,11 @@ class EnginePool:
             return None
 
         while True:
-            current_active = mx.get_active_memory()
+            # max(active, phys_footprint) matches what jetsam sees and
+            # what ProcessMemoryEnforcer uses, so load decisions are
+            # consistent. psutil/active-memory underreports IOAccelerator-
+            # backed Metal on Apple Silicon UMA (95 GB gap on 31B+32k).
+            current_active = max(mx.get_active_memory(), get_phys_footprint())
             projected = current_active + entry.estimated_size
             if projected <= enforcer.max_bytes:
                 return None
@@ -1337,7 +1342,7 @@ class EnginePool:
 
             # All cleanup done. Re-check actual Metal memory — Metal's
             # allocator may not have reclaimed pages even after clear_cache.
-            current_active = mx.get_active_memory()
+            current_active = max(mx.get_active_memory(), get_phys_footprint())
             projected = current_active + entry.estimated_size
             if projected <= enforcer.max_bytes:
                 logger.info(
