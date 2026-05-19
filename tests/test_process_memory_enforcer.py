@@ -161,12 +161,14 @@ class TestCheckAndEnforce:
         enforcer._engine_pool._unload_engine.side_effect = fake_unload
 
         with patch("omlx.process_memory_enforcer.mx") as mock_mx:
-            mock_mx.get_active_memory.side_effect = _cycling([
-                20 * 1024**3,  # Initial check
-                20 * 1024**3,  # Re-check (still over)
-                15 * 1024**3,  # After first eviction (still over)
-                8 * 1024**3,  # After second eviction (under limit)
-            ])
+            # One-eviction-per-tick (feature Issue 1): keep memory above
+            # the limit throughout — _unload_engine only flips
+            # entry.engine = None and schedules deferred Metal cleanup,
+            # so mx.get_active_memory() doesn't drop within a tick.
+            # Each tick evicts at most one; drive two ticks to evict
+            # both LRU non-pinned victims.
+            mock_mx.get_active_memory.return_value = 20 * 1024**3
+            await enforcer._check_and_enforce()
             await enforcer._check_and_enforce()
         assert enforcer._engine_pool._unload_engine.call_count == 2
 
@@ -221,10 +223,14 @@ class TestCheckAndEnforce:
 
         with patch("omlx.process_memory_enforcer.mx") as mock_mx:
             mock_mx.get_active_memory.side_effect = _cycling([
-                20 * 1024**3,  # Initial check
-                20 * 1024**3,  # Re-check (still over)
-                15 * 1024**3,  # After eviction (still over)
+                20 * 1024**3,  # Tick 1 initial
+                20 * 1024**3,  # Tick 1 re-check
+                15 * 1024**3,  # Tick 1 post-eviction
+                15 * 1024**3,  # Tick 2 initial (no victim available)
             ])
+            # One-eviction-per-tick: tick 1 evicts the LRU victim,
+            # tick 2 (no victim) aborts the loading model.
+            await enforcer._check_and_enforce()
             await enforcer._check_and_enforce()
 
         # LRU victim evicted first
@@ -491,6 +497,10 @@ class TestSingleModelMemoryPressure:
         with patch("omlx.process_memory_enforcer.mx") as mock_mx:
             # Memory stays over limit throughout
             mock_mx.get_active_memory.return_value = 15 * 1024**3
+            # One-eviction-per-tick: tick 1 evicts model-b (after aborting
+            # its requests); tick 2 with only model-a remaining (single
+            # non-pinned) aborts its requests but keeps it loaded.
+            await enforcer._check_and_enforce()
             await enforcer._check_and_enforce()
 
         # model-b evicted (requests aborted before eviction)
@@ -499,7 +509,7 @@ class TestSingleModelMemoryPressure:
         )
         # model-b's requests aborted before eviction
         engine_b.abort_all_requests.assert_awaited_once()
-        # model-a's requests aborted (single-model path, second iteration)
+        # model-a's requests aborted (single-model path, second tick)
         engine_a.abort_all_requests.assert_awaited_once()
         # model-a still loaded
         assert entry_a.engine is not None
