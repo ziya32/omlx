@@ -310,8 +310,6 @@ class TestDisabledWhenMaxBytesZero:
 
         assert scheduler._memory_limit_bytes == 0
         assert scheduler._memory_hard_limit_bytes == 0
-        assert bg._memory_limit_bytes == 0
-        assert bg._memory_hard_limit_bytes == 0
 
 
 class TestPrefillMemoryGuardToggle:
@@ -537,10 +535,8 @@ class TestMemoryLimitPropagation:
             enforcer._propagate_memory_limit()
 
         assert scheduler._memory_limit_bytes == 10 * 1024**3
-        assert bg._memory_limit_bytes == 10 * 1024**3
         # hard limit = 96GB - 4GB = 92GB
         assert scheduler._memory_hard_limit_bytes == 92 * 1024**3
-        assert bg._memory_hard_limit_bytes == 92 * 1024**3
 
     def test_propagates_on_max_bytes_change(self, enforcer):
         """Propagates updated limits when max_bytes is changed at runtime."""
@@ -562,7 +558,6 @@ class TestMemoryLimitPropagation:
             enforcer.max_bytes = 20 * 1024**3
 
         assert scheduler._memory_limit_bytes == 20 * 1024**3
-        assert bg._memory_limit_bytes == 20 * 1024**3
 
     def test_skips_engine_without_scheduler(self, enforcer):
         """Gracefully skips engines without scheduler attribute."""

@@ -5395,10 +5395,6 @@ class Scheduler:
             if self._deferred_clear_at is None or target > self._deferred_clear_at:
                 self._deferred_clear_at = target
 
-    def _is_cache_corruption_error(self, error: Exception) -> bool:
-        """Check if an error indicates cache corruption."""
-        return is_cache_corruption_error(error)
-
     def _recover_from_cache_error(self) -> None:
         """Recover from cache corruption error."""
         # Clear batch generator (this is the source of the corruption)
@@ -5610,7 +5606,7 @@ class Scheduler:
             self._reschedule_running_requests()
 
         except (TypeError, AttributeError, ValueError) as e:
-            if self._is_cache_corruption_error(e):
+            if is_cache_corruption_error(e):
                 import traceback
 
                 logger.warning(

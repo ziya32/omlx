@@ -216,10 +216,6 @@ class ProcessMemoryEnforcer:
                     scheduler._model_size_bytes = int(
                         getattr(entry, "estimated_size", 0) or 0
                     )
-                    bg = getattr(scheduler, "batch_generator", None)
-                    if bg is not None and hasattr(bg, "_memory_limit_bytes"):
-                        bg._memory_limit_bytes = self._max_bytes
-                        bg._memory_hard_limit_bytes = hard_limit
 
     async def stop(self) -> None:
         """Stop the background enforcement loop."""
