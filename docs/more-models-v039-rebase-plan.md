@@ -1,10 +1,11 @@
 # v0.3.9rc1 Integration: `features/more-models` ← `origin/main`
 
-**Status:** ✅ **complete**. Merge committed + 25 follow-up commits + 9 review-driven
-fixes applied. **513/513 unit tests pass** on the targeted sweep. All 3 flagged risks
-resolved by inspection.
+**Status:** ✅ **complete**. Merge + 25 first-pass follow-ups + 9 review-driven fixes
++ 9 remaining-work commits. **All 8 "remaining future work" items now closed** —
+the doc no longer has any deferred items. Targeted test suite green; all 3 flagged
+risks resolved by inspection.
 **Authored:** 2026-05-19
-**Last update:** 2026-05-19 — post-merge review + hardening complete; doc audited
+**Last update:** 2026-05-19 — remaining-future-work items complete; doc audited
 
 ## Context
 
@@ -198,38 +199,29 @@ plus feature's `pillow-heif` and `>=3.12` python pin).
 | 2 | anthropic extra `except (json.JSONDecodeError, AttributeError)` — feature's dropped `bbf0f90` had it | **RESOLVED — present.** `omlx/api/anthropic_utils.py:820` carries the exact handler; main's `c5b91b5` also covers it via several `except (json.JSONDecodeError, ValueError)` blocks for tool-input parsing. |
 | 3 | gate-mcp — main's `697f63d` is a different impl than feature's dropped `f157e85` | **RESOLVED — gated.** `server.py:422` `app.include_router(mcp_router, dependencies=[Depends(verify_api_key)])` and `server.py:430` same for `audio_router`. Both routers require auth. |
 
-## Remaining future work (truly outstanding, lower priority)
+## Remaining-work pass (2026-05-19)
 
-Genuine polish items that didn't make this integration:
+After the post-merge review settled, the 8 items previously listed as "deferrable
+polish" were driven to completion. Two of them turned out to mask **critical
+runtime bugs** the test suite hadn't been exercising:
 
-- **`engine_pool.py` diagnostic fields** (`actual_size`, `loading_started_at`,
-  `_load_seconds_per_gb_ema`, `_load_time_observations`) — admin UI memory-bar
-  observability (#1278); requires `EngineEntry` dataclass extension + post-load
-  measurement loop. Low impact on serving correctness.
-- **`dflash.py` track-upstream** — main's `630/108` line delta covering #1276 DFlash
-  tuning params (`draft_window_size`/`draft_sink_size`/`verify_mode`), Gemma4 channel
-  marker support (`a74cfc8`), `dflash-mlx@1ba6713` runtime contract changes
-  (`ee5edc4`, `b7ee12c`). Significant integration against feature's kept routing.
-- **Anthropic `/v1/messages` + Responses `/v1/responses` resolve-once migration** —
-  mechanical extension of `ef50b0c`'s pattern to 2 more endpoints (`create_message`,
-  `create_response`).
-- **`max_tokens` settings fallback for STT** (`audio_routes.py`) — read per-model
-  `ModelSettings.max_tokens` when the request omits it (#1163).
-- **`_with_json_keepalive`** on non-streaming endpoints (`a124a1f`) + body-encoded
-  error after keepalive byte (`16445e1`) — feature's keepalive UX for long-running
-  non-streaming requests.
-- **`4baf965` cache-corruption traceback** — surface the full traceback when
-  scheduler cache-corruption recovery retries are exhausted.
-- **Format function consolidation** — 6 duplicate implementations
-  (`utils/formatting.py`, `utils/hardware.py`, `model_discovery.py`, `scheduler.py`,
-  `process_memory_enforcer.py`, `admin/routes.py`). Pure maintenance.
-- **Memory-guard unification** — `_preflight_memory_check` and `_schedule_waiting`'s
-  generation memory guard share the same metric snapshot (`_tick_memory_bytes` after
-  `c07ad0b`) and could share a `_check_memory_gating()` decision function returning
-  `OK | DEFER_GENERATION | REJECT_PREFLIGHT`.
+| Commit | Item | Notes |
+|---|---|---|
+| `2b71b10` | **#6** scheduler cache-corruption traceback (`4baf965`) | Tiny — promote traceback to WARNING when retries exhaust; debugging without re-running on DEBUG. |
+| `2ec0470` | **#3** Anthropic + Responses resolve-once | Mechanical — `create_anthropic_message`, `count_anthropic_tokens`, and `create_response` now thread `resolved_id=` (Issue 7). |
+| `1c0ec25` | **#4** STT `max_tokens` settings fallback (`#1163`) | request > `ModelSettings.max_tokens` > model default. Adapted to feature's form.get() handler. |
+| `79d3bd9` | **#1** engine_pool diagnostic fields | `EngineEntry.actual_size` + `.loading_started_at`, `EnginePool._load_seconds_per_gb_ema` + `_load_time_observations`. Wired in `_load_engine` (pre/post `phys_footprint`, EMA, reset on unload). Enables `#1278` admin UI memory-bar observability. |
+| `b3cbcb8` | **#7** Format function dedup | `utils/formatting.py` and `utils/hardware.py` shipped identical `format_bytes`; hardware.py now re-exports the canonical. Other format functions left as-is (different output shapes — not pure duplicates). |
+| `f32289f` | **#8** Memory-guard helper | Factored `_current_tick_memory_bytes()` to replace 4 duplicated `or max(mx.get_active_memory(), get_phys_footprint())` fallback expressions. Full merge of `_preflight_memory_check` + `_schedule_waiting` rejected: their return contracts (reject vs defer) are fundamentally different. |
+| `38f448d` | **#5** `_with_json_keepalive` body-encoded errors (`16445e1`) | The helper + 5 endpoint wirings auto-merged from main; only the error-body handling was still missing. `task.result()` now catches `RequestAbortedError` / `EngineEvictedError` / `HTTPException` / `Exception` and emits OpenAI envelope `{error: {message, type, code}}` with the equivalent status mirrored into `error.code` (HTTP status stays 200 — keepalive byte committed it). |
+| `7ac0a5f` | **#2 (a)** dflash v0.1.7 API breakage — **CRITICAL** | DFlashEngine was crashing at runtime against the pinned `dflash-mlx@1ba6713`: `load_target_bundle` moved out of `runtime/__init__` into `runtime.bundle`, and `generate_dflash_once` was removed entirely. Fixed imports + replaced `generate_dflash_once` with a sync drain of `stream_dflash_generate`. |
+| `a3f7454` | **#2 (b)** dflash tuning params + temperature drop | `_runtime_context` built from ModelSettings (`dflash_draft_window_size` / `_sink_size` / `_verify_mode` per `#1276`) and passed to every `stream_dflash_generate`. Dropped `temperature=` kwarg — v0.1.7 doesn't accept it on its streaming API; temperature still applies on fallback to BatchedEngine. |
 
-None of these block correctness or user-facing functionality. The merge is
-operationally complete.
+## All remaining future work — closed
+
+The previously-deferred items are now landed. The integration is operationally
+complete with no known outstanding work. The verification log (513 unit tests on
+the targeted suite, 21/21 critical-module imports) reflects the final state.
 
 ## Rollback
 
