@@ -2083,11 +2083,22 @@ class VLMBatchedEngine(BaseEngine):
         messages: list[dict[str, Any]],
         tools: list[dict] | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
+        is_partial: bool | None = None,
     ) -> str:
-        """Apply chat template for text-only messages (no images)."""
+        """Apply chat template for text-only messages (no images).
+
+        Args:
+            is_partial: Accepted for API parity with BatchedEngine but not
+                acted upon — VLM always uses ``add_generation_prompt=True``.
+                The ``partial`` key is still cleaned from message dicts.
+        """
         if hasattr(self._tokenizer, "apply_chat_template"):
             # Strip partial field (VLM always uses add_generation_prompt=True)
-            detect_and_strip_partial(messages)
+            if is_partial is None:
+                detect_and_strip_partial(messages)
+            else:
+                for msg in messages:
+                    msg.pop("partial", None)
             template_kwargs = {
                 "tokenize": False,
                 "add_generation_prompt": True,
@@ -2564,12 +2575,16 @@ class VLMBatchedEngine(BaseEngine):
         messages: list[dict[str, Any]],
         tools: list[dict] | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
+        is_partial: bool | None = None,
     ) -> int:
         """Count prompt tokens for chat messages including image token estimates.
 
         Strips image parts from messages without loading them via PIL, then
         estimates image tokens from the base64 header dimensions using the
         model's vision config (patch_size, merge_size).
+
+        ``is_partial`` is accepted for API parity with BatchedEngine but not
+        acted upon — VLM always uses ``add_generation_prompt=True``.
         """
         from ..utils.image import strip_images_and_estimate_tokens
 
@@ -2601,7 +2616,9 @@ class VLMBatchedEngine(BaseEngine):
 
         template_tools = convert_tools_for_template(tools) if tools else None
         prompt = self._apply_chat_template(
-            text_messages, template_tools, chat_template_kwargs=chat_template_kwargs
+            text_messages, template_tools,
+            chat_template_kwargs=chat_template_kwargs,
+            is_partial=is_partial,
         )
         text_tokens = len(self._tokenizer.encode(prompt))
         return text_tokens + image_tokens

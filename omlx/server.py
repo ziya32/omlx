@@ -119,13 +119,9 @@ from .api.rerank_models import (
     RerankUsage,
 )
 from .api.responses_models import (
-    OutputContent,
     OutputItem,
     ResponseObject,
     ResponsesRequest,
-    ResponsesTool,
-    ResponseUsage,
-    TextConfig,
 )
 from .api.responses_utils import (
     ResponseStore,
@@ -149,13 +145,11 @@ from .api.tool_calling import (
     restore_gemma4_param_names,
     extract_tool_calls_with_thinking,
     parse_json_output,
-    parse_tool_calls,
-    parse_tool_calls_with_thinking_fallback,
     sanitize_tool_call_markup,
 )
 from .api.thinking import ThinkingParser, extract_thinking
-from .api.utils import clean_output_text, clean_special_tokens, detect_and_strip_partial, extract_multimodal_content, extract_text_content
-from .engine import BaseEngine, BatchedEngine, VLMBatchedEngine
+from .api.utils import clean_special_tokens, detect_and_strip_partial, extract_multimodal_content, extract_text_content
+from .engine import BaseEngine, VLMBatchedEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
 from .engine_pool import EnginePool
@@ -417,17 +411,30 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Include MCP routes
+# Include MCP routes. Wire MCP's per-route _verify_auth dep to verify_api_key
+# so the router's dependencies=[Depends(verify_api_key)] is not the only
+# layer (avoid duplicated 401 paths and keeps test-injectable seams that
+# bypass server-state Bearer enforcement working in production too).
 from .api.mcp_routes import router as mcp_router, set_mcp_manager_getter
+from .api.mcp_routes import set_auth_dependency as _set_mcp_auth_dependency
 set_mcp_manager_getter(get_mcp_manager)
+_set_mcp_auth_dependency(verify_api_key)
 app.include_router(mcp_router, dependencies=[Depends(verify_api_key)])
 
 # Include audio routes only when mlx-audio is installed.
 # audio_routes.py itself only imports fastapi/stdlib at module level, so it
 # would always import successfully — we need an explicit mlx-audio check.
+# Wire audio_routes' _verify_auth + settings manager getter; without this
+# every /v1/audio/* endpoint returns 401 "Auth not configured".
 try:
     import mlx_audio as _  # noqa: F401
-    from .api.audio_routes import router as audio_router
+    from .api.audio_routes import (
+        router as audio_router,
+        set_auth_dependency as _set_audio_auth_dependency,
+        set_settings_manager_getter as _set_audio_settings_getter,
+    )
+    _set_audio_auth_dependency(verify_api_key)
+    _set_audio_settings_getter(lambda: _server_state.settings_manager)
     app.include_router(audio_router, dependencies=[Depends(verify_api_key)])
     del _
 except ImportError:
@@ -3472,7 +3479,6 @@ async def stream_anthropic_messages(
             tokenizer=engine.tokenizer,
             tools=kwargs.get("tools"),
         )
-        cleaned_text = extraction.cleaned_text
         tool_calls = extraction.tool_calls
 
     # 4. Close open blocks
@@ -4021,17 +4027,13 @@ async def create_response(
     openai_tools = convert_responses_tools(request.tools)
 
     # Get per-model settings
-    max_tool_result_tokens = None
     merged_ct_kwargs = {}
-    forced_keys: set[str] = set()
     reasoning_parser = None
     if _server_state.settings_manager:
         ms = _server_state.settings_manager.get_settings(resolved_model)
-        max_tool_result_tokens = ms.max_tool_result_tokens
         reasoning_parser = ms.reasoning_parser
         if ms.chat_template_kwargs:
             merged_ct_kwargs.update(ms.chat_template_kwargs)
-        forced_keys = set(ms.forced_ct_kwargs or [])
         # Dedicated enable_thinking toggle takes precedence over chat_template_kwargs
         if ms.enable_thinking is not None:
             merged_ct_kwargs["enable_thinking"] = ms.enable_thinking

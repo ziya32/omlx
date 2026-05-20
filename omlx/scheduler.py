@@ -797,6 +797,19 @@ class Scheduler:
         self._cache_rate_tracker = CacheRateTracker()
         self.memory_monitor: MemoryMonitor | None = None
 
+        # Memory monitor: used by the admission guard, preflight memory check,
+        # and KV cache eviction estimators. Without this, those checks fall
+        # through to no-op (returning 0/None) and silently disable themselves.
+        # The max_kv_cache_memory parameter is a constructor requirement but is
+        # not used by the estimator functions we rely on.
+        if MemoryMonitor is not None:
+            try:
+                self.memory_monitor = MemoryMonitor(max_kv_cache_memory=1024**3)
+                self._set_model_info_for_monitor()
+            except Exception as e:
+                logger.warning(f"Failed to initialize memory monitor: {e}")
+                self.memory_monitor = None
+
         # Initialize paged SSD cache if paged_ssd_cache_dir is specified
         if self.config.paged_ssd_cache_dir:
             # Calculate max_blocks automatically if not specified
@@ -5903,10 +5916,34 @@ class Scheduler:
             return
 
         try:
-            # Try to get model config
+            # Resolve a config-like object that has flat transformer fields
+            # (num_hidden_layers, num_attention_heads, etc.).
+            #
+            # For VLM adapters, .config returns the VLM wrapper config which
+            # has nested text_config / vision_config and does NOT expose flat
+            # transformer fields. The adapter's .args proxies to the language
+            # model's args, which DOES expose them. Try .args first.
+            #
+            # For LM models, .args may be missing — fall back to .config. If
+            # .config has nested text_config, drill into it.
+            def _has_flat_fields(c: Any) -> bool:
+                if c is None:
+                    return False
+                return (
+                    getattr(c, "num_hidden_layers", None) is not None
+                    or getattr(c, "n_layer", None) is not None
+                )
+
             config = None
-            if hasattr(self.model, "config"):
+            if hasattr(self.model, "args") and _has_flat_fields(self.model.args):
+                config = self.model.args
+            elif hasattr(self.model, "config"):
                 config = self.model.config
+                if not _has_flat_fields(config):
+                    # Drill into text_config (Qwen3-VL, Gemma3, Pixtral, etc.)
+                    text_config = getattr(config, "text_config", None)
+                    if _has_flat_fields(text_config):
+                        config = text_config
             elif hasattr(self.model, "args"):
                 config = self.model.args
 

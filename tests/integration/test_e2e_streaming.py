@@ -123,7 +123,13 @@ class MockBaseEngine(BaseEngine):
                 finish_reason="stop",
             )
 
-    def count_chat_tokens(self, messages: List[Dict], tools=None, chat_template_kwargs=None) -> int:
+    def count_chat_tokens(
+        self,
+        messages: List[Dict],
+        tools=None,
+        chat_template_kwargs=None,
+        is_partial=None,
+    ) -> int:
         prompt = self._tokenizer.apply_chat_template(messages, tokenize=False)
         return len(self._tokenizer.encode(prompt))
 
@@ -315,7 +321,13 @@ class TestOpenAIStreamingFormat:
         )
 
         events = parse_sse_events(response.text)
-        non_done_events = [e for e in events if not e.get("done")]
+        # Skip the keepalive pre-flight frame (model="keepalive") emitted by
+        # _with_sse_keepalive before the real stream begins — it is wire-only
+        # and does not carry the role chunk.
+        non_done_events = [
+            e for e in events
+            if not e.get("done") and e.get("model") != "keepalive"
+        ]
 
         if non_done_events:
             first_chunk = non_done_events[0]
