@@ -638,6 +638,16 @@ async def create_transcription(
     # Whisper models. When True, each segment in the response includes a
     # ``words`` array of ``{word, start, end, probability}`` objects.
     word_timestamps = str(form.get("word_timestamps", "false")).lower() == "true"
+    # oMLX extension raising the underlying model's output cap. Useful for
+    # long audio with models like VibeVoice-ASR whose mlx-audio default
+    # (8192) truncates ~24 min files. Precedence: request form > per-model
+    # ModelSettings.max_tokens > model's own generate() default.
+    _max_tokens_raw = form.get("max_tokens")
+    req_max_tokens: int | None
+    try:
+        req_max_tokens = int(_max_tokens_raw) if _max_tokens_raw not in (None, "") else None
+    except (TypeError, ValueError):
+        req_max_tokens = None
 
     if audio_file is None:
         raise HTTPException(status_code=400, detail="Audio file is required")
@@ -692,12 +702,27 @@ async def create_transcription(
                     detail=f"Model '{model_str}' is not a speech-to-text model",
                 )
             try:
+                # Effective max_tokens precedence: request > per-model
+                # ModelSettings.max_tokens > model's own generate() default.
+                effective_max_tokens = req_max_tokens
+                if effective_max_tokens is None:
+                    sm = _get_settings_manager()
+                    if sm is not None:
+                        try:
+                            ms = sm.get_settings(model_str)
+                            if ms is not None and getattr(ms, "max_tokens", None) is not None:
+                                effective_max_tokens = ms.max_tokens
+                        except Exception:
+                            pass
+
                 transcribe_kwargs: dict[str, object] = {
                     "language": language,
                     "prompt": str(prompt) if prompt else None,
                 }
                 if word_timestamps:
                     transcribe_kwargs["word_timestamps"] = True
+                if effective_max_tokens is not None:
+                    transcribe_kwargs["max_tokens"] = effective_max_tokens
                 output = await engine.transcribe(tmp_path, **transcribe_kwargs)
             except InvalidAudioFormatError as e:
                 raise HTTPException(status_code=400, detail=str(e))
