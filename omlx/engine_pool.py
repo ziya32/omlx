@@ -87,6 +87,11 @@ class EngineEntry:
     is_pinned: bool = False  # Never evict if True
     abort_loading: bool = False  # Deprecated: kept for backward compat only
     _vision_limits_cache: dict | None = None  # Cached compute_vision_limits result
+    # Diagnostic fields: actual_size is observed phys_footprint delta after load
+    # settles (None until first load completes); loading_started_at lets the
+    # admin UI compute an ETA against the load_seconds_per_gb EMA.
+    actual_size: int | None = None
+    loading_started_at: float | None = None
 
     # State machine fields
     state: EngineState = EngineState.UNLOADED
@@ -152,6 +157,11 @@ class EnginePool:
         self._process_memory_enforcer: object | None = None  # Set by server
         self._settings_manager: object | None = None  # Set by server
         self._suppress_ttl: bool = False  # Suppress TTL during benchmarks
+        # Exponentially-weighted moving average of observed load speed in
+        # seconds-per-GB. Used by the admin UI to project ETA for in-progress
+        # loads based on EngineEntry.loading_started_at + estimated_size.
+        self._load_seconds_per_gb_ema: float | None = None
+        self._load_time_observations: int = 0
         self._drain_timeout = drain_timeout
         self._max_wait_timeout = max_wait_timeout
         # Incremented on ANY timeout firing. Tests assert this stays at 0.
@@ -1603,6 +1613,7 @@ class EnginePool:
         engine_to_stop = entry.engine
         entry.engine = None  # prevent new requests
         entry.last_access = 0.0
+        entry.actual_size = None  # observed size lost when engine unloads
         entry.unload_complete = asyncio.Event()
         self._set_state(entry, EngineState.UNLOADING, reason)
 
@@ -1701,6 +1712,9 @@ class EnginePool:
         else:
             logger.info(f"Loading model: {model_id}")
         t0 = time.monotonic()
+        entry.loading_started_at = t0
+        # Snapshot pre-load memory so we can attribute the delta to this load.
+        pre_load_memory = max(mx.get_active_memory(), get_phys_footprint())
 
         # Retrieve per-model settings for post-load transforms
         model_settings = None
@@ -1977,9 +1991,27 @@ class EnginePool:
         )
 
         elapsed = time.monotonic() - t0
+        # Capture observed phys_footprint delta to populate EngineEntry.actual_size
+        # and feed the load-speed EMA the admin UI consumes for load-time ETAs.
+        post_load_memory = max(mx.get_active_memory(), get_phys_footprint())
+        observed_delta = max(0, post_load_memory - pre_load_memory)
+        entry.actual_size = observed_delta or entry.estimated_size
+        entry.loading_started_at = None
+        size_gb = entry.estimated_size / (1024 ** 3)
+        if size_gb > 0 and elapsed > 0:
+            sample = elapsed / size_gb
+            if self._load_seconds_per_gb_ema is None:
+                self._load_seconds_per_gb_ema = sample
+            else:
+                # 0.1 weight on each new sample — same EMA shape main uses.
+                self._load_seconds_per_gb_ema = (
+                    self._load_seconds_per_gb_ema * 0.9 + sample * 0.1
+                )
+            self._load_time_observations += 1
         logger.info(
             f"Loaded model: {model_id} in {elapsed:.1f}s "
-            f"(estimated: {format_size(entry.estimated_size)}, "
+            f"(actual: {format_size(entry.actual_size)}, "
+            f"estimated: {format_size(entry.estimated_size)}, "
             f"total: {format_size(self._committed_memory())})"
         )
 
