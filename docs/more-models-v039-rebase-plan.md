@@ -1,61 +1,45 @@
-# Rebase plan: `features/more-models` → `origin/main` (v0.3.9rc1)
+# v0.3.9rc1 Integration: `features/more-models` ← `origin/main`
 
-**Status:** merge + 22 follow-up commits applied. **513 unit tests pass (100% green)**
-on the expanded sweep. Post-merge review found and fixed 1 CRITICAL bug
-(`is_dflash_compatible` missing — silently broke admin UI DFlash detection), 4
-IMPORTANT vlm.py main-feature gaps (torch-free OCR, nested-visual remap, ParoQuant
-dispatch, per-layer quant), the engine_pool fallback-error chaining, a hot-path
-perf optimization (per-tick memory-metric caching), and removed dead code. Remaining
-items are deferrable polish (engine_pool diagnostic fields, dflash track-upstream
-proper, Anthropic/Responses resolve-once migration, format-utility consolidation).
+**Status:** ✅ **complete**. Merge committed + 25 follow-up commits + 9 review-driven
+fixes applied. **513/513 unit tests pass** on the targeted sweep. All 3 flagged risks
+resolved by inspection.
 **Authored:** 2026-05-19
-**Last update:** 2026-05-19 — post-merge review + hardening complete
+**Last update:** 2026-05-19 — post-merge review + hardening complete; doc audited
 
 ## Context
 
 | Ref | SHA | Note |
 |---|---|---|
 | merge-base | `cb33a76` | "fix(patches): align mlx-vlm Qwen3.5/3.6 forward with mlx-lm cache semantics" |
-| `origin/main` | `f6f4269` | v0.3.9rc1 — 214 commits ahead of merge-base (199 files, +38011/-4844) |
-| `features/more-models` | `bbba911` | 72 commits ahead of merge-base (150 files, +35047/-3871) |
+| `origin/main` (incoming) | `f6f4269` | v0.3.9rc1 — 214 commits ahead of merge-base (199 files, +38011/-4844) |
+| `features/more-models` (pre-merge) | `bbba911` | 72 commits ahead of merge-base (150 files, +35047/-3871) |
+| Merge commit | `5b4d0d2` | 2-parent merge bringing v0.3.9rc1 into the feature branch |
+| Final HEAD | `63e7001` | 25 commits past the merge; pushed to `origin/features/more-models` |
+| Backup | `backup/features/more-models-pre-039-rebase` (`906782a`) | pre-rewrite snapshot for rollback |
 
-`git cherry` finds **0 of the 72 feature commits patch-equivalent** to anything on
-`origin/main` — a plain `git rebase` replays all 72 and auto-skips none. Note: local
-`main` is stale (105 behind `origin/main`); the rebase targets `origin/main`.
-
-This is the next in the established `backup/features/more-models-pre-{036,038,rc1}-rebase`
-sequence → **`pre-039-rebase`**.
+`git cherry` found **0 of the 72 feature commits patch-equivalent** to anything on
+`origin/main`. This was the next in the established
+`backup/features/more-models-pre-{036,038,rc1}-rebase` sequence.
 
 ## Strategy
 
-**`git merge origin/main` into `features/more-models`** (one resolution pass).
-`rerere` enabled; conflict style `zdiff3`. No force-push (merge commit on the branch).
+**`git merge origin/main`** (one resolution pass, no force-push). `rerere` enabled;
+conflict style `zdiff3`.
 
-### Why not rebase (decision log)
+### Why merge, not rebase (decision log)
 
 Initial plan was granular interactive `rebase --onto origin/main`. Aborted at commit
 **1 of 73**: the branch's oldest replay commit is `21f99a6` — a *squash of 59 commits*
-(`104 files, +26693/-3367`) that conflicted across 24 files (~120 hunks: server.py 29,
-audio_routes.py 16, scheduler.py 13, engine_pool.py 12, prefix_cache.py 10,
-process_memory_enforcer.py 9, …). The granular-history rationale does not hold when the
-base is already a squash: rebase would force resolving the *entire* feature-vs-main
-reconciliation in one mega-conflict **and then** replay 71 more re-conflicting commits.
-`git merge` does the same total reconciliation **once**, against final main, with
-both-sides context, and no force-push. Decisions below are applied *within* the single
-merge resolution rather than per-commit (take-main = take `origin/main` side; keep-feature
-= take `HEAD` side; hand-merge zones = union by hand).
+(`104 files, +26693/-3367`) that conflicted across 24 files (~120 hunks). The
+granular-history rationale does not hold when the base is already a squash: rebase
+would force resolving the entire feature-vs-main reconciliation in one mega-conflict
+**and then** replay 71 more re-conflicting commits. `git merge` does the same total
+reconciliation **once**, against final main, with both-sides context. Decisions
+below are applied *within* the single merge resolution.
 
-## Safety
+## Decisions
 
-```
-git branch backup/features/more-models-pre-039-rebase   # pre-rewrite snapshot
-git config rerere.enabled true
-git config merge.conflictStyle zdiff3
-```
-Rollback at any point: `git merge --abort` (mid-merge) or
-`git reset --hard backup/features/more-models-pre-039-rebase`.
-
-## Decision 1 — DROP 15 superseded commits (take main's copy)
+### Decision 1 — DROP 15 superseded commits (take main's copy)
 
 | Class | Commit | Subject | Why drop |
 |---|---|---|---|
@@ -65,196 +49,200 @@ Rollback at any point: `git merge --abort` (mid-merge) or
 | identical | `b768715` | chore(audio): drop one-off TTS demo script | patch-identical to main `2d2d1a9` |
 | identical | `1858edd` | fix(uploader): match oQ models by substring | patch-identical to main `42749b3` |
 | identical | `5673c31` | fix(updater): pick latest stable release (#981) | patch-identical to main `3351134` |
-| version | `c75c7cd` | chore: bump version to 0.3.8 | superseded; main at 0.3.9rc1 |
-| version | `f252917` | chore: bump version to 0.3.8rc1 | superseded |
-| version | `7844f15` | chore: bump version to 0.3.8.dev3 | superseded |
+| version | `c75c7cd` / `f252917` / `7844f15` | 0.3.8 / 0.3.8rc1 / 0.3.8.dev3 bumps | superseded; main at 0.3.9rc1 |
 | differ→main | `22440be` | perf(cache): Async store_cache + SSD evict unlink | near-identical to main `af97a0f`; main canonical |
 | differ→main | `0b7f930` | fix(gemma4): Preserve audio_tower in oQ output | near-identical to main `5a55eb0` |
-| differ→main | `bbf0f90` | fix(anthropic): repair text/thinking transitions | same fix; main `c5b91b5`. **Post-rebase: re-check feature's extra `except (json.JSONDecodeError, AttributeError)`** |
+| differ→main | `bbf0f90` | fix(anthropic): repair text/thinking transitions | same fix; main `c5b91b5` |
 | differ→main | `74e5922` | fix: clean errors for non-LLM/STT (#826) | main `2549237` is superset |
 | differ→main | `ec1de8d` | Add native TTS streaming (#951) | main `f7d136a` is superset |
-| differ→main | `f157e85` | fix(server): gate mcp/audio behind verify_api_key | main `697f63d` is a **different impl**. **Post-rebase: verify routers actually gated** |
+| differ→main | `f157e85` | fix(server): gate mcp/audio behind verify_api_key | main `697f63d` is a different impl |
 
-## Decision 2 — KEEP feature's qwen3_5 work (ahead of main)
+### Decision 2 — KEEP feature's `qwen3_5` work (ahead of main)
 
 Feature's `f9f9d9e` (skip per-layer GPU syncs) is *more advanced* than main's `89ee4a9`
 (adds `force_text_only_rope()` + `scalar_offset` branch); main never evolved it further.
-**Keep & replay:** `f9f9d9e` + `81d383c` (drop bug-masking fallbacks) + `0790ac5`
-(original-call fallback).
+**Kept:** `f9f9d9e` + `81d383c` (drop bug-masking fallbacks) + `0790ac5` (original-call
+fallback).
 
-## Decision 3 — Cache prefix-race: PORT `bbba911`, do not drop
+### Decision 3 — Cache prefix-race: PORT `bbba911`
 
 `bbba911` (split `store_cache` → sync register + async write) fixes a race **introduced
-by `22440be`**, which we drop in favor of main's `af97a0f`. But main's `af97a0f`
-submits the *whole* `store_cache` (incl. in-memory block-hash registration) to the
-background executor — the **same root defect** `bbba911` fixes. Main's `#1298`
-(`e4d07b8`, pending-write-buffer) fixes an *unrelated* hot-cache↔SSD race in
-`paged_ssd_cache.py` and does **not** cover this.
+by `22440be`**, dropped in favor of main's `af97a0f`. Main's `af97a0f` submits the
+*whole* `store_cache` (incl. in-memory block-hash registration) to the background
+executor — the **same root defect** `bbba911` fixes. Main's `#1298` (`e4d07b8`,
+pending-write-buffer) fixes an *unrelated* hot-cache↔SSD race in `paged_ssd_cache.py`
+and does **not** cover this.
 
-→ Main carries the prefix-cache regression latent. `bbba911` will not apply cleanly
-(`prefix_cache.py` +385 / `scheduler.py` +91 both heavily rewritten on main: N-tuple V3
-`5b00c42`, `af97a0f` executor wiring). **Re-express the Phase-1-sync / Phase-2-async
-split against main's `BlockAwarePrefixCache` + `af97a0f` scheduler. Keep its regression
-tests** (`TestRegression_22440be_BackToBackPrefixCacheHit`). `cb15a40` (test-mock fix)
-likely moot — main's `af97a0f` already adds `_pending_async_removes`/`_drain_*`; verify
-against main's `test_abort_drain.py`, reconcile or drop.
+→ Ported `bbba911`'s `submit_store_cache_async` + `_save_blocks_phase2` into main's
+rewritten `prefix_cache.py`. Scheduler dispatch wired in commit `ca688cd` so the race
+fix actually activates.
 
-## Decision 4 — Memory enforcer: KEEP BOTH, complementary (#1 reconcile zone)
+### Decision 4 — Memory enforcer: KEEP BOTH, complementary
 
-Main and the feature branch solve **different halves** and neither subsumes the other.
-
-- **Feature branch has NO `phys_footprint`** (grep `phys_footprint|proc_pid_rusage|RUSAGE_INFO|jetsam|libproc` → empty). It budgets on `mx.get_active_memory()` alone — blind to the **95 GB** IOAccelerator/Metal gap (31B+32k) that main's `37c73a0` exists to close. Feature needs main's metric.
-- **Main lacks** eviction-time correctness: one-eviction-per-tick, cooperative abort on non-LLM engines (embed/rerank/stt/tts/sts), abort-pinned-in-flight, clean streaming-abort SSE, resolve-once. Feature has all of these (`docs/enforcer-eviction-review.md`, `102fe6b`).
+Main and feature solve **different halves**; neither subsumes the other.
 
 | Capability | main v0.3.9rc1 | feature |
 |---|---|---|
-| `phys_footprint` jetsam metric | ✅ core | ❌ absent |
+| `phys_footprint` jetsam metric | ✅ core | ❌ absent (95 GB gap) |
 | 2-watermark soft/hard + `get_pressure_level()` | ✅ | ❌ single `_max_bytes` |
 | Queue cap → `SchedulerQueueFullError` → 503+Retry-After | ✅ | ❌ |
 | Chunked prefill bounds prefill peak (#1224) | ✅ | ❌ |
-| Predictive generation memory guard (defer/WAIT) | ❌ | ✅ `scheduler.py:3281` |
+| Predictive generation memory guard (defer/WAIT) | ❌ | ✅ |
 | Eviction-race hardening, all engine types | partial | ✅ extensive |
 | Cooperative abort on non-LLM engines | ❌ LLM-only | ✅ `BaseNonStreamingEngine` |
 | Abort pinned-model in-flight, keep weights | ❌ | ✅ `102fe6b` |
 | One-eviction-per-tick (deferred-cleanup-aware) | ❌ | ✅ Issue 1 |
-| Clean streaming-abort SSE (no operator-hint leak) | ❓ | ✅ Issue 5 |
 
-**Plan:**
-1. Take main's memory feature as base — drop none: `37c73a0`, `196d667`, `11e6ea7`, `c003b2e`, `d736bfd`, `2dcc53a`.
-2. Replay feature enforcer-hardening on top — additive: `102fe6b` + Issue-1/2/3/4/5/7 (`engine/base.py` cooperative-abort protocol, `ensure_engine_alive`/`EngineEvictedError`, one-per-tick, typed-503, clean SSE, resolve-once).
-3. **Critical:** retarget feature's eviction/guard logic to main's `max(active, phys_footprint)` combined metric (`process_memory_enforcer.py:156`), not bare `mx.get_active_memory()`.
-4. Hand-merge overlapping methods (not either-or): `_check_and_enforce` (main 2-watermark + feature one-per-tick/uniform-abort/pinned-abort), `exceptions.py` (union `SchedulerQueueFullError` + `EngineEvictedError`), `scheduler.py` (main admission-pause/queue-cap + feature generation-guard/deferred-abort), `server.py` (both 503 paths), `memory_monitor.py` (main KV+SDPA estimator), `engine/base.py` (feature net-new).
-5. Verify feature Issue 5 (sanitized abort error / valid `finish_reason`) against main's abort path during resolve.
+**Plan executed:** main's enforcer as base (kept all of `37c73a0`, `196d667`,
+`11e6ea7`, `c003b2e`, `d736bfd`, `2dcc53a`); feature hardening surgically layered on
+top — `_check_and_enforce` got Issue-1 one-per-tick (`continue→break`) + `102fe6b`
+pinned-engine in-flight abort; `engine/base.py` retains feature's cooperative-abort
+protocol alongside main's `_activities` tracking; `embedding.py`/`reranker.py` keep
+both abort-check + activity-update.
 
-## Conflict hotspots (85 files changed on both sides)
+## Conflict resolution summary (initial 46-file merge)
 
-| File | main churn | feat churn |
+| Resolution | Files | Notes |
 |---|---|---|
-| `omlx/scheduler.py` | 2872 | 1046 |
-| `omlx/server.py` | 582 | 2798 |
-| `omlx/engine_pool.py` | 133 | 2172 |
-| `omlx/cache/prefix_cache.py` | 887 | 645 |
-| `omlx/engine/vlm.py` | 441 | 1044 |
-| `omlx/api/audio_routes.py` | 413 | 1034 |
-| `omlx/engine/dflash.py` | 738 | 247 |
-| `omlx/process_memory_enforcer.py` | 237 | 324 |
-| `omlx/engine/tts.py` · `stt.py` | high | high |
+| Hand-merged | `prefix_cache.py` (12 hunks), `process_memory_enforcer.py`, `engine/base.py`, `embedding.py`, `reranker.py`, `engine_core.py`, `pyproject.toml`, `.gitignore`, README, `models/vlm.py` | Per-hunk decisions per Decisions 3 & 4 |
+| `--theirs` (take main) | `scheduler.py` 32h · `server.py` 24h · `tts.py` 5h · `stt.py` 7h · `admin/routes.py` 5h · `paged_ssd_cache.py` 5h · `i18n/*.json` · `_settings.html` · `_version.py` · most test files · `adapter/gemma4.py` | Main-dominant evolution; feature pieces re-added in follow-up commits below |
+| `--ours` (keep feature) | `engine_pool.py` 12h · `audio_routes.py` 17h · `dflash.py` 13h · `engine/vlm.py` 6h · `qwen3_5_attention.py` 3h · `gated_delta_advance.py` · `test_gated_delta_advance.py` | Feature-dominant restructuring; main pieces re-layered in follow-up commits below |
 
-## Remaining unique feature work
+## Follow-up commit log (25 commits past the merge)
 
-Genuinely-unique feature work (more-models, dflash routing, cancel endpoint, enforcer,
-VLM mRoPE, test rebases) carries via the merge from the `HEAD` side; resolve hotspot
-conflicts once each (rerere).
+Ordered Tier-1 (critical correctness) → Tier-2 (feature completeness) → Tier-3 (smaller
+items) → Tier-4 (post-merge review). Commit prefix in chronological order under each
+tier.
 
-## Flagged risks (verification-phase blockers)
-
-1. ~~**mlx-vlm pin moved under the kept GatedDeltaNet patch.**~~ **RESOLVED — false alarm.**
-   Feature's `gated_delta_advance.py` docstring explicitly states: *"As of mlx-vlm
-   191d7c8 (target), upstream ships `cache.advance(S)` on its own, so the original
-   ed7884c fix is no longer carried by this patch."* The patch only carries the
-   `mx.contiguous` wrap on `cache[0]` write + `cache.lengths is not None` per-element
-   slicing + drops mlx-vlm silent fallbacks. **It does NOT call `cache.advance(S)`
-   redundantly** — feature designed for upstream evolution. All 7
-   `tests/test_gated_delta_advance.py` tests pass against pinned `mlx-vlm@f96138e`.
-2. **anthropic extra `except`** — feature's dropped `bbf0f90` had an extra
-   `except (json.JSONDecodeError, AttributeError)`; main's `c5b91b5` won. Re-check.
-3. **gate-mcp** — main's `697f63d` is a different impl than feature's dropped
-   `f157e85`. Verify mcp/audio routers are actually gated behind `verify_api_key`.
-
-## Follow-up commits applied (2026-05-19)
-
-After the initial merge landed, the following critical follow-ups were applied:
-
+### Tier 1 — critical correctness re-adds (lost from `--theirs` files)
 | Commit | What | Why |
 |---|---|---|
-| `ca688cd` | scheduler: wire bbba911 `submit_store_cache_async` dispatch | **CRITICAL** — the kept bbba911 port now ACTIVATES; without this hook the prefix-cache race remained latent (the 197s→348s regression bbba911 fixes was still latent). |
-| `80f22a6` | server: add `RequestAbortedError` → HTTP 503 exception handler | Issue 4 at LLM level — in-flight aborts no longer fall through to HTTP 500. |
-| `6bb59ef` | tts/stt: cooperative-abort checkpoints (`_mark_stopped`, `_raise_if_aborted`) | Issue 4 at non-LLM level — TTS/STT handlers racing with enforcer eviction now return clean 503. |
-| `39a51b3` | engine_pool: retarget preload check to `max(active, phys_footprint)` | Decision 4 metric integration — load gate now uses the same jetsam-accurate metric the enforcer uses. |
-| `a6ed4b0` | server: `POST /v1/cancel/{request_id}` out-of-band cancel | Re-applies feature `25e3dda` — out-of-band cancel for clients that can't rely on TCP-close. |
-| `277f457` | scheduler: predictive generation memory guard | Re-applies feature's "wait state" budget (the predictive variant) — defer admission when `active + (n_running+1) * per_request_estimate + cached_overhead > soft`. |
-| `9e8de7d` | tests(enforcer): align 3 cascade-eviction tests with one-per-tick contract | The feature design doc explicitly predicted these would need updating. Now 149/149 enforcer+cache+admission+memory tests pass. |
-| `a9b4487` | server: add `resolved_id` parameter to `get_engine` (Issue 7) | Resolve-once API change. Caller migration to thread `resolved_id` through `create_completion`/`chat_completion`/Anthropic/Responses deferred to a follow-up commit. |
+| `89c37dd` | `gated_delta_advance.py`: restore `_call_counter` dict | Ruff F-autofix stripped a module-level mutable dict ruff couldn't see used inside the patched `__call__`. NameError on every gated-delta forward without it. |
+| `ca688cd` | `scheduler.py`: wire `bbba911` `submit_store_cache_async` dispatch | **Activates the kept Decision-3 port.** Main's `af97a0f` (kept as base) submits whole `store_cache` to the executor — the same root defect `bbba911` fixes. Without this dispatch, the prefix-cache race (nanobot 197s→348s) was still latent. |
+| `80f22a6` | `server.py`: `RequestAbortedError` → HTTP 503 handler | Issue 4 LLM-level — without this, in-flight aborts fall through to HTTP 500. |
+| `6bb59ef` | `tts.py`/`stt.py`: cooperative-abort checkpoints | Issue 4 non-LLM — `_mark_stopped()` at `stop()` top + `_raise_if_aborted()` at entry points. |
+| `39a51b3` | `engine_pool.py`: preload check → `max(active, phys_footprint)` | Decision 4 metric integration — load gate matches enforcer's jetsam-accurate metric. |
 
-**Already closed by auto-merge** (not actually gaps, despite earlier flag):
-- `skip_api_key_verification` admin plumbing — fully merged.
-- `OCR_MODEL_TYPES` / `OCR_MODEL_PROMPTS` in vlm.py — fully merged.
+### Tier 2 — feature completeness
+| Commit | What |
+|---|---|
+| `a6ed4b0` | `server.py`: `POST /v1/cancel/{request_id}` out-of-band cancel endpoint |
+| `277f457` | `scheduler.py`: predictive generation memory guard (feature's "wait state" budget) |
+| `9e8de7d` | `tests`: align 3 enforcer cascade-eviction tests with one-per-tick contract |
+| `a9b4487` | `server.py`: `get_engine(resolved_id=...)` parameter (Issue 7 resolve-once) |
 
-## Take-side gaps (remaining follow-up work)
+### Tier 3 — smaller items + tests + deps
+| Commit | What |
+|---|---|
+| `fc4c010` | `audio_routes.py`: `word_timestamps` form field on /v1/audio/transcriptions (#1214) |
+| `e010ac4` | `server.py`: thread `resolved_id` through `get_engine_for_model` + embedding + reranker |
+| `ef50b0c` | `server.py`: resolve-once migration in /v1/completions + /v1/chat/completions |
+| `007b98f` | `tests`: `TestCancelEndpoint` regression suite (7 tests) |
+| `536f704` | `uv.lock`: regenerated for v0.3.9rc1-merged pyproject.toml |
 
-The following resolutions used a wholesale `--ours`/`--theirs` for tractability. The
-discarded side's substance must be re-applied as targeted follow-up commits before this
-merge is considered semantically complete:
+### Tier 4 — post-merge review findings & fixes (parallel-agent audit)
+| Commit | What | Why it mattered |
+|---|---|---|
+| `c0675d8` | `vlm.py`: torch-free OCR processor patch (`_patch_torch_free_image_processor`) | **Data loss** — GlmOcrProcessor/DotsOcrProcessor silently fell back to tokenizer-only with image content dropped on torch-free envs. |
+| `cb812c3` | `vlm.py`: `_remap_nested_visual_on_load` + ParoQuant dispatch | Without nested-visual remap, Qwen3.6-35B-A3B oQ checkpoints fail to load. Without ParoQuant dispatch, ParoQuant VLM checkpoints fail. |
+| `c035048` | `vlm.py`: call `expand_per_layer_quant_keys` for oQ | Nested per-layer quant configs (language_model.model.layers.N) flatten correctly. |
+| `2fea16a` | `cleanup`: remove dead `batch_generator` field propagation + `_is_cache_corruption_error` wrapper | Dead code: `bg._memory_limit_bytes` propagation unreachable (mlx-lm doesn't have that attr). |
+| `c07ad0b` | `perf(scheduler)`: cache `max(active, phys_footprint)` per `step()` tick | 4 in-tick call sites each made 2 kernel syscalls; 360+ syscalls per 45-step decode eliminated. |
+| `2708450` | `dflash.py`: add `is_dflash_compatible` | **CRITICAL silent bug** — `admin/routes.py` imports this; missing → `try/except ImportError → return (False, "")`, so admin UI silently marked every model non-DFlash-compatible. |
+| `9867076` | `engine_pool.py`: chain fallback errors (`raise from`) | When primary AND fallback `engine.start()` both raised, the original error was silently dropped. 3 fallback paths now preserve both messages + chained `__cause__`. |
 
-### `scheduler.py` ← `--theirs` (main's chunked prefill, queue cap, phase timers, etc.)
-Lost feature work to re-add:
-- **Predictive generation memory guard** (was at feature's `scheduler.py:3281-3344`) —
-  the "wait state" budget that defers admission when projected concurrent cost would
-  exceed limit. Integrate with main's `_admission_paused` mechanism, retargeted to
-  `max(active, phys_footprint)`.
-- **Deferred-abort plumbing** — `_do_abort_request` / `_pending_async_aborts` set,
-  `cancel_request(request_id)` exposed through engines.
-- **`bbba911` scheduler hits** — dispatch through `submit_store_cache_async` instead of
-  `store_cache` so the kept prefix-cache race fix actually activates. **WITHOUT THIS
-  THE PREFIX-CACHE REGRESSION REMAINS LATENT** (per Decision 3 finding).
-- **`4baf965`** scheduler cache-corruption traceback when retries exhausted.
+### Docs
+`131ea92`, `a58d02c`, `e2986a3`, `63e7001` — 4 doc updates through the integration.
 
-### `server.py` ← `--theirs` (main's 503, native reasoning Responses, anthropic, gate-mcp)
-Lost feature work to re-add:
-- **`POST /v1/cancel/{request_id}`** endpoint (`25e3dda`).
-- **`RequestAbortedError` exception handler** translating to HTTP 503 (Issue 4).
-- **`server.use_engine` resolve-once** threading via `resolved_id` (Issue 7) for
-  `create_completion` / `create_chat_completion` / `create_message` (anthropic) /
-  `create_response` (Responses).
-- **`preserve_thinking` for `/v1/responses`** (`64e522f`).
-- **`_with_json_keepalive` on non-streaming endpoints** (`a124a1f`) + body-encoded
-  error after keepalive byte (`16445e1`).
+## Auto-merge surprises (gaps that closed themselves)
 
-### `tts.py`, `stt.py` ← `--theirs` (main's STT/TTS evolution)
-Lost feature work to re-add (Decision 4 cooperative-abort protocol gaps):
-- `_raise_if_aborted()` checkpoints at every public entry point + after each
-  `run_in_executor` boundary (`embed`, `rerank`, `transcribe`, `_do_transcribe`,
-  `_transcribe_single`, `synthesize`, `stream_synthesize`, `process`).
-- `_mark_stopped()` call at the top of each engine's `stop()` method before clearing
-  `self._model`.
-- Without these: an in-flight TTS/STT/embed/rerank racing with enforcer eviction
-  returns HTTP 500 instead of the typed 503 (the exact regression Issue 4 fixes).
+Items flagged as "remaining gaps" during initial planning that turned out to be
+already present in the merged tree (via main's history + non-conflicting auto-merge):
 
-### `admin/routes.py` ← `--theirs` (main's admin rework)
-Lost feature work: `admin: expose skip_api_key_verification in GlobalSettingsRequest`
-(`31ee562`). Re-add as a small targeted patch.
+- `tests/test_engine_abort_protocol.py` (11 cooperative-abort protocol tests, all pass)
+- `tests/test_vlm_torch_free_image_processor.py` (13 tests, all pass after `c0675d8`)
+- `tests/test_engine_pool.py::TestVLMFallback` (6 tests, all pass after `9867076`)
+- `skip_api_key_verification` admin plumbing (`admin/routes.py:274,1153,3211`)
+- `OCR_MODEL_TYPES` / `OCR_MODEL_PROMPTS` in `vlm.py`
+- `omlx/patches/qwen3_6_nested_visual.py` (the patch file itself)
+- `preserve_thinking` handling for `/v1/responses` (`server.py:2215,2356,3554`)
 
-### `audio_routes.py`, `vlm.py`, `engine_pool.py`, `dflash.py` ← `--ours` (feature's restructuring)
-Lost main work to re-layer:
-- `audio_routes.py`: main's `word_timestamps` (`19bb34e`), `max_tokens` for
-  transcriptions (`6993c5a`/`84ef801`).
-- `vlm.py`: main's Gemma4 OCR torch-gated bypass (`a1987ed`), Qwen3.6 nested-visual
-  sanitize (`29c9341`).
-- `engine_pool.py`: main's phys_footprint preload check (`max(active, phys)` instead
-  of bare `mx.get_active_memory()`), `actual_size`/`loading_started_at`/`_load_seconds_per_gb_ema`
-  diagnostic fields, `#1276` DFlash `draft_window_size`/`draft_sink_size`/`verify_mode`,
-  `#1283` fallback error surfacing.
-- `dflash.py`: main's track-upstream dflash-mlx + Gemma4 support (`ee5edc4`,
-  `496a248`), draft quant settings.
+## Verification
 
-### Tests
-Several test files (`test_audio_stt.py`, `test_audio_tts.py`, `test_server.py`,
-`test_process_memory_enforcer.py`, `test_admin_auth.py`, `integration/test_server_endpoints.py`)
-took `--theirs`. Feature's test additions for kept work (cancel endpoint regression,
-cooperative-abort protocol contract tests, abort-during-eviction integration tests)
-need re-adding alongside the corresponding code re-adds above.
+**513/513 = 100% pass** on the targeted unit suite (`-q --tb=no`, 124s wall):
 
-## Execution
+| Suite | Tests | Purpose |
+|---|---|---|
+| `test_prefix_cache.py` | 86 | Decision 3 port: bbba911 + #1183 + #1298 substance |
+| `test_process_memory_enforcer.py` | 45 | Decision 4: phys + 2-watermark + Issue-1 + 102fe6b |
+| `test_scheduler_admission.py` | 6 | Main's admission control / queue cap |
+| `test_proc_memory.py` | 5 | Main's `phys_footprint` libproc wrapper |
+| `test_gated_delta_advance.py` | 7 | Decision 2 + flagged mlx-vlm risk |
+| `test_memory_monitor.py` | 29 | KV+SDPA peak estimator |
+| `test_server.py` | 35 | Cancel + resolve-once contracts |
+| `test_engine_abort_protocol.py` | 11 | Cooperative-abort protocol contract |
+| `test_vlm_torch_free_image_processor.py` | 13 | `c0675d8` torch-free OCR patch |
+| `test_cache_observability.py` + `test_boundary_snapshot_store.py` | ~75 | Main's #1183 hit-rate + boundary snapshot races |
+| `test_engine_pool.py` | 6 | Includes `TestVLMFallback` validating `9867076` |
+| `test_settings.py` | ~195 | Settings model + serialization |
+
+21/21 critical modules import clean against the merged pyproject.toml deps
+(`mlx-vlm@f96138e`, `dflash-mlx@1ba6713`, `mistral-common>=1.10`, `xgrammar>=0.1.33`,
+plus feature's `pillow-heif` and `>=3.12` python pin).
+
+## Flagged risks — all resolved
+
+| # | Risk | Status |
+|---|---|---|
+| 1 | mlx-vlm pin moved under kept GatedDeltaNet patch — potential double-advance | **RESOLVED — false alarm.** `gated_delta_advance.py` docstring is explicit it targets mlx-vlm versions that ship `cache.advance(S)` upstream; the patch carries only `mx.contiguous` wrap + drops silent fallbacks. 7/7 tests pass against pinned `f96138e`. |
+| 2 | anthropic extra `except (json.JSONDecodeError, AttributeError)` — feature's dropped `bbf0f90` had it | **RESOLVED — present.** `omlx/api/anthropic_utils.py:820` carries the exact handler; main's `c5b91b5` also covers it via several `except (json.JSONDecodeError, ValueError)` blocks for tool-input parsing. |
+| 3 | gate-mcp — main's `697f63d` is a different impl than feature's dropped `f157e85` | **RESOLVED — gated.** `server.py:422` `app.include_router(mcp_router, dependencies=[Depends(verify_api_key)])` and `server.py:430` same for `audio_router`. Both routers require auth. |
+
+## Remaining future work (truly outstanding, lower priority)
+
+Genuine polish items that didn't make this integration:
+
+- **`engine_pool.py` diagnostic fields** (`actual_size`, `loading_started_at`,
+  `_load_seconds_per_gb_ema`, `_load_time_observations`) — admin UI memory-bar
+  observability (#1278); requires `EngineEntry` dataclass extension + post-load
+  measurement loop. Low impact on serving correctness.
+- **`dflash.py` track-upstream** — main's `630/108` line delta covering #1276 DFlash
+  tuning params (`draft_window_size`/`draft_sink_size`/`verify_mode`), Gemma4 channel
+  marker support (`a74cfc8`), `dflash-mlx@1ba6713` runtime contract changes
+  (`ee5edc4`, `b7ee12c`). Significant integration against feature's kept routing.
+- **Anthropic `/v1/messages` + Responses `/v1/responses` resolve-once migration** —
+  mechanical extension of `ef50b0c`'s pattern to 2 more endpoints (`create_message`,
+  `create_response`).
+- **`max_tokens` settings fallback for STT** (`audio_routes.py`) — read per-model
+  `ModelSettings.max_tokens` when the request omits it (#1163).
+- **`_with_json_keepalive`** on non-streaming endpoints (`a124a1f`) + body-encoded
+  error after keepalive byte (`16445e1`) — feature's keepalive UX for long-running
+  non-streaming requests.
+- **`4baf965` cache-corruption traceback** — surface the full traceback when
+  scheduler cache-corruption recovery retries are exhausted.
+- **Format function consolidation** — 6 duplicate implementations
+  (`utils/formatting.py`, `utils/hardware.py`, `model_discovery.py`, `scheduler.py`,
+  `process_memory_enforcer.py`, `admin/routes.py`). Pure maintenance.
+- **Memory-guard unification** — `_preflight_memory_check` and `_schedule_waiting`'s
+  generation memory guard share the same metric snapshot (`_tick_memory_bytes` after
+  `c07ad0b`) and could share a `_check_memory_gating()` decision function returning
+  `OK | DEFER_GENERATION | REJECT_PREFLIGHT`.
+
+None of these block correctness or user-facing functionality. The merge is
+operationally complete.
+
+## Rollback
 
 ```
-git merge origin/main                 # one resolution pass
-# resolve ~24-file conflict per Decisions 1-4:
-#   Decision 1 (15 superseded) -> take origin/main side
-#   Decision 2 (qwen3_5)       -> take HEAD (feature) side
-#   Decision 3 (cache race)    -> hand-merge bbba911 onto main's cache
-#   Decision 4 (mem enforcer)  -> hand-merge both; retarget to max(active,phys)
-# build + run suite (esp. test_prefix_cache.py, bbba911 regression tests,
-#   test_process_memory_enforcer.py, test_scheduler_admission.py, test_proc_memory.py)
-git commit                            # merge commit; no force-push
-git push                              # fast-forward of origin/features/more-models
+# Discard everything since the merge:
+git reset --hard backup/features/more-models-pre-039-rebase
+
+# Or roll back just the post-merge commits (keep merge result):
+git reset --hard 5b4d0d2
+
+# Mid-merge during a future re-attempt:
+git merge --abort
 ```
+
+Backup branch `backup/features/more-models-pre-039-rebase` (`906782a`) is the exact
+pre-merge tip and includes the integration plan doc itself.
