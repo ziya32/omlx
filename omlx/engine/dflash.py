@@ -107,6 +107,25 @@ class DFlashEngine(BaseEngine):
         self._model_type_str = None
         self._fallback_engine: BaseEngine | None = None
         self._in_fallback_mode = False
+        # Per-engine dflash-mlx runtime context, built once in start() from
+        # ModelSettings tuning fields (dflash_draft_window_size,
+        # dflash_draft_sink_size, dflash_verify_mode, etc.). None means
+        # stream_dflash_generate will use its own defaults.
+        self._runtime_context: Any | None = None
+        # Cached settings reads for #1276 tuning. None → let dflash-mlx pick
+        # its default (window=1024, sink=64, verify_mode='adaptive').
+        self._draft_window_size = (
+            getattr(model_settings, "dflash_draft_window_size", None)
+            if model_settings else None
+        )
+        self._draft_sink_size = (
+            getattr(model_settings, "dflash_draft_sink_size", None)
+            if model_settings else None
+        )
+        self._verify_mode = (
+            getattr(model_settings, "dflash_verify_mode", None)
+            if model_settings else None
+        )
 
         # Single-request tracking for has_active_requests / abort_request.
         # DFlash processes one request at a time on the MLX executor; the
@@ -180,13 +199,42 @@ class DFlashEngine(BaseEngine):
         elif hasattr(config, "model_type"):
             self._model_type_str = config.model_type
 
+        # Build the dflash-mlx runtime context from ModelSettings tuning
+        # fields (#1276). Passed to every stream_dflash_generate call so
+        # users see their configured draft_window_size / draft_sink_size /
+        # verify_mode rather than dflash-mlx defaults.
+        try:
+            from dflash_mlx.runtime.config import runtime_config_from_defaults
+            from dflash_mlx.runtime.context import build_runtime_context
+
+            cfg_kwargs: dict[str, Any] = {}
+            if self._draft_window_size is not None:
+                cfg_kwargs["draft_window_size"] = self._draft_window_size
+            if self._draft_sink_size is not None:
+                cfg_kwargs["draft_sink_size"] = self._draft_sink_size
+            if self._verify_mode is not None:
+                cfg_kwargs["verify_mode"] = self._verify_mode
+            runtime_config = runtime_config_from_defaults(**cfg_kwargs)
+            self._runtime_context = build_runtime_context(runtime_config)
+        except Exception as e:
+            # Tuning is non-essential; if the dflash-mlx API moves again or
+            # one of the settings doesn't apply, fall back to defaults.
+            logger.warning(
+                "DFlash runtime context build failed (%s); using "
+                "dflash-mlx defaults", e,
+            )
+            self._runtime_context = None
+
         self._loaded = True
         self._in_fallback_mode = False
         logger.info(
             f"DFlashEngine loaded: target={self._model_name}, "
             f"draft={self._draft_model_path}, "
             f"max_ctx={self._max_dflash_ctx}, "
-            f"fallback={self._fallback_engine_type}"
+            f"fallback={self._fallback_engine_type}, "
+            f"draft_window={self._draft_window_size}, "
+            f"draft_sink={self._draft_sink_size}, "
+            f"verify_mode={self._verify_mode}"
         )
 
     async def _evict_dflash_and_start_fallback(self) -> None:
@@ -372,6 +420,10 @@ class DFlashEngine(BaseEngine):
             except ImportError:
                 pass
 
+            # dflash-mlx 0.1.7 doesn't expose sampling temperature through
+            # stream_dflash_generate; the runtime decides via VerifyConfig.
+            # Temperature is honored only on fallback (BatchedEngine) when
+            # DFlash falls back; here it's dropped at the API boundary.
             generator = stream_dflash_generate(
                 target_model=self._target_model,
                 tokenizer=self._executor_tokenizer,
@@ -380,7 +432,7 @@ class DFlashEngine(BaseEngine):
                 max_new_tokens=max_tokens,
                 stop_token_ids=stop_ids,
                 prompt_tokens_override=prompt_tokens,
-                temperature=temperature,
+                runtime_context=self._runtime_context,
             )
             for event in generator:
                 # Abort check between events.  dflash-mlx's runtime is a
@@ -505,6 +557,8 @@ class DFlashEngine(BaseEngine):
             # streaming generator into a single summary instead. The token-
             # event stream produces the same generated_token_ids the legacy
             # API returned, and the summary event carries the metrics.
+            # See note in _run_generate_streaming re: temperature being
+            # dropped at the dflash-mlx v0.1.7 API boundary.
             generator = stream_dflash_generate(
                 target_model=self._target_model,
                 tokenizer=self._executor_tokenizer,
@@ -513,7 +567,7 @@ class DFlashEngine(BaseEngine):
                 max_new_tokens=max_tokens,
                 stop_token_ids=stop_ids,
                 prompt_tokens_override=prompt_tokens,
-                temperature=temperature,
+                runtime_context=self._runtime_context,
             )
             token_ids: list[int] = []
             summary_metrics: dict = {}
