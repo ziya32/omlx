@@ -153,6 +153,10 @@ class ModelSettingsRequest(BaseModel):
     is_default: bool | None = None
     # Security: per-model opt-in for trust_remote_code (issue #926)
     trust_remote_code: bool | None = None
+    # Exclusive: model holds the GPU alone (no concurrent decode). Used by
+    # large VLMs to avoid memory pressure during streaming.
+    exclusive: bool | None = None
+    exclusive_max_hold: int | None = None
 
 
 class CreateProfileRequest(BaseModel):
@@ -2100,6 +2104,13 @@ async def update_model_settings(
             server_state.default_model = model_id
     if "trust_remote_code" in sent:
         current_settings.trust_remote_code = bool(request.trust_remote_code)
+    if request.exclusive is not None:
+        current_settings.exclusive = request.exclusive
+        # Mirror to engine pool entry so the scheduler sees it immediately.
+        entry.exclusive = request.exclusive
+    if request.exclusive_max_hold is not None:
+        current_settings.exclusive_max_hold = request.exclusive_max_hold
+        entry.exclusive_max_hold = request.exclusive_max_hold
 
     # If an active profile was set, clear it when the user's save diverges
     # from the profile's stored values.  Only compare fields present in
