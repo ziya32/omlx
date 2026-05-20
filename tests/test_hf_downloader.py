@@ -174,7 +174,7 @@ class TestHFDownloader:
             "omlx.admin.hf_downloader.HfApi"
         ) as mock_api_cls, patch(
             "omlx.admin.hf_downloader.snapshot_download"
-        ) as mock_download:
+        ):
             mock_api = MagicMock()
             mock_info = MagicMock()
             mock_info.siblings = []
@@ -1813,7 +1813,7 @@ class TestHFEndpointPassthrough:
             return_value=(mock_api, "https://hf-mirror.com"),
         ), patch("omlx.admin.hf_downloader.snapshot_download") as mock_download:
             downloader = HFDownloader(model_dir=str(model_dir))
-            task = await downloader.start_download("owner/model")
+            await downloader.start_download("owner/model")
             await asyncio.sleep(0.5)
 
             # Called twice: dry_run + actual download
@@ -1841,7 +1841,7 @@ class TestHFEndpointPassthrough:
             mock_api_cls.return_value = mock_api
 
             downloader = HFDownloader(model_dir=str(model_dir))
-            task = await downloader.start_download("owner/model")
+            await downloader.start_download("owner/model")
             await asyncio.sleep(0.5)
 
             assert mock_download.call_count == 2
@@ -2033,6 +2033,7 @@ class TestStallDetection:
     @pytest.mark.asyncio
     async def test_stall_detection_marks_task_failed(self, model_dir, monkeypatch):
         """Download should be marked failed when stalled for _STALL_TIMEOUT seconds."""
+        import threading
         import omlx.admin.hf_downloader as dl_module
 
         # Use a very short stall timeout for testing
@@ -2045,32 +2046,40 @@ class TestStallDetection:
 
         downloader = HFDownloader(model_dir=str(model_dir))
 
+        # Interruptible "slow" download: blocks until stop_event fires so the
+        # mocked thread doesn't hold the default executor past loop close
+        # (which would hang pytest-asyncio teardown for THREAD_JOIN_TIMEOUT).
+        stop_event = threading.Event()
+
         def _slow_download(**kwargs):
             if kwargs.get("dry_run"):
                 return []
-            time.sleep(30)
+            stop_event.wait(timeout=30)
 
-        with patch(
-            "omlx.admin.hf_downloader.HfApi"
-        ) as mock_api_cls, patch(
-            "omlx.admin.hf_downloader.snapshot_download",
-            side_effect=_slow_download,
-        ):
-            mock_api = MagicMock()
-            mock_info = MagicMock()
-            mock_info.safetensors = {"parameters": {"BF16": 5000}}
-            mock_api.model_info.return_value = mock_info
-            mock_api_cls.return_value = mock_api
+        try:
+            with patch(
+                "omlx.admin.hf_downloader.HfApi"
+            ) as mock_api_cls, patch(
+                "omlx.admin.hf_downloader.snapshot_download",
+                side_effect=_slow_download,
+            ):
+                mock_api = MagicMock()
+                mock_info = MagicMock()
+                mock_info.safetensors = {"parameters": {"BF16": 5000}}
+                mock_api.model_info.return_value = mock_info
+                mock_api_cls.return_value = mock_api
 
-            task = await downloader.start_download("owner/model")
+                task = await downloader.start_download("owner/model")
 
-            # Wait for stall detection to kick in (2s timeout + polling intervals)
-            await asyncio.sleep(8)
+                # Wait for stall detection to kick in (2s timeout + polling intervals)
+                await asyncio.sleep(8)
 
-            assert task.status == DownloadStatus.FAILED
-            assert "stalled" in task.error.lower()
+                assert task.status == DownloadStatus.FAILED
+                assert "stalled" in task.error.lower()
 
-            await downloader.shutdown()
+                await downloader.shutdown()
+        finally:
+            stop_event.set()
 
     @pytest.mark.asyncio
     async def test_no_stall_when_size_zero(self, model_dir, monkeypatch):
@@ -2131,30 +2140,39 @@ class TestSequentialDownloadQueue:
     @pytest.mark.asyncio
     async def test_second_download_stays_pending(self, model_dir):
         """When two downloads are started, only the first should be DOWNLOADING."""
+        import threading
+
         downloader = HFDownloader(model_dir=str(model_dir))
 
-        with patch(
-            "omlx.admin.hf_downloader.HfApi"
-        ) as mock_api_cls, patch(
-            "omlx.admin.hf_downloader.snapshot_download",
-            side_effect=lambda **kwargs: time.sleep(30),
-        ):
-            mock_api = MagicMock()
-            mock_info = MagicMock()
-            mock_info.safetensors = {"parameters": {"BF16": 5000}}
-            mock_api.model_info.return_value = mock_info
-            mock_api_cls.return_value = mock_api
+        # Interruptible "slow" download — see test_stall_detection_marks_task_failed
+        # for the rationale.
+        stop_event = threading.Event()
 
-            task1 = await downloader.start_download("owner/model-a")
-            task2 = await downloader.start_download("owner/model-b")
+        try:
+            with patch(
+                "omlx.admin.hf_downloader.HfApi"
+            ) as mock_api_cls, patch(
+                "omlx.admin.hf_downloader.snapshot_download",
+                side_effect=lambda **kwargs: stop_event.wait(timeout=30),
+            ):
+                mock_api = MagicMock()
+                mock_info = MagicMock()
+                mock_info.safetensors = {"parameters": {"BF16": 5000}}
+                mock_api.model_info.return_value = mock_info
+                mock_api_cls.return_value = mock_api
 
-            # Give first task time to acquire semaphore
-            await asyncio.sleep(1)
+                task1 = await downloader.start_download("owner/model-a")
+                task2 = await downloader.start_download("owner/model-b")
 
-            assert task1.status == DownloadStatus.DOWNLOADING
-            assert task2.status == DownloadStatus.PENDING
+                # Give first task time to acquire semaphore
+                await asyncio.sleep(1)
 
-            await downloader.shutdown()
+                assert task1.status == DownloadStatus.DOWNLOADING
+                assert task2.status == DownloadStatus.PENDING
+
+                await downloader.shutdown()
+        finally:
+            stop_event.set()
 
     @pytest.mark.asyncio
     async def test_queued_download_starts_after_first_completes(self, model_dir):
@@ -2165,7 +2183,7 @@ class TestSequentialDownloadQueue:
             "omlx.admin.hf_downloader.HfApi"
         ) as mock_api_cls, patch(
             "omlx.admin.hf_downloader.snapshot_download",
-        ) as mock_download:
+        ):
             mock_api = MagicMock()
             mock_info = MagicMock()
             mock_info.safetensors = {"parameters": {"BF16": 5000}}
@@ -2215,7 +2233,6 @@ class TestMtimeActivityDetection:
 
         # Simulate mtime advancing on each call
         call_count = 0
-        original_get_latest_mtime = HFDownloader._get_latest_mtime
 
         @staticmethod
         def mock_get_latest_mtime(path):
@@ -2228,26 +2245,32 @@ class TestMtimeActivityDetection:
             HFDownloader, "_get_latest_mtime", mock_get_latest_mtime
         )
 
-        with patch(
-            "omlx.admin.hf_downloader.HfApi"
-        ) as mock_api_cls, patch(
-            "omlx.admin.hf_downloader.snapshot_download",
-            side_effect=lambda **kwargs: time.sleep(30),
-        ):
-            mock_api = MagicMock()
-            mock_info = MagicMock()
-            mock_info.safetensors = {"parameters": {"BF16": 5000}}
-            mock_api.model_info.return_value = mock_info
-            mock_api_cls.return_value = mock_api
+        import threading
+        stop_event = threading.Event()
 
-            task = await downloader.start_download("owner/model")
-            # Wait longer than stall timeout
-            await asyncio.sleep(8)
+        try:
+            with patch(
+                "omlx.admin.hf_downloader.HfApi"
+            ) as mock_api_cls, patch(
+                "omlx.admin.hf_downloader.snapshot_download",
+                side_effect=lambda **kwargs: stop_event.wait(timeout=30),
+            ):
+                mock_api = MagicMock()
+                mock_info = MagicMock()
+                mock_info.safetensors = {"parameters": {"BF16": 5000}}
+                mock_api.model_info.return_value = mock_info
+                mock_api_cls.return_value = mock_api
 
-            # Should still be downloading because mtime keeps updating
-            assert task.status == DownloadStatus.DOWNLOADING
+                task = await downloader.start_download("owner/model")
+                # Wait longer than stall timeout
+                await asyncio.sleep(8)
 
-            await downloader.shutdown()
+                # Should still be downloading because mtime keeps updating
+                assert task.status == DownloadStatus.DOWNLOADING
+
+                await downloader.shutdown()
+        finally:
+            stop_event.set()
 
 
 # =============================================================================

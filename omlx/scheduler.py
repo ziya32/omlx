@@ -1454,7 +1454,7 @@ class Scheduler:
         NOTE: Detokenizers are NOT pooled - each request gets a fresh instance
         to prevent state contamination that causes text corruption.
         """
-        detok = self._request_detokenizers.pop(request_id, None)
+        self._request_detokenizers.pop(request_id, None)
         # Let GC collect - no pooling to prevent state contamination
 
     def _get_output_parser_session(
@@ -1644,6 +1644,42 @@ class Scheduler:
                 f"cache layers to {bits}-bit{skip_msg}"
             )
 
+    def _restore_vlm_position_state(
+        self,
+        vlm_embeds: tuple[mx.array, dict[str, Any], int] | None,
+    ) -> None:
+        """Rehydrate mRoPE position state from extra_kwargs onto the LM.
+
+        Some mlx-vlm models (Qwen3.5/3.6) compute ``_position_ids`` and
+        ``_rope_deltas`` inside ``get_input_embeddings`` and store them
+        only on the language model — ``InputEmbeddingsFeatures.to_dict()``
+        does not surface them. ``VLMBatchedEngine._prepare_vision_inputs``
+        snapshots both into ``extra_kwargs`` as ``_vlm_position_ids`` /
+        ``_vlm_rope_deltas``; this helper restores them before any retry
+        whose state may have been clobbered by an intervening text-only
+        request (which sets ``lm._position_ids`` to a short text grid).
+        Without this, slicing the short grid at ``cache_offset`` yields
+        an empty seq dimension and ``apply_multimodal_rotary_pos_emb``
+        crashes in ``broadcast_shapes``.
+
+        Noop when ``vlm_embeds`` is None, when extra_kwargs is empty, or
+        when the model has no ``_language_model``.
+        """
+        if vlm_embeds is None:
+            return
+        _, extra_kwargs, _ = vlm_embeds
+        if not extra_kwargs:
+            return
+        lm = getattr(self.model, "_language_model", None)
+        if lm is None:
+            return
+        pos_ids = extra_kwargs.get("_vlm_position_ids")
+        if pos_ids is not None:
+            lm._position_ids = pos_ids
+        rope_deltas = extra_kwargs.get("_vlm_rope_deltas")
+        if rope_deltas is not None:
+            lm._rope_deltas = rope_deltas
+
     def _do_external_prefill(
         self,
         request: "Request",
@@ -1701,6 +1737,11 @@ class Scheduler:
         # Clear stale mRoPE position state for text-only requests.
         if vlm_embeds is None and hasattr(self.model, "clear_vlm_position_state"):
             self.model.clear_vlm_position_state()
+        else:
+            # On VLM retries, an intervening text-only request may have
+            # clobbered lm._position_ids with a short grid — rehydrate
+            # from the snapshot stored in extra_kwargs before prefill.
+            self._restore_vlm_position_state(vlm_embeds)
 
         # Boundary snapshot setup
         block_size = self.config.paged_cache_block_size
@@ -1708,9 +1749,6 @@ class Scheduler:
             block_size > 0
             and self.block_aware_cache is not None
             and _prompt_cache_needs_snapshots(prompt_cache)
-        )
-        all_boundaries = (
-            boundary_enabled  # always stop at every boundary for hybrid models
         )
         base_size = _cache_base_sizes(prompt_cache) if boundary_enabled else 0
         # Sanity check: base_size from cache offsets should match the number

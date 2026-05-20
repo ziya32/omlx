@@ -126,6 +126,29 @@ def _ensure_audio_routes(app):
         app.include_router(audio_router)
 
 
+@pytest.fixture(autouse=True)
+def _permissive_audio_auth():
+    """Wire the audio router's _verify_auth dependency for every test.
+
+    The audio router's ``_verify_auth`` raises 401 "Auth not configured"
+    until ``set_auth_dependency()`` is called — server.py does this at
+    startup but TestClient bypasses that path. The ``audio_sts_client``
+    fixture already patches ``_auth_dependency`` directly, but
+    ``server_sts_client`` and any inline TestClient blocks didn't, so
+    every STS test against the full server app hit 401. Permissive dep
+    + teardown restore mirrors test_audio_tts.py / test_audio_stt.py.
+    """
+    from omlx.api.audio_routes import set_auth_dependency
+
+    async def _permit(request=None, credentials=None) -> bool:
+        return True
+    set_auth_dependency(_permit)
+    try:
+        yield
+    finally:
+        set_auth_dependency(None)
+
+
 @pytest.fixture
 def server_sts_client():
     """TestClient using the full omlx server app with mocked STS pool."""

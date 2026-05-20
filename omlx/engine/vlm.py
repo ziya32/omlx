@@ -2267,8 +2267,13 @@ class VLMBatchedEngine(BaseEngine):
 
         submitted = False
         finished_normally = False
+        # Capture the engine reference up front: a ProcessMemoryEnforcer
+        # unload between submission and stream cleanup clears self._engine,
+        # and the finally block must still be able to abort the in-flight
+        # request on the original engine instance.
+        inner_engine = self._engine
         try:
-            request_id = await self._engine.add_request(
+            request_id = await inner_engine.add_request(
                 prompt=prompt,
                 sampling_params=sampling_params,
                 request_id=request_id,
@@ -2281,7 +2286,7 @@ class VLMBatchedEngine(BaseEngine):
             )
             submitted = True
 
-            async for output in self._engine.stream_outputs(request_id):
+            async for output in inner_engine.stream_outputs(request_id):
                 text = clean_special_tokens(output.output_text)
 
                 if output.finished:
@@ -2302,9 +2307,9 @@ class VLMBatchedEngine(BaseEngine):
         except asyncio.CancelledError:
             logger.info(f"[vlm_stream_generate] CancelledError for request {request_id}")
         finally:
-            if submitted and not finished_normally:
+            if submitted and not finished_normally and inner_engine is not None:
                 logger.info(f"[vlm_stream_generate] Aborting request {request_id}")
-                await self._engine.abort_request(request_id)
+                await inner_engine.abort_request(request_id)
 
     async def chat(
         self,

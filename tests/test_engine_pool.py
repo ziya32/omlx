@@ -732,9 +732,14 @@ class TestEnginePoolEviction:
         mock_engine_a = MagicMock()
         mock_engine_a.start = AsyncMock()
         mock_engine_a.stop = AsyncMock()
+        # has_active_requests must return False so the drain monitor
+        # completes immediately; a bare MagicMock returns a truthy
+        # MagicMock and the drain hangs until drain_timeout (120s).
+        mock_engine_a.has_active_requests = MagicMock(return_value=False)
 
         mock_engine_b = MagicMock()
         mock_engine_b.start = AsyncMock()
+        mock_engine_b.has_active_requests = MagicMock(return_value=False)
 
         call_count = [0]
 
@@ -752,10 +757,18 @@ class TestEnginePoolEviction:
             # Load model-b - should evict model-a first
             await pool.get_engine("model-b")
 
-        # model-a should have been unloaded
-        mock_engine_a.stop.assert_called_once()
-        assert pool._entries["model-a"].engine is None
-        assert pool._entries["model-b"].engine is not None
+            # _unload_engine now defers engine.stop to a background
+            # task — wait for model-a's cleanup specifically so stop
+            # assertions are deterministic without unloading model-b.
+            entry_a = pool._entries["model-a"]
+            if entry_a.unload_complete is not None:
+                await asyncio.wait_for(
+                    entry_a.unload_complete.wait(), timeout=10
+                )
+
+            mock_engine_a.stop.assert_called_once()
+            assert pool._entries["model-a"].engine is None
+            assert pool._entries["model-b"].engine is not None
 
     @pytest.mark.asyncio
     async def test_insufficient_memory_all_pinned(self, tight_memory_pool):
@@ -848,7 +861,7 @@ class TestEnginePoolEviction:
         await pool.shutdown()
 
 
-class TestEnginePoolStatus:
+class TestEnginePoolStatusLoadingField:
     """Tests for get_status is_loading field."""
 
     def test_get_status_includes_is_loading(self, small_mock_model_dir):

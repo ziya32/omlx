@@ -17,20 +17,23 @@ def _mock_request(headers=None):
 class TestVerifyApiKey:
     """Tests for verify_api_key function."""
 
-    def test_verify_api_key_rejects_when_no_key_configured(self):
-        """Test that requests are rejected with 401 when api_key is None."""
+    def test_verify_api_key_allows_when_no_key_configured(self):
+        """When ``api_key`` is None, auth is disabled: verify_api_key must
+        return True without inspecting credentials. This is the documented
+        opt-out path (see server.py: "No auth required if no API key is
+        configured") — a public deployment that hasn't set a key should
+        not 401 every request."""
         from omlx.server import verify_api_key, _server_state
-        from fastapi import HTTPException
         import asyncio
 
         original_key = _server_state.api_key
         _server_state.api_key = None
 
         try:
-            with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(verify_api_key(request=_mock_request(), credentials=None))
-            assert exc_info.value.status_code == 401
-            assert "not configured" in exc_info.value.detail.lower()
+            result = asyncio.run(
+                verify_api_key(request=_mock_request(), credentials=None)
+            )
+            assert result is True
         finally:
             _server_state.api_key = original_key
 

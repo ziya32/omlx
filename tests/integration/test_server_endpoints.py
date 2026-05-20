@@ -327,6 +327,7 @@ def mock_engine_pool(mock_llm_engine, mock_embedding_engine, mock_reranker_engin
 def client(mock_engine_pool):
     """Create a test client with mocked server state."""
     from omlx.server import app, _server_state
+    from omlx.api.mcp_routes import set_auth_dependency as _set_mcp_auth
 
     # Store original state
     original_pool = _server_state.engine_pool
@@ -336,11 +337,20 @@ def client(mock_engine_pool):
     _server_state.engine_pool = mock_engine_pool
     _server_state.default_model = "test-model"
 
-    yield TestClient(app)
+    # The MCP router's _verify_auth raises 401 until set_auth_dependency
+    # is wired (server.py does this at startup; TestClient bypasses the
+    # lifespan path that wires it). Permissive dep + teardown restore.
+    async def _permit(request=None, credentials=None) -> bool:
+        return True
+    _set_mcp_auth(_permit)
 
-    # Restore original state
-    _server_state.engine_pool = original_pool
-    _server_state.default_model = original_default
+    try:
+        yield TestClient(app)
+    finally:
+        # Restore original state
+        _server_state.engine_pool = original_pool
+        _server_state.default_model = original_default
+        _set_mcp_auth(None)
 
 
 class TestHealthEndpoint:

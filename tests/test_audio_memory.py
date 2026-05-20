@@ -302,10 +302,15 @@ class TestAudioPreLoadEviction:
         mock_llm = MagicMock()
         mock_llm.start = AsyncMock()
         mock_llm.stop = AsyncMock()
+        # has_active_requests must return False so the drain monitor
+        # completes immediately; a bare MagicMock returns a truthy
+        # MagicMock and the drain hangs until drain_timeout (120s).
+        mock_llm.has_active_requests = MagicMock(return_value=False)
 
         mock_stt = MagicMock()
         mock_stt.start = AsyncMock()
         mock_stt.stop = AsyncMock()
+        mock_stt.has_active_requests = MagicMock(return_value=False)
 
         with patch("omlx.engine_pool.BatchedEngine", return_value=mock_llm):
             await pool.get_engine("llama-3b")
@@ -313,7 +318,15 @@ class TestAudioPreLoadEviction:
         with patch("omlx.engine_pool.STTEngine", return_value=mock_stt, create=True):
             await pool.get_engine("whisper-tiny")
 
-        # llama-3b should have been evicted
+        # _unload_engine now defers engine.stop to a background task —
+        # wait for llama-3b's cleanup specifically so stop assertions are
+        # deterministic without unloading whisper-tiny.
+        entry_llm = pool._entries["llama-3b"]
+        if entry_llm.unload_complete is not None:
+            await asyncio.wait_for(
+                entry_llm.unload_complete.wait(), timeout=10
+            )
+
         mock_llm.stop.assert_called_once()
         assert pool._entries["llama-3b"].engine is None
         assert pool._entries["whisper-tiny"].engine is not None

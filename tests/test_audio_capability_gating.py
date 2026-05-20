@@ -81,7 +81,11 @@ def client_with_import_error_pool(import_error_pool):
         mock_state.hf_downloader = None
         mock_state.ms_downloader = None
         mock_state.mcp_manager = None
-        mock_state.api_key = "test-key"
+        # Auth-OFF here: this suite is about capability gating, not auth
+        # — the server-level verify_api_key dependency would otherwise
+        # gate the request before it reaches the router (api_key=None
+        # makes verify_api_key return True at server.py:267).
+        mock_state.api_key = None
         mock_state.settings_manager = MagicMock()
         mock_state.settings_manager.get_settings.return_value = MagicMock(
             model_alias=None,
@@ -91,7 +95,8 @@ def client_with_import_error_pool(import_error_pool):
             default_language=None,
         )
 
-        # Bypass auth — this test focuses on capability gating, not auth.
+        # Bypass the audio router's _verify_auth dep (separate layer from
+        # server-level verify_api_key).
         import omlx.api.audio_routes as ar
         original_auth = ar._auth_dependency
 
@@ -272,7 +277,9 @@ class TestNoMlxAudioRoutes:
 
         with patch("omlx.server._server_state") as mock_state:
             mock_state.engine_pool = pool
-            mock_state.api_key = "test-key"
+            # Auth-OFF (see fixture above) so the server-level
+            # verify_api_key dep doesn't 401 before the router runs.
+            mock_state.api_key = None
             mock_state.settings_manager = None
             mock_state.global_settings = None
             mock_state.process_memory_enforcer = None

@@ -1003,8 +1003,6 @@ class TestMemoryAccounting:
         engine_b = await switching_pool.get_engine("model-b")
         engine_b.add_request("req-2")  # Keep busy so model-a is drained
 
-        committed_before = switching_pool._committed_memory()
-
         task_c = asyncio.create_task(switching_pool.get_engine("model-c"))
         await asyncio.sleep(0.1)
 
@@ -1097,7 +1095,6 @@ class TestMemoryAccounting:
         """Drain finishes before load starts -> peak memory = max(A,B), not A+B."""
         engine_a = await switching_pool.get_engine("model-a")
         engine_a.add_request("req-1")
-        committed_a = switching_pool._committed_memory()
 
         # model-b (same size) should be loadable after drain, not during.
         engine_b = await switching_pool.get_engine("model-b")
@@ -1108,7 +1105,7 @@ class TestMemoryAccounting:
 
         engine_a.finish_request("req-1")
         engine_b.finish_request("req-2")
-        engine_c = await asyncio.wait_for(task_c, timeout=8)
+        await asyncio.wait_for(task_c, timeout=8)
 
         # After everything settles, committed memory should be <= max.
         final_committed = switching_pool._committed_memory()
@@ -1250,8 +1247,16 @@ class TestInvariants:
         assert elapsed < 6
         assert pool._timeout_counter >= 1
 
+    @pytest.mark.timeout(90)
     async def test_inv6_unload_bounded(self, tmp_path):
-        """INV-6: _unload_engine has bounded run time."""
+        """INV-6: Unload is bounded even when engine.stop() hangs.
+
+        Contract change: ``_unload_engine`` is now a fast state transition
+        that schedules ``_deferred_engine_cleanup`` as a background task.
+        The bound moved into the cleanup task — it does
+        ``wait_for(engine.stop(), timeout=30)`` and force-cleans on
+        timeout — and is observable via ``entry.unload_complete``.
+        """
         pool = EnginePool(
             max_model_memory=10_000,
             drain_timeout=5,
@@ -1263,27 +1268,34 @@ class TestInvariants:
 
         await pool.get_engine("model-a")
 
-        # Make engine.stop() hang.
+        # Make engine.stop() hang forever; cleanup must still progress.
         entry = pool.get_entry("model-a")
 
         async def hanging_stop():
-            await asyncio.sleep(100)  # Hang
+            await asyncio.sleep(3600)
 
         entry.engine.stop = hanging_stop
 
-        # _unload_engine should have a timeout on stop().
+        # _unload_engine itself must be effectively instant — it only
+        # flips state and spawns the cleanup task.
         t0 = time.monotonic()
-        try:
-            await asyncio.wait_for(
-                pool._unload_engine("model-a"),
-                timeout=35,
-            )
-        except asyncio.TimeoutError:
-            pass
-        elapsed = time.monotonic() - t0
+        await pool._unload_engine("model-a")
+        immediate_elapsed = time.monotonic() - t0
+        assert immediate_elapsed < 1.0, (
+            f"_unload_engine should be instant after deferred-cleanup "
+            f"split, took {immediate_elapsed:.2f}s"
+        )
 
-        # Should complete (or timeout) reasonably, not hang for 100s.
-        assert elapsed < 35
+        # Cleanup task runs in the background with its own 30s bound on
+        # engine.stop(); unload_complete must fire within ~35s.
+        assert entry.unload_complete is not None
+        t1 = time.monotonic()
+        try:
+            await asyncio.wait_for(entry.unload_complete.wait(), timeout=45)
+        except asyncio.TimeoutError:
+            pytest.fail("_deferred_engine_cleanup did not complete within 45s")
+        cleanup_elapsed = time.monotonic() - t1
+        assert cleanup_elapsed < 45
 
         await pool.shutdown()
 
