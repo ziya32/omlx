@@ -43,6 +43,10 @@ except Exception:
 
 pytestmark = [
     pytest.mark.slow,
+    # 7-hour audio takes 30+ minutes to transcribe even on Apple Silicon —
+    # pytest's default + sweep-level --timeout=300 cut the test off mid-stream.
+    # 60-minute budget lets the test finish on M3/M4 while still bounding hangs.
+    pytest.mark.timeout(3600),
     pytest.mark.skipif(
         sys.platform != "darwin",
         reason="ASR E2E tests require macOS with Apple Silicon",
