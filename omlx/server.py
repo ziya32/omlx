@@ -3551,10 +3551,10 @@ async def create_anthropic_message(
             detail="Server is busy with oQ quantization. Please try again after quantization completes.",
         )
 
-    engine = await get_engine_for_model(request.model)
-
-    # Resolve alias to real model ID for settings lookups
+    # Resolve once and thread through get_engine_for_model so the engine
+    # lookup uses the same id as the settings lookups below (Issue 7).
     resolved_model = resolve_model_id(request.model) or request.model
+    engine = await get_engine_for_model(request.model, resolved_id=resolved_model)
 
     # Get per-model settings
     max_tool_result_tokens = None
@@ -3827,7 +3827,11 @@ async def count_anthropic_tokens(
             detail="Server is busy with oQ quantization. Please try again after quantization completes.",
         )
 
-    engine = await get_engine_for_model(request.model)
+    # Resolve once and thread through get_engine_for_model so the engine
+    # lookup uses the same id any downstream settings/state lookups will
+    # use (Issue 7).
+    resolved_model = resolve_model_id(request.model) or request.model
+    engine = await get_engine_for_model(request.model, resolved_id=resolved_model)
 
     # Convert Anthropic format to internal format
     # Create a temporary MessagesRequest to reuse existing conversion logic
@@ -3941,11 +3945,12 @@ async def create_response(
         f"Responses API request: model={request.model}, stream={request.stream}"
     )
 
-    load_start = time.perf_counter()
-    engine = await get_engine_for_model(request.model)
-    model_load_duration = time.perf_counter() - load_start
-
+    # Resolve once and thread through get_engine_for_model so the engine
+    # lookup uses the same id as the settings/state lookups below (Issue 7).
     resolved_model = resolve_model_id(request.model) or request.model
+    load_start = time.perf_counter()
+    engine = await get_engine_for_model(request.model, resolved_id=resolved_model)
+    model_load_duration = time.perf_counter() - load_start
 
     current_input_messages = convert_responses_input_to_messages(request.input)
 
