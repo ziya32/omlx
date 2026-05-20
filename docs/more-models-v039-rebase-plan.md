@@ -31,9 +31,28 @@ independent of the merge; both require domain-specific investigation, not a
 quick fix:
 
 1. **`test_exclusive_live_server::TestReport::test_99_generate_report_and_check_vlm_times`**:
-   VLM requests under heavy concurrent stress (test_17_max_stress, test_18_endurance)
-   take 84–113 s vs. the 60 s SLA. Performance bottleneck under contention, not
-   a correctness bug. Needs Metal/scheduler profiling.
+   VLM requests under heavy concurrent stress (test_17_max_stress,
+   test_18_endurance) take 109–120 s vs. the 60 s SLA. **Root-caused**: the
+   `acquire_engine` / `release_engine` plumbing in `server.py` was lost in
+   the v0.3.9rc1 merge. Backup branch had 19 call sites + a `use_engine`
+   context manager + a `_with_engine_guard` stream wrapper covering every
+   chat / embed / rerank / streaming endpoint. Current `server.py` has 2
+   references (both in comments); only `audio_routes.py` still calls
+   `acquire_engine`. Without those calls `EngineEntry.active_uses` is
+   permanently 0 for VLM / LLM / embedding / reranker engines, so:
+   - `exclusive_idle` Event is never created (acquire 0→1 transition never fires)
+   - Non-VLM `get_engine` always sees `active_uses == 0` and takes the engine
+     immediately instead of waiting on `exclusive_idle`
+   - `_clear_for_exclusive` drain-vs-evict decision only sees `has_active_requests`
+     (scheduler in-flight count), not `active_uses`, so handlers between
+     `get_engine` and their first scheduler dispatch don't block eviction
+   - `release_engine` (the `exclusive_idle.set()` trigger) is never called
+
+   Net effect: under concurrent stress small models race onto the
+   single-threaded MLX executor alongside the VLM, the VLM finishes *last*.
+   Fix is a substantial restoration (use_engine + _with_engine_guard +
+   ~19 acquire/release call-site insertions) — deferred to a follow-up
+   commit since the diff is large and orthogonal to the rest of the merge.
 
 2. **`test_server_e2e::TestTTSASRRoundTripHTTP::test_round_trip`**:
    TTS-generated WAV transcribed back through ASR produces unintelligible
