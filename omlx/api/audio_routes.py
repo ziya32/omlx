@@ -174,6 +174,26 @@ async def _use_engine(model_id: str):
 # ---------------------------------------------------------------------------
 
 
+def _record_audio_request(model_id: str) -> None:
+    """Record an audio-API request in server metrics, with zero token counts.
+
+    Audio endpoints (transcribe / speech / process) don't produce token
+    deltas, but they still count as work the server did and should
+    appear in request totals. Mirrors main's recording for completion-
+    style endpoints (see ``server.get_server_metrics``).
+    """
+    try:
+        from ..server_metrics import get_server_metrics
+        get_server_metrics().record_request_complete(
+            prompt_tokens=0,
+            completion_tokens=0,
+            cached_tokens=0,
+            model_id=model_id,
+        )
+    except Exception as exc:
+        logger.warning("Failed to record audio metrics for %s: %s", model_id, exc)
+
+
 async def _read_upload(file: UploadFile) -> bytes:
     """Read an uploaded file in chunks, bailing early if it exceeds the limit."""
     chunks: list[bytes] = []
@@ -311,6 +331,7 @@ async def _stream_transcription(
                 {"id": i, "start": s.get("start", 0.0), "end": s.get("end", 0.0), "text": s.get("text", "")}
                 for i, s in enumerate(output.segments) if isinstance(s, dict)
             ]
+        _record_audio_request(model_str)
         yield f"data: {json.dumps(result)}\n\n"
         yield "data: [DONE]\n\n"
     except Exception as e:
@@ -718,6 +739,7 @@ async def create_transcription(
             f"duration={output.duration}s"
         )
 
+        _record_audio_request(model_str)
         return _format_transcription_response(output, response_format)
     finally:
         os.unlink(tmp_path)
@@ -909,6 +931,10 @@ async def create_speech(
         # Fallback for the never-iterated case: fires on GC of `body`.
         weakref.finalize(body, _release_once)
 
+        # Record on first-chunk readiness (matches non-stream recording
+        # at request-completion: by here the engine has produced its
+        # first PCM bytes and the response is committed).
+        _record_audio_request(resolved)
         return StreamingResponse(
             body,
             media_type="audio/wav",
@@ -972,6 +998,7 @@ async def create_speech(
         f"format={fmt}"
     )
 
+    _record_audio_request(resolved_model)
     return StreamingResponse(
         iter([audio_bytes]),
         media_type=media_type,
@@ -1032,6 +1059,7 @@ async def process_audio(
                 except OSError:
                     pass
 
+    _record_audio_request(model)
     return Response(content=wav_bytes, media_type="audio/wav")
 
 

@@ -752,7 +752,8 @@ class Scheduler:
         self._vlm_mtp_active: dict[int, _VLMMTPDecodeState] = {}
         self._vlm_mtp_next_uid: int = -1
         # Per-request settings snapshot for vlm_mtp routing (block size etc.).
-        # Injected by VLMBatchedEngine.set_vlm_mtp_drafter alongside the drafter.
+        # Injected by VLMBatchedEngine's drafter-load path alongside the
+        # drafter (via ``scheduler.set_vlm_mtp_drafter`` below).
         self._vlm_mtp_draft_block_size: int | None = None
 
         # Phase timing instrumentation for cache-on overhead diagnostics.
@@ -3516,8 +3517,9 @@ class Scheduler:
     ) -> None:
         """Attach a gemma4_assistant drafter for VLM MTP speculative decode.
 
-        Called by ``VLMBatchedEngine.set_vlm_mtp_drafter`` once the assistant
-        artifact is loaded. ``None`` clears the toggle.
+        Called by VLMBatchedEngine.start() once the assistant artifact
+        is loaded (it dispatches here directly — there is no wrapper
+        method on the engine). ``None`` clears the toggle.
         """
         self._vlm_mtp_drafter = drafter
         self._vlm_mtp_draft_block_size = draft_block_size
