@@ -812,20 +812,24 @@ class EnginePool:
                         entry.last_access = time.time()
                         result = entry.engine  # Capture under lock
                     else:
-                        if not isinstance(load_error, asyncio.CancelledError):
-                            entry.load_error = load_error  # Set under lock
-                        # LOAD_COOLDOWN exists to prevent rapid-fire retries
-                        # of a model that genuinely can't load —
-                        # ModelTooLargeError / InsufficientMemoryError /
-                        # ModelNotFoundError. Retrying those for 30s won't
-                        # change physics.
+                        # Two error categories drive the cooldown +
+                        # post-wait-failure paths:
                         #
-                        # Other failures (enforcer-initiated abort,
-                        # transient Metal allocation errors, missing
-                        # weight files getting downloaded, etc.) are
-                        # potentially recoverable on the next attempt —
-                        # blocking retries for 30s on those produces
-                        # spurious 409s under stress.
+                        # - TERMINAL: model can't load (ModelTooLargeError,
+                        #   InsufficientMemoryError, ModelNotFoundError).
+                        #   Retrying for 30s won't change physics — set
+                        #   ``load_failed_at`` so subsequent get_engine()
+                        #   calls within LOAD_COOLDOWN return 409, and
+                        #   set ``load_error`` so waiters on the
+                        #   ready_event see the typed failure.
+                        #
+                        # - TRANSIENT: enforcer-initiated abort,
+                        #   intermittent Metal allocation error, etc.
+                        #   Failure is recoverable — don't set either
+                        #   field, so the next get_engine() request
+                        #   loops back into the load path fresh
+                        #   instead of seeing a stale cooldown 409 or
+                        #   a stale load_error post-wait 409.
                         _terminal = isinstance(
                             load_error,
                             (
@@ -834,7 +838,10 @@ class EnginePool:
                                 ModelNotFoundError,
                             ),
                         )
-                        if _terminal:
+                        if _terminal and not isinstance(
+                            load_error, asyncio.CancelledError
+                        ):
+                            entry.load_error = load_error
                             entry.load_failed_at = time.time()
                         self._set_state(
                             entry, EngineState.UNLOADED, "load_failed"

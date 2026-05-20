@@ -449,7 +449,19 @@ class STTEngine(BaseNonStreamingEngine):
                 gen_kwargs["language"] = generate_language
             if prompt:
                 gen_kwargs.setdefault("initial_prompt", prompt)
-            result = model.generate(audio_path, **gen_kwargs)
+            try:
+                result = model.generate(audio_path, **gen_kwargs)
+            except (InvalidAudioFormatError, AudioError):
+                # Already typed — propagate as-is so the endpoint can
+                # map to 400/422.
+                raise
+            except Exception as e:
+                # Wrap raw mlx-audio errors as AudioError so the audio
+                # endpoint surfaces 422 (retryable) instead of 500
+                # (unhandled). Same pattern as TTS engine.synthesize().
+                raise AudioError(
+                    f"Transcription failed: {e}"
+                ) from e
 
             if hasattr(result, "text"):
                 raw_lang = _normalize_language(getattr(result, "language", None))
