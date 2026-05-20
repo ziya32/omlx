@@ -1952,6 +1952,84 @@ async def server_status(_: bool = Depends(verify_api_key)):
     }
 
 
+# =============================================================================
+# Diagnostic endpoints (auth-gated; production-safe).
+# =============================================================================
+
+
+@app.get("/debug/pool")
+async def debug_pool(_: bool = Depends(verify_api_key)):
+    """Lock-free snapshot of engine-pool state for diagnostics.
+
+    Returns the same dict as ``EnginePool.get_debug_status()`` —
+    stuck-state heuristics, memory accounting, executor health.
+    """
+    pool = get_engine_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+    return pool.get_debug_status()
+
+
+@app.get("/debug/engine-diagnostics")
+async def debug_engine_diagnostics(_: bool = Depends(verify_api_key)):
+    """Per-engine scheduler memory limits for diagnostic / regression checks.
+
+    Reports the enforcer's max_bytes plus each loaded engine's
+    scheduler._memory_limit_bytes / _memory_hard_limit_bytes via the
+    same getattr(entry.engine, "scheduler", None) path
+    ``_propagate_memory_limit()`` uses — so tests can verify the
+    enforcer's broadcast actually reached every loaded engine.
+    """
+    pool = get_engine_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+
+    engines: dict = {}
+    for model_id, entry in pool._entries.items():
+        if entry.engine is None:
+            continue
+        info: dict = {
+            "state": entry.state.name,
+            "engine_type": entry.engine_type,
+            "estimated_size_gb": round(entry.estimated_size / (1024**3), 2),
+        }
+        scheduler = getattr(entry.engine, "scheduler", None)
+        info["propagate_finds_scheduler"] = scheduler is not None
+        if scheduler is not None:
+            info["scheduler_memory_limit_bytes"] = getattr(
+                scheduler, "_memory_limit_bytes", None
+            )
+            info["scheduler_memory_hard_limit_bytes"] = getattr(
+                scheduler, "_memory_hard_limit_bytes", None
+            )
+        else:
+            info["scheduler_memory_limit_bytes"] = None
+            info["scheduler_memory_hard_limit_bytes"] = None
+        engines[model_id] = info
+
+    enforcer_status: dict = {}
+    if pool._process_memory_enforcer is not None:
+        enforcer_status = pool._process_memory_enforcer.get_status()
+
+    return {"enforcer": enforcer_status, "engines": engines}
+
+
+@app.post("/debug/reset-enforcer-peak")
+async def debug_reset_enforcer_peak(_: bool = Depends(verify_api_key)):
+    """Reset the enforcer's peak watermark + soft-overage counter.
+
+    Useful between test runs so peak_bytes / overage_count in
+    ``get_status()`` reflect only the current scenario.
+    """
+    pool = get_engine_pool()
+    if pool is None:
+        raise HTTPException(status_code=503, detail="Engine pool not initialized")
+    enforcer = pool._process_memory_enforcer
+    if enforcer is not None:
+        enforcer.reset_peak()
+    return {"ok": True}
+
+
 @app.get("/v1/models")
 async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
     """List all available models with load status."""

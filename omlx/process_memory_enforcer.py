@@ -83,6 +83,13 @@ class ProcessMemoryEnforcer:
         # Most recently observed pressure level, consumed by scheduler /
         # admission control. Updated on every poll iteration.
         self._pressure_level: str = "ok"
+        # Diagnostic counters reset by /debug/reset-enforcer-peak between
+        # test runs. ``_peak_memory_bytes`` tracks the highest current
+        # usage we've observed since the last reset; ``_overage_count``
+        # counts how many polls saw current > soft. Both are observability
+        # only — not consumed by enforcement logic.
+        self._peak_memory_bytes: int = 0
+        self._overage_count: int = 0
 
     @property
     def max_bytes(self) -> int:
@@ -276,6 +283,13 @@ class ProcessMemoryEnforcer:
         hard = self._hard_bytes
         prev_level = self._pressure_level
 
+        # Observability counters: peak watermark + soft-overage count.
+        # Reset via /debug/reset-enforcer-peak between test runs.
+        if current > self._peak_memory_bytes:
+            self._peak_memory_bytes = current
+        if current >= soft:
+            self._overage_count += 1
+
         if current < soft:
             new_level = "ok"
         elif current < hard:
@@ -466,4 +480,12 @@ class ProcessMemoryEnforcer:
             "utilization": (
                 current / self._max_bytes if self._max_bytes > 0 else 0.0
             ),
+            "peak_bytes": self._peak_memory_bytes,
+            "peak_formatted": _format_gb(self._peak_memory_bytes),
+            "overage_count": self._overage_count,
         }
+
+    def reset_peak(self) -> None:
+        """Reset peak memory and overage counter (for tests/diagnostics)."""
+        self._peak_memory_bytes = 0
+        self._overage_count = 0
