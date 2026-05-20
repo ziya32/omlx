@@ -150,7 +150,12 @@ class DFlashEngine(BaseEngine):
         loop = asyncio.get_running_loop()
 
         def _load_models():
-            from dflash_mlx.runtime import load_target_bundle, load_draft_bundle
+            # dflash-mlx 0.1.7 (1ba6713) moved load_target_bundle / load_draft_bundle
+            # out of runtime/__init__ into runtime.bundle; importing from the
+            # legacy path now raises ImportError. Use the explicit submodule.
+            from dflash_mlx.runtime.bundle import (
+                load_target_bundle, load_draft_bundle,
+            )
 
             model, tokenizer, meta = load_target_bundle(self._model_name)
             draft, draft_meta = load_draft_bundle(
@@ -490,13 +495,17 @@ class DFlashEngine(BaseEngine):
 
         from ..engine_core import get_mlx_executor
         from dflash_mlx.generate import get_stop_token_ids
-        from dflash_mlx.runtime import generate_dflash_once
+        from dflash_mlx.runtime import stream_dflash_generate
 
         loop = asyncio.get_running_loop()
         stop_ids = get_stop_token_ids(self._tokenizer_obj)
 
         def _run():
-            return generate_dflash_once(
+            # dflash-mlx 0.1.7 removed generate_dflash_once; drain the
+            # streaming generator into a single summary instead. The token-
+            # event stream produces the same generated_token_ids the legacy
+            # API returned, and the summary event carries the metrics.
+            generator = stream_dflash_generate(
                 target_model=self._target_model,
                 tokenizer=self._executor_tokenizer,
                 draft_model=self._draft_model,
@@ -506,6 +515,29 @@ class DFlashEngine(BaseEngine):
                 prompt_tokens_override=prompt_tokens,
                 temperature=temperature,
             )
+            token_ids: list[int] = []
+            summary_metrics: dict = {}
+            for event in generator:
+                ev = event.get("event")
+                if ev == "token":
+                    tid = event["token_id"]
+                    if tid not in stop_ids:
+                        token_ids.append(tid)
+                elif ev == "summary":
+                    summary_metrics = {
+                        k: v for k, v in event.items() if k != "event"
+                    }
+            return {
+                "generated_token_ids": token_ids,
+                "prompt_token_count": summary_metrics.get(
+                    "prompt_token_count", len(prompt_tokens)
+                ),
+                "generation_tokens": summary_metrics.get(
+                    "generation_tokens", len(token_ids)
+                ),
+                **{k: v for k, v in summary_metrics.items()
+                   if k not in ("prompt_token_count", "generation_tokens")},
+            }
 
         self._enter_active(request_id)
         try:
