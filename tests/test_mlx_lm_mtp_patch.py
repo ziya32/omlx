@@ -294,11 +294,21 @@ class TestDeepseekV4Model:
         not satisfied in this environment.
         """
         try:
-            from omlx.patches.deepseek_v4 import apply_deepseek_v4_patch
+            from omlx.patches.deepseek_v4 import (
+                apply_deepseek_v4_patch,
+                is_applied,
+            )
         except ImportError:
             pytest.skip("omlx.patches.deepseek_v4 not importable")
-        if not apply_deepseek_v4_patch():
-            pytest.skip("DeepSeek-V4 base patch refused to apply in this env")
+        # ``apply_deepseek_v4_patch`` returns False both when mlx_lm isn't
+        # importable AND when the patch was already applied earlier in
+        # this process (e.g. by tests/test_deepseek_v4_patch.py's
+        # ``applied_patch`` module fixture). Treating False as "refused"
+        # would skip a passing test whenever something else ran first.
+        # Trigger the (idempotent) apply, then gate on ``is_applied()``.
+        apply_deepseek_v4_patch()
+        if not is_applied():
+            pytest.skip("DeepSeek-V4 base patch could not apply (mlx_lm missing?)")
 
         from omlx.patches.mlx_lm_mtp import deepseek_v4_model
 
