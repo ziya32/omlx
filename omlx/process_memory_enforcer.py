@@ -311,23 +311,49 @@ class ProcessMemoryEnforcer:
         if new_level == "ok":
             return
 
-        # SOFT pressure: ``_propagate_memory_limit`` above already paused
-        # new admissions on every loaded scheduler — the admission gate
-        # absorbs the next request before it hits prefill, giving the
-        # already-in-flight work room to complete and naturally drop
-        # memory back below soft. Aborting in-flight requests on a
-        # non-pinned model here would cascade-503 stress workloads that
-        # have all small models actively serving (test_17_max_stress).
+        # HARD-only action: abort any in-progress model loads. Prevents
+        # further memory growth without touching loaded engines. Runs
+        # even when ``current`` is still under the absolute limit (HEAD
+        # measures via ``max(active, phys_footprint)`` which can flag
+        # HARD on transient phys_footprint overshoot before MLX-active
+        # actually saturates).
+        if new_level == "hard":
+            aborted_any = False
+            for entry in self._engine_pool._entries.values():
+                if entry.is_loading and not entry.abort_loading:
+                    logger.warning(
+                        f"Aborting in-progress load of "
+                        f"'{entry.model_id}' (hard memory pressure)"
+                    )
+                    entry.abort_loading = True
+                    aborted_any = True
+            if aborted_any:
+                # Aborting loads alone usually suffices to keep memory
+                # contained; let the next tick re-check before going
+                # further.
+                return
+
+        # Full eviction loop is gated on the absolute ``max_bytes``
+        # limit, not the SOFT/HARD watermarks. SOFT/HARD signals are
+        # consumed by admission control (``_propagate_memory_limit``
+        # already paused new prefills above) and the HARD load-abort
+        # pass above — they fire proactively below max to give
+        # in-flight work a chance to drain naturally before any
+        # request abort.
         #
-        # Pre-v0.3.9 ``_find_drain_or_evict_candidate`` was only invoked
-        # when ``current > self._max_bytes`` — i.e. HARD. Restore that
-        # gate: SOFT just signals admission pause; eviction waits for
-        # HARD.
-        if new_level == "soft":
+        # Pre-v0.3.9 semantics: ``if current <= self._max_bytes: return``.
+        # The merge introduced the SOFT/HARD watermarks but kept the
+        # enforcement loop gated on SOFT, which under HEAD's stricter
+        # ``max(mx.get_active_memory(), phys_footprint)`` measurement
+        # (phys_footprint includes IOAccelerator + dirty file-backed,
+        # routinely 10-20% above mx.get_active_memory alone) triggered
+        # eviction-thrash on stress workloads that ran fine under the
+        # pre-merge active-memory-only check.
+        if current <= self._max_bytes:
             return
 
-        # HARD pressure: recover to soft so we have margin before the
-        # next hard event (prevents oscillation at the boundary).
+        # Recover to soft so we have margin before the next event
+        # (prevents oscillation at the boundary).
         target = soft
 
         async with self._engine_pool._lock:
