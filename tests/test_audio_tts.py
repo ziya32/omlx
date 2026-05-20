@@ -40,10 +40,19 @@ MAX_WAV_CHUNK_SIZE = 0xFFFFFFFF
 
 
 def _make_mock_tts_engine(wav_bytes: bytes = None) -> MagicMock:
-    """Build a mock TTSEngine that returns the given WAV bytes."""
-    from omlx.engine.tts import TTSEngine
+    """Build a mock TTSEngine that returns the given WAV bytes.
+
+    Returns a ``SpeechOutput`` dataclass — the audio handler now reads
+    ``output.audio_bytes`` / ``.sample_rate`` / ``.duration`` (see commit
+    7b3615d which restored feature's dataclass return shape).
+    """
+    from omlx.engine.tts import TTSEngine, SpeechOutput
     engine = MagicMock(spec=TTSEngine)
-    engine.synthesize = AsyncMock(return_value=wav_bytes or DUMMY_WAV)
+    engine.synthesize = AsyncMock(return_value=SpeechOutput(
+        audio_bytes=wav_bytes or DUMMY_WAV,
+        sample_rate=24000,
+        duration=0.1,
+    ))
     engine.supports_native_tts_streaming.return_value = False
     return engine
 
@@ -76,6 +85,31 @@ def _ensure_audio_routes(app):
     existing = {getattr(r, "path", "") for r in app.routes}
     if not audio_paths & existing:
         app.include_router(audio_router)
+
+
+@pytest.fixture(autouse=True)
+def _permissive_audio_auth():
+    """Auto-wire the audio router's _verify_auth dependency for every test
+    in this module.
+
+    The audio router's ``_verify_auth`` raises 401 "Auth not configured"
+    until ``set_auth_dependency()`` is called — server.py does this at
+    startup, but TestClient bypasses that path. Without this fixture
+    every TTS test that POSTs to ``/v1/audio/speech`` lands on 401 instead
+    of reaching the mocked engine. Module-scoped autouse so it applies to
+    the dedicated ``server_tts_client`` fixture and to the inline
+    TestClient blocks in TestTTSStreamingResponse / TestTTSPCMStreaming /
+    TestTTSVoiceCloneEndpoint without duplicating boilerplate.
+    """
+    from omlx.api.audio_routes import set_auth_dependency
+
+    async def _permit(request=None, credentials=None) -> bool:
+        return True
+    set_auth_dependency(_permit)
+    try:
+        yield
+    finally:
+        set_auth_dependency(None)
 
 
 @pytest.fixture
@@ -521,9 +555,12 @@ class TestTTSModelAliasResolution:
                 )
                 assert response.status_code == 200
                 # Verify pool.get_engine was called with the resolved ID
-                mock_pool.get_engine.assert_awaited_once_with(
-                    "Qwen3-TTS-12Hz-1.7B-Base-bf16"
-                )
+                # create_speech now calls pool.get_engine twice: once at the top of
+                # the handler for validation, once via _use_engine context for
+                # leased access. Both must use the resolved alias.
+                assert mock_pool.get_engine.await_count >= 1
+                for call in mock_pool.get_engine.await_args_list:
+                    assert call.args == ("Qwen3-TTS-12Hz-1.7B-Base-bf16",)
 
     def test_speech_direct_model_id(self):
         """POST /v1/audio/speech with direct model ID works without alias."""
@@ -554,9 +591,12 @@ class TestTTSModelAliasResolution:
                     },
                 )
                 assert response.status_code == 200
-                mock_pool.get_engine.assert_awaited_once_with(
-                    "Qwen3-TTS-12Hz-1.7B-Base-bf16"
-                )
+                # create_speech now calls pool.get_engine twice: once at the top of
+                # the handler for validation, once via _use_engine context for
+                # leased access. Both must use the resolved alias.
+                assert mock_pool.get_engine.await_count >= 1
+                for call in mock_pool.get_engine.await_args_list:
+                    assert call.args == ("Qwen3-TTS-12Hz-1.7B-Base-bf16",)
 
 
 # ---------------------------------------------------------------------------

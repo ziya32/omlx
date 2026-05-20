@@ -14,6 +14,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+from omlx.engine.stt import TranscriptionOutput
 from fastapi.testclient import TestClient
 
 # ---------------------------------------------------------------------------
@@ -42,15 +44,21 @@ TINY_WAV = _make_wav_bytes()
 
 
 def _make_mock_stt_engine(transcript: str = "hello world") -> MagicMock:
-    """Build a mock STTEngine that returns the given transcript."""
-    from omlx.engine.stt import STTEngine
+    """Build a mock STTEngine that returns the given transcript.
+
+    Returns a ``TranscriptionOutput`` dataclass — the audio handler now
+    reads ``output.text`` / ``output.language`` / ``output.duration`` /
+    ``output.segments`` as attributes (see commit 7b3615d which restored
+    feature's dataclass return shape).
+    """
+    from omlx.engine.stt import STTEngine, TranscriptionOutput
     engine = MagicMock(spec=STTEngine)
-    engine.transcribe = AsyncMock(return_value={
-        "text": transcript,
-        "language": "en",
-        "duration": 0.1,
-        "segments": [],
-    })
+    engine.transcribe = AsyncMock(return_value=TranscriptionOutput(
+        text=transcript,
+        language="en",
+        duration=0.1,
+        segments=[],
+    ))
     return engine
 
 
@@ -73,6 +81,22 @@ def _make_mock_pool(stt_engine=None, model_id: str = "whisper-tiny") -> MagicMoc
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _permissive_audio_auth():
+    """Auto-wire the audio router's _verify_auth dependency for every test
+    in this module — see test_audio_tts.py for full rationale.
+    """
+    from omlx.api.audio_routes import set_auth_dependency
+
+    async def _permit(request=None, credentials=None) -> bool:
+        return True
+    set_auth_dependency(_permit)
+    try:
+        yield
+    finally:
+        set_auth_dependency(None)
 
 
 @pytest.fixture
@@ -115,7 +139,7 @@ class TestSTTEngineLanguageForwarding:
         normalizes "chinese" -> "zh" for the language token, and Qwen3-ASR
         lowercases its supported-language list before matching.
         """
-        from omlx.engine.stt import STTEngine
+        from omlx.engine.stt import TranscriptionOutput, STTEngine
 
         generate_call = {}
 
@@ -147,7 +171,7 @@ class TestSTTEngineLanguageForwarding:
             "language": "chinese",
             "temperature": 0.0,
         }
-        assert result["language"] == "zh"
+        assert result.language == "zh"
 
     @pytest.mark.asyncio
     async def test_transcribe_passes_unknown_language_through(self, tmp_path):
@@ -262,7 +286,7 @@ class TestSTTEndpointBasic:
         """Response text matches what the engine returned."""
         client, mock_pool = server_audio_client
         mock_pool.get_engine.return_value.transcribe = AsyncMock(
-            return_value={"text": "test transcription", "language": "en", "duration": 0.5, "segments": []}
+            return_value=TranscriptionOutput(text="test transcription", language="en", duration=0.5, segments=[])
         )
 
         response = client.post(
@@ -302,7 +326,7 @@ class TestSTTEndpointBasic:
 
         async def capture(path, **kwargs):
             captured.update(kwargs)
-            return {"text": "ok", "language": "en", "segments": [], "duration": 0.0}
+            return TranscriptionOutput(text="ok", language="en", segments=[], duration=0.0)
 
         engine.transcribe = AsyncMock(side_effect=capture)
 
@@ -326,7 +350,7 @@ class TestSTTEndpointBasic:
 
         async def capture(path, **kwargs):
             captured.update(kwargs)
-            return {"text": "ok", "language": "en", "segments": [], "duration": 0.0}
+            return TranscriptionOutput(text="ok", language="en", segments=[], duration=0.0)
 
         engine.transcribe = AsyncMock(side_effect=capture)
 
@@ -355,7 +379,7 @@ class TestSTTEndpointBasic:
 
         async def capture(path, **kwargs):
             captured.update(kwargs)
-            return {"text": "ok", "language": "en", "segments": [], "duration": 0.0}
+            return TranscriptionOutput(text="ok", language="en", segments=[], duration=0.0)
 
         engine.transcribe = AsyncMock(side_effect=capture)
 
@@ -389,7 +413,7 @@ class TestSTTEndpointBasic:
 
         async def capture(path, **kwargs):
             captured.update(kwargs)
-            return {"text": "ok", "language": "en", "segments": [], "duration": 0.0}
+            return TranscriptionOutput(text="ok", language="en", segments=[], duration=0.0)
 
         engine.transcribe = AsyncMock(side_effect=capture)
 
@@ -419,7 +443,7 @@ class TestSTTEndpointBasic:
 
         async def capture(path, **kwargs):
             captured.update(kwargs)
-            return {"text": "ok", "language": "en", "segments": [], "duration": 0.0}
+            return TranscriptionOutput(text="ok", language="en", segments=[], duration=0.0)
 
         engine.transcribe = AsyncMock(side_effect=capture)
 
@@ -441,7 +465,7 @@ class TestSTTEndpointBasic:
 
         async def capture(path, **kwargs):
             captured.update(kwargs)
-            return {"text": "ok", "language": "en", "segments": [], "duration": 0.0}
+            return TranscriptionOutput(text="ok", language="en", segments=[], duration=0.0)
 
         engine.transcribe = AsyncMock(side_effect=capture)
 

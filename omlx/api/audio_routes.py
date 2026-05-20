@@ -938,7 +938,12 @@ async def create_speech(
     # Materialize ref_audio tempfile only now — past all sync validation.
     nonstream_ref_audio_path = _write_ref_audio_tempfile(ref_audio_bytes)
     try:
-        async with _use_engine(request.model) as engine:
+        # Pass the already-resolved id (computed at line 807) so the lease
+        # path's get_engine uses the same model id as the validator above.
+        # See Issue 7 resolve-once pattern — without this the get_engine
+        # call inside _use_engine re-resolves and can land on a different
+        # entry if the alias map churns mid-request.
+        async with _use_engine(resolved_model) as engine:
             if not isinstance(engine, TTSEngine):
                 raise HTTPException(
                     status_code=400,
