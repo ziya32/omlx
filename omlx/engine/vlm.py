@@ -1135,6 +1135,49 @@ class VLMBatchedEngine(BaseEngine):
                 except Exception as e:
                     logger.error(f"SpecPrefill: draft model load failed: {e}")
 
+        # VLM-MTP: load the assistant drafter and wire it into the scheduler.
+        # Without this, vlm_mtp_enabled=True silently has no effect — the
+        # scheduler's _route_to_vlm_mtp dispatch only fires when
+        # _vlm_mtp_drafter is set. Mirrors the SpecPrefill pattern above.
+        if self._model_settings is not None:
+            vlm_mtp_enabled = getattr(
+                self._model_settings, "vlm_mtp_enabled", False
+            )
+            vlm_mtp_draft = getattr(
+                self._model_settings, "vlm_mtp_draft_model", None
+            )
+            if vlm_mtp_enabled and vlm_mtp_draft:
+                try:
+                    from ..speculative.vlm_mtp import load_vlm_mtp_drafter
+
+                    def _load_vlm_mtp_drafter():
+                        return load_vlm_mtp_drafter(vlm_mtp_draft)
+
+                    drafter = await loop.run_in_executor(
+                        get_mlx_executor(), _load_vlm_mtp_drafter
+                    )
+                    if drafter is not None:
+                        block_size = getattr(
+                            self._model_settings,
+                            "vlm_mtp_draft_block_size",
+                            None,
+                        )
+                        self._engine.engine.scheduler.set_vlm_mtp_drafter(
+                            drafter, draft_block_size=block_size,
+                        )
+                        logger.info(
+                            "VLM MTP: drafter loaded (%s, block_size=%s)",
+                            vlm_mtp_draft, block_size,
+                        )
+                    else:
+                        logger.warning(
+                            "VLM MTP: drafter load returned None for %s — "
+                            "speculative path will stay inactive",
+                            vlm_mtp_draft,
+                        )
+                except Exception as e:
+                    logger.error(f"VLM MTP: drafter load failed: {e}")
+
         # Inject mlx-lm tool calling support into VLM tokenizer
         self._inject_tool_calling(self._tokenizer)
 
