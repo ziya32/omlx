@@ -21,7 +21,7 @@ import mlx.core as mx
 import numpy as np
 
 from ..engine_core import get_mlx_executor
-from ..exceptions import AudioError
+from ..exceptions import AudioError, VoiceCloningError
 from .audio_utils import DEFAULT_SAMPLE_RATE as _DEFAULT_SAMPLE_RATE
 from .audio_utils import audio_to_wav_bytes as _audio_to_wav_bytes
 from .base import BaseNonStreamingEngine
@@ -354,13 +354,31 @@ class TTSEngine(BaseNonStreamingEngine):
 
         def _create_gen():
             # iter() so a model.generate() that returns a list (mocks,
-            # eager iterables) still supports next(g, None) per segment.
-            return iter(model.generate(**_build_generate_kwargs()))
+            # eager iterables) still supports next(g, _SEG_DONE) per
+            # segment. Map raw model errors to AudioError/VoiceCloning-
+            # Error so the audio endpoint surfaces 422 instead of 500.
+            try:
+                return iter(model.generate(**_build_generate_kwargs()))
+            except Exception as e:
+                if self._variant == "base" and ref_audio:
+                    raise VoiceCloningError(
+                        f"Voice cloning failed: {e}"
+                    ) from e
+                raise AudioError(
+                    f"TTS generation failed: {e}"
+                ) from e
 
         _SEG_DONE = object()
 
         def _next_seg(g):
-            return next(g, _SEG_DONE)
+            # Same wrapping: per-segment errors from mlx-audio's iterator
+            # become AudioError, not HTTP 500.
+            try:
+                return next(g, _SEG_DONE)
+            except Exception as e:
+                raise AudioError(
+                    f"TTS segment generation failed: {e}"
+                ) from e
 
         def _finalize(chunks, sample_rate):
             audio = np.concatenate(chunks, axis=0)
