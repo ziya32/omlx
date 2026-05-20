@@ -86,14 +86,29 @@ class DFlashEngine(BaseEngine):
         model_name: str,
         draft_model_path: str,
         draft_quant_bits: int | None = None,
+        draft_quant_enabled: bool | None = None,
+        draft_quant_weight_bits: int | None = None,
+        draft_quant_activation_bits: int | None = None,
+        draft_quant_group_size: int | None = None,
         model_settings: Any | None = None,
         fallback_engine_type: str = "batched",
         scheduler_config: Any | None = None,
         process_memory_max_bytes: int = 0,
+        omlx_ssd_cache_dir: str | Path | None = None,
     ):
         self._model_name = model_name
         self._draft_model_path = draft_model_path
         self._draft_quant_bits = draft_quant_bits
+        # New-style draft-quant config (dflash 0.1.5+). Lets callers pass an
+        # explicit ``enabled`` toggle plus separate bit-widths so a profile
+        # can flip quantization on without filling in every value.
+        self._draft_quant_enabled = draft_quant_enabled
+        self._draft_quant_weight_bits = draft_quant_weight_bits
+        self._draft_quant_activation_bits = draft_quant_activation_bits
+        self._draft_quant_group_size = draft_quant_group_size
+        self._omlx_ssd_cache_dir = (
+            Path(omlx_ssd_cache_dir) if omlx_ssd_cache_dir else None
+        )
         self._model_settings = model_settings
         self._fallback_engine_type = fallback_engine_type
         self._scheduler_config = scheduler_config
@@ -126,6 +141,31 @@ class DFlashEngine(BaseEngine):
             getattr(model_settings, "dflash_verify_mode", None)
             if model_settings else None
         )
+        # Prefix-cache (L1/L2) settings used by _build_runtime_context +
+        # _resolve_dflash_l2_dir.
+        self._in_memory_cache_enabled = (
+            bool(getattr(model_settings, "dflash_in_memory_cache", True))
+            if model_settings else True
+        )
+        self._in_memory_cache_max_entries = int(
+            getattr(model_settings, "dflash_in_memory_cache_max_entries", 4)
+            if model_settings else 4
+        )
+        self._in_memory_cache_max_bytes = int(
+            getattr(
+                model_settings, "dflash_in_memory_cache_max_bytes",
+                8 * 1024**3,
+            )
+            if model_settings else 8 * 1024**3
+        )
+        self._ssd_cache_requested = (
+            bool(getattr(model_settings, "dflash_ssd_cache", False))
+            if model_settings else False
+        )
+        # Protocol-specific output parser factory (gemma4 / harmony) —
+        # detected at start() once the target model is loaded. None means
+        # the streaming detokenizer is used as-is (qwen, llama, etc.).
+        self._output_parser_factory: Any | None = None
 
         # Single-request tracking for has_active_requests / abort_request.
         # DFlash processes one request at a time on the MLX executor; the
@@ -142,11 +182,141 @@ class DFlashEngine(BaseEngine):
         # current request and refuses new ones until stop().
         self._aborted_terminal = False
 
-        raw = os.environ.get("DFLASH_MAX_CTX", str(DEFAULT_MAX_DFLASH_CTX)).strip()
+        # ``dflash_max_ctx`` precedence: per-model setting > env var >
+        # DEFAULT_MAX_DFLASH_CTX. A ``None`` setting (the model_settings
+        # default) means "unlimited" — every prompt size stays on dflash.
+        # An env override of "" is treated as "fall back to default".
+        if model_settings is not None and hasattr(model_settings, "dflash_max_ctx"):
+            self._max_dflash_ctx = model_settings.dflash_max_ctx
+        else:
+            raw = os.environ.get("DFLASH_MAX_CTX", str(DEFAULT_MAX_DFLASH_CTX)).strip()
+            try:
+                self._max_dflash_ctx = max(1, int(raw)) if raw else DEFAULT_MAX_DFLASH_CTX
+            except ValueError:
+                self._max_dflash_ctx = DEFAULT_MAX_DFLASH_CTX
+
+    @staticmethod
+    def _build_quant_spec(
+        weight_bits: int | None,
+        activation_bits: int | None,
+        group_size: int | None,
+    ) -> str:
+        """Convert draft quantization config into dflash 0.1.5's spec string.
+
+        None values fall back to dflash defaults (w4a16:gs64), so the spec
+        stays valid when a profile or external API sets ``enabled=True``
+        without filling in every bit value.
+        """
+        wb = weight_bits if weight_bits is not None else 4
+        ab = activation_bits if activation_bits is not None else 16
+        gs = group_size if group_size is not None else 64
+        return f"w{wb}a{ab}:gs{gs}"
+
+    def _resolve_dflash_l2_dir(self) -> Path | None:
+        """Compute the dflash L2 cache directory under the omlx SSD cache root."""
+        if not self._ssd_cache_requested:
+            return None
+        if self._omlx_ssd_cache_dir is None:
+            logger.warning(
+                "DFlash SSD cache requested but omlx paged SSD cache directory "
+                "is not configured; disabling L2."
+            )
+            return None
+        if not self._in_memory_cache_enabled:
+            logger.warning(
+                "DFlash SSD cache requires in-memory cache; disabling L2."
+            )
+            return None
+        return self._omlx_ssd_cache_dir / "dflash_l2"
+
+    def _build_runtime_context(self) -> Any:
+        """Build a dflash-mlx ``RuntimeContext`` from the engine's settings.
+
+        Called at ``start()``; the result is cached on ``self._runtime_context``
+        and passed to every ``stream_dflash_generate`` invocation. Tests
+        also call this directly to verify per-setting plumbing.
+        """
+        from dflash_mlx.runtime.config import runtime_config_from_defaults
+        from dflash_mlx.runtime.context import build_runtime_context
+
+        l2_dir = self._resolve_dflash_l2_dir()
+        l2_enabled = l2_dir is not None
+        cfg = runtime_config_from_defaults(
+            prefix_cache=self._in_memory_cache_enabled,
+            prefix_cache_max_entries=self._in_memory_cache_max_entries,
+            prefix_cache_max_bytes=self._in_memory_cache_max_bytes,
+            prefix_cache_l2=l2_enabled,
+            prefix_cache_l2_dir=str(l2_dir) if l2_dir else "",
+            # 1 TiB sentinel — disk usage is bounded by the omlx SSD cache
+            # configuration; dflash's own byte limit is intentionally large.
+            prefix_cache_l2_max_bytes=1 << 40 if l2_enabled else 0,
+            # None → dflash-mlx fills in DEFAULT_RUNTIME_CONFIG values
+            # (window=1024, sink=64, verify_mode='adaptive').
+            draft_window_size=self._draft_window_size,
+            draft_sink_size=self._draft_sink_size,
+            verify_mode=self._verify_mode,
+        )
+        return build_runtime_context(cfg)
+
+    def _get_think_token_id(self, attr: str) -> int | None:
+        """Safely read think_start_id / think_end_id from the tokenizer."""
         try:
-            self._max_dflash_ctx = max(1, int(raw))
-        except ValueError:
-            self._max_dflash_ctx = DEFAULT_MAX_DFLASH_CTX
+            return getattr(self._tokenizer_obj, attr, None)
+        except (ValueError, TypeError):
+            return None
+
+    def _detect_needs_think_prefix(self, prompt_tokens: list[int]) -> bool:
+        """Detect if prompt ends with an open ``<think>`` tag.
+
+        DFlash bypasses the scheduler, so the ``<think>\\n`` prefix that
+        the scheduler normally prepends to the first chunk for reasoning
+        models must be reproduced here. Mirrors the scheduler's detection
+        logic. Returns False for disabled-thinking patterns like
+        ``<think></think>`` where ``</think>`` immediately follows
+        ``<think>`` in the prompt tail.
+        """
+        if not prompt_tokens:
+            return False
+
+        think_start_id = self._get_think_token_id('think_start_id')
+        if think_start_id is None and self._tokenizer_obj is not None:
+            try:
+                tid = self._tokenizer_obj.convert_tokens_to_ids("<think>")
+                if tid == getattr(self._tokenizer_obj, 'unk_token_id', None):
+                    return False
+                think_start_id = tid
+            except (AttributeError, KeyError, TypeError):
+                return False
+
+        if not think_start_id:
+            return False
+
+        last_tokens = list(prompt_tokens[-3:])
+        if think_start_id not in last_tokens:
+            return False
+
+        last_idx = len(last_tokens) - 1 - last_tokens[::-1].index(think_start_id)
+        after_start = last_tokens[last_idx + 1:]
+
+        if after_start:
+            think_end_id = self._get_think_token_id('think_end_id')
+            if think_end_id is not None and think_end_id in after_start:
+                return False
+            if self._tokenizer_obj is not None:
+                try:
+                    tid = self._tokenizer_obj.convert_tokens_to_ids("</think>")
+                    unk = getattr(self._tokenizer_obj, 'unk_token_id', None)
+                    if tid != unk and tid in after_start:
+                        return False
+                except (AttributeError, KeyError, TypeError):
+                    pass
+
+        return True
+
+    def _think_prefix_text(self) -> str:
+        """Return the opening think tag string to prepend (e.g. '<think>\\n')."""
+        tag = getattr(self._tokenizer_obj, 'think_start', '<think>')
+        return f"{tag}\n"
 
     @property
     def model_name(self) -> str:
@@ -325,9 +495,33 @@ class DFlashEngine(BaseEngine):
         messages: list[dict[str, Any]],
         tools: list[dict] | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
+        is_partial: bool | None = None,
     ) -> str:
+        """Apply chat template to messages.
+
+        Args:
+            messages: List of chat messages.
+            tools: Optional tool definitions.
+            chat_template_kwargs: Optional kwargs for the chat template
+                (e.g. enable_thinking, reasoning_effort).
+            is_partial: Explicit partial-mode signal from the API server.
+                ``True``/``False`` — server has already decided; the
+                ``partial`` key is cleaned from message dicts but no
+                detection is performed. ``None`` (default) — auto-detect
+                from messages for backward compatibility with direct
+                engine callers. Mirrors BatchedEngine's contract so the
+                server can ``count_chat_tokens(..., is_partial=...)``
+                followed by ``_apply_chat_template(..., is_partial=...)``
+                render with identical flags.
+        """
         if hasattr(self._tokenizer_obj, "apply_chat_template"):
-            is_partial = detect_and_strip_partial(messages)
+            if is_partial is None:
+                is_partial = detect_and_strip_partial(messages)
+            else:
+                # Server already resolved partial; just clean residual keys
+                # so the chat template never sees the non-standard field.
+                for msg in messages:
+                    msg.pop("partial", None)
             template_kwargs = {
                 "tokenize": False,
                 "add_generation_prompt": not is_partial,
@@ -360,14 +554,28 @@ class DFlashEngine(BaseEngine):
         messages: list[dict[str, Any]],
         tools: list[dict] | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
+        is_partial: bool | None = None,
     ) -> int:
+        """Count prompt tokens for chat messages after applying chat template.
+
+        Args:
+            messages: List of chat messages.
+            tools: Optional tool definitions.
+            chat_template_kwargs: Optional kwargs for chat template.
+            is_partial: Explicit partial-mode signal (see _apply_chat_template).
+        """
         template_tools = convert_tools_for_template(tools) if tools else None
         prompt = self._apply_chat_template(
-            messages, template_tools, chat_template_kwargs=chat_template_kwargs
+            messages, template_tools,
+            chat_template_kwargs=chat_template_kwargs,
+            is_partial=is_partial,
         )
         return len(self._tokenizer_obj.encode(prompt))
 
     def _should_fallback(self, prompt_tokens: list[int]) -> bool:
+        """``None`` ``_max_dflash_ctx`` means dflash handles every prompt size."""
+        if self._max_dflash_ctx is None:
+            return False
         return len(prompt_tokens) >= self._max_dflash_ctx
 
     def _enter_active(self, request_id: str | None) -> str:
