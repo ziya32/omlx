@@ -33,6 +33,10 @@ import pytest
 
 pytestmark = [
     pytest.mark.slow,
+    # Each variant runs 7 phases (LLM cache + batching + TurboQuant + 4 VLM
+    # phases) — the VLM variants (Qwen3-VL) need ~10 min on M3/M4. Sweep-level
+    # --timeout=300 cuts them off mid-phase. 1200s leaves headroom.
+    pytest.mark.timeout(1200),
     pytest.mark.skipif(
         sys.platform != "darwin",
         reason="Requires macOS with Apple Silicon",
@@ -170,7 +174,6 @@ def _track_peak_memory(label: str):
 
     mx.synchronize()
     mem_before = mx.get_active_memory()
-    peak_before = mx.get_peak_memory()
     # Reset peak to current level
     mx.reset_peak_memory()
 
