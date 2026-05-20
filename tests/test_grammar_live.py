@@ -711,6 +711,11 @@ class TestPerformance:
         async with httpx.AsyncClient() as c:
             await _complete(c, model, "Hi", max_tokens=5)
 
+    # 12 combos × 60s = 720s for qwen (thinking on/off × 2 grammars × 3 conc
+    # levels). gemma runs only 6 combos = 360s. Plus warmup + result print.
+    # Use 1200s to leave headroom; sweep-level --timeout overrides this only
+    # if set lower, so individual runs honor the 20-min budget the test needs.
+    @pytest.mark.timeout(1200)
     @pytest.mark.asyncio
     @pytest.mark.parametrize("family", [
         pytest.param("qwen", marks=_skip_if_family_missing("qwen")),
