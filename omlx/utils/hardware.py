@@ -332,14 +332,7 @@ def get_os_version() -> str:
 # Utility Functions
 # =============================================================================
 
-
-def format_bytes(bytes_value: int) -> str:
-    """Format bytes as human-readable string (e.g., '16.00 GB')."""
-    if bytes_value >= 1024**3:
-        return f"{bytes_value / 1024**3:.2f} GB"
-    elif bytes_value >= 1024**2:
-        return f"{bytes_value / 1024**2:.2f} MB"
-    elif bytes_value >= 1024:
-        return f"{bytes_value / 1024:.2f} KB"
-    else:
-        return f"{bytes_value} B"
+# Canonical formatter lives in omlx.utils.formatting; re-exported here so
+# every existing `from .utils.hardware import format_bytes` site keeps
+# working with a single source of truth.
+from .formatting import format_bytes  # noqa: E402, F401
