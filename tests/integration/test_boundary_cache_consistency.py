@@ -30,6 +30,11 @@ import pytest
 
 pytestmark = [
     pytest.mark.slow,
+    # Each parametrized variant loads a real model + runs 8K-context prefill
+    # twice (ON/OFF + fresh/SSD-cached). The largest one (gemma-4-31b VLM
+    # hybrid) needs ~6 min on M3/M4 — sweep-level --timeout=300 cuts it off.
+    # 900s leaves headroom while still bounding hangs.
+    pytest.mark.timeout(900),
     pytest.mark.skipif(
         sys.platform != "darwin",
         reason="Requires macOS with Apple Silicon",
