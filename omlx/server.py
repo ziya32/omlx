@@ -160,6 +160,7 @@ from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
 from .engine_pool import EnginePool
 from .exceptions import (
+    EngineEvictedError,
     EnginePoolError,
     InsufficientMemoryError,
     ModelLoadingError,
@@ -1577,7 +1578,57 @@ async def _with_json_keepalive(
             if keepalive_elapsed >= interval:
                 keepalive_elapsed = 0.0
                 yield " "
-        result = task.result()
+
+        # Surface task result OR an OpenAI-shaped error body. HTTP status
+        # is locked at 200 once the keepalive byte is on the wire — Starlette
+        # commits http.response.start before iterating the body — so any
+        # exception raised by `coro` after that point can't flip the status.
+        # Mirror the equivalent status into ``error.code`` so clients keying
+        # retry logic off ``body.error.code`` (matching OpenAI's streaming
+        # mid-stream error contract) recover the retry signal. See feature
+        # commit 16445e1 for the original rationale.
+        try:
+            result = task.result()
+        except RequestAbortedError as exc:
+            logger.warning(
+                "Request aborted mid-keepalive (status already 200): %s", exc
+            )
+            yield json.dumps(
+                _openai_error_body(str(exc) or "Request aborted", 503, code=503)
+            )
+            return
+        except EngineEvictedError as exc:
+            logger.warning(
+                "Engine evicted mid-keepalive (status already 200): %s", exc
+            )
+            yield json.dumps(
+                _openai_error_body(str(exc) or "Engine evicted", 503, code=503)
+            )
+            return
+        except HTTPException as exc:
+            logger.warning(
+                "HTTPException mid-keepalive (status already 200): %d %s",
+                exc.status_code, exc.detail,
+            )
+            yield json.dumps(
+                _openai_error_body(
+                    str(exc.detail) or "Error",
+                    exc.status_code,
+                    code=exc.status_code,
+                )
+            )
+            return
+        except Exception as exc:
+            logger.exception(
+                "Unhandled exception mid-keepalive (status already 200)"
+            )
+            yield json.dumps(
+                _openai_error_body(
+                    str(exc) or "Internal server error", 500, code=500,
+                )
+            )
+            return
+
         if result is not None:
             yield result
     finally:
