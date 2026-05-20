@@ -1217,16 +1217,30 @@ def init_server(
 
         init_auth(global_settings.auth.secret_key, lambda: _server_state.global_settings)
 
-    # Configure CORS middleware from settings
+    # Configure CORS middleware from settings.
+    # FastAPI/Starlette rejects add_middleware after the app has started
+    # (RuntimeError: "Cannot add middleware after an application has
+    # started"). In tests that call init_server repeatedly across modules
+    # — e.g. test_server_e2e + test_exclusive_pinned_e2e in one session —
+    # the second call fires after the first module's lifespan started the
+    # app. Guard with a sentinel so we add once; in production init_server
+    # is only invoked at startup so the guard is a no-op there.
     cors_origins = global_settings.server.cors_origins if global_settings else ["*"]
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=cors_origins,
-        allow_credentials=False,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-    logger.info(f"CORS origins: {cors_origins}")
+    if not getattr(app.state, "_cors_added", False):
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=cors_origins,
+            allow_credentials=False,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+        app.state._cors_added = True
+        logger.info(f"CORS origins: {cors_origins}")
+    else:
+        logger.debug(
+            "CORS middleware already added; skipping (cors_origins=%s)",
+            cors_origins,
+        )
 
     # Initialize model settings manager
     base_path = Path(global_settings.base_path) if global_settings else Path.home() / ".omlx"
