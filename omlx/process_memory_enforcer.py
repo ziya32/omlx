@@ -317,12 +317,35 @@ class ProcessMemoryEnforcer:
 
         async with self._engine_pool._lock:
             while self._current_usage_bytes() > target:
-                # _find_drain_or_evict_candidate is the drain-aware
-                # successor to main's _find_lru_victim: same LRU-of-
-                # non-pinned semantics but also skips models in
-                # DRAINING/LOADING/UNLOADING states and prefers idle
-                # over busy candidates. See EnginePool.
+                # ``_find_drain_or_evict_candidate`` (drain-aware
+                # successor of pre-v0.3.9 ``_find_lru_victim``)
+                # returns the LRU non-pinned model, skipping
+                # DRAINING/LOADING/UNLOADING. It prefers idle but
+                # falls back to busy if no idle candidates.
+                #
+                # Under SOFT pressure we don't want to abort in-flight
+                # requests just to hit the watermark — pre-v0.3.9
+                # semantics let busy models fall through to the
+                # "no non-pinned victim" branch (gentle pinned-abort
+                # only on HARD). Replicate that by treating a busy
+                # victim as "no victim" when level == "soft".
                 victim = self._engine_pool._find_drain_or_evict_candidate()
+                if victim is not None and new_level == "soft":
+                    v_entry = self._engine_pool._entries.get(victim)
+                    if v_entry is not None and v_entry.engine is not None:
+                        try:
+                            v_busy = (
+                                v_entry.engine.has_active_requests()
+                                or getattr(v_entry, "active_uses", 0) > 0
+                            )
+                        except (AttributeError, TypeError):
+                            v_busy = False
+                        if v_busy is True:
+                            # All non-pinned victims are busy at SOFT —
+                            # fall through to the pinned-aborts branch
+                            # (it short-circuits under SOFT and just
+                            # waits for the next tick).
+                            victim = None
                 if victim is not None:
                     loaded_non_pinned = [
                         mid
