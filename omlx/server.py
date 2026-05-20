@@ -1227,6 +1227,38 @@ def _resolve_chat_template_settings(
     return merged_ct_kwargs, forced_keys, max_tool_result_tokens, reasoning_parser
 
 
+def _auto_set_thinking_ct_kwargs(
+    merged_ct_kwargs: dict,
+    thinking_budget: int | None,
+    resolved_model: str,
+) -> None:
+    """Auto-fill ``enable_thinking`` / ``preserve_thinking`` in chat template
+    kwargs based on the active thinking_budget and the model's template
+    support.
+
+    - ``enable_thinking``: set True when a thinking_budget is active (from
+      request or model settings) and the caller hasn't already pinned it.
+      Some templates (Gemma 4) suppress thinking otherwise.
+    - ``preserve_thinking``: set True only when the engine_pool entry
+      advertises ``preserve_thinking_default = True`` (Qwen 3.6+) and
+      enable_thinking isn't explicitly False. Gated on detection so
+      strict templates don't reject an unknown kwarg.
+
+    Mutates ``merged_ct_kwargs`` in place.
+    """
+    if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:
+        merged_ct_kwargs["enable_thinking"] = True
+
+    _entry = get_engine_pool().get_entry(resolved_model)
+    if (
+        _entry is not None
+        and _entry.preserve_thinking_default is True
+        and merged_ct_kwargs.get("enable_thinking") is not False
+        and "preserve_thinking" not in merged_ct_kwargs
+    ):
+        merged_ct_kwargs["preserve_thinking"] = True
+
+
 def _get_ocr_defaults(model_id: str | None) -> dict | None:
     """Get OCR generation defaults for a model, or None if not an OCR model."""
     if model_id is None:
@@ -2600,24 +2632,7 @@ async def create_chat_completion(
         if thinking_budget is not None:
             chat_kwargs["thinking_budget"] = thinking_budget
 
-        # Auto-set enable_thinking in chat template kwargs when a thinking
-        # budget is active (from request or model settings).  Some chat
-        # templates (e.g. Gemma 4) explicitly suppress thinking unless this
-        # kwarg is True.
-        if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:
-            merged_ct_kwargs["enable_thinking"] = True
-
-        # Auto-set preserve_thinking only when the template advertises support
-        # for it (Qwen 3.6+). Other templates silently ignore unknown kwargs
-        # today but strict templates could raise, so gate on the detected flag.
-        _entry = get_engine_pool().get_entry(resolved_model)
-        if (
-            _entry is not None
-            and _entry.preserve_thinking_default is True
-            and merged_ct_kwargs.get("enable_thinking") is not False
-            and "preserve_thinking" not in merged_ct_kwargs
-        ):
-            merged_ct_kwargs["preserve_thinking"] = True
+        _auto_set_thinking_ct_kwargs(merged_ct_kwargs, thinking_budget, resolved_model)
 
         # Add compiled grammar for logit-level structured output.
         # When a reasoning_parser is configured, the structural tag includes
@@ -3905,23 +3920,7 @@ async def create_anthropic_message(
         if thinking_budget is not None:
             chat_kwargs["thinking_budget"] = thinking_budget
 
-        # Auto-set enable_thinking in chat template kwargs when a thinking
-        # budget is active but enable_thinking was not already set (e.g. via
-        # the Anthropic thinking.type field above or model settings).
-        if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:
-            merged_ct_kwargs["enable_thinking"] = True
-
-        # Auto-set preserve_thinking only when the template advertises support
-        # for it (Qwen 3.6+). Gated on detection so other templates don't
-        # receive an unknown kwarg.
-        _entry = get_engine_pool().get_entry(resolved_model)
-        if (
-            _entry is not None
-            and _entry.preserve_thinking_default is True
-            and merged_ct_kwargs.get("enable_thinking") is not False
-            and "preserve_thinking" not in merged_ct_kwargs
-        ):
-            merged_ct_kwargs["preserve_thinking"] = True
+        _auto_set_thinking_ct_kwargs(merged_ct_kwargs, thinking_budget, resolved_model)
 
         # Merge MCP tools with user-provided Anthropic tools
         user_internal = convert_anthropic_tools_to_internal(request.tools)
@@ -4373,21 +4372,11 @@ async def create_response(
         if thinking_budget is not None:
             chat_kwargs["thinking_budget"] = thinking_budget
 
-        # Auto-set enable_thinking when thinking budget is active.
-        if thinking_budget is not None and "enable_thinking" not in merged_ct_kwargs:
-            merged_ct_kwargs["enable_thinking"] = True
+        _auto_set_thinking_ct_kwargs(merged_ct_kwargs, thinking_budget, resolved_model)
 
-        # Auto-set preserve_thinking only when the template advertises support
-        # for it (Qwen 3.6+). Gated on detection so other templates don't
-        # receive an unknown kwarg.
+        # native_reasoning is also consumed later for thinking-block extraction.
         _entry = get_engine_pool().get_entry(resolved_model)
         native_reasoning = bool(_entry and _entry.preserve_thinking_default is True)
-        if (
-            native_reasoning
-            and merged_ct_kwargs.get("enable_thinking") is not False
-            and "preserve_thinking" not in merged_ct_kwargs
-        ):
-            merged_ct_kwargs["preserve_thinking"] = True
 
         # Add compiled grammar for logit-level structured output.
         if compiled_grammar is not None:
