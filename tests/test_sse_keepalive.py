@@ -155,11 +155,30 @@ class TestKeepaliveChunkFormats:
 class TestResolveKeepalive:
     """Tests for _resolve_keepalive helper that maps settings to wire format."""
 
+    @pytest.fixture(autouse=True)
+    def _ensure_global_settings(self):
+        """Initialize ``_server_state.global_settings`` for the test.
+
+        ``_resolve_keepalive`` reads ``global_settings.server.sse_keepalive_mode``
+        and returns None when ``global_settings`` is None. Production code
+        always has it set (``init_server`` populates it from a config file);
+        in test-only mode we install a fresh ``GlobalSettings`` so the
+        function-under-test reaches its real branches.
+        """
+        from omlx.server import _server_state
+        from omlx.settings import GlobalSettings
+
+        original = _server_state.global_settings
+        if original is None:
+            _server_state.global_settings = GlobalSettings()
+        try:
+            yield
+        finally:
+            _server_state.global_settings = original
+
     def _set_mode(self, mode: str):
         from omlx.server import _server_state
 
-        if _server_state.global_settings is None:
-            pytest.skip("global_settings not initialized")
         _server_state.global_settings.server.sse_keepalive_mode = mode
 
     def test_chunk_mode_returns_protocol_specific_frames(self):
@@ -171,8 +190,6 @@ class TestResolveKeepalive:
             _server_state,
         )
 
-        if _server_state.global_settings is None:
-            pytest.skip("global_settings not initialized")
         original = _server_state.global_settings.server.sse_keepalive_mode
         try:
             self._set_mode("chunk")
@@ -187,8 +204,6 @@ class TestResolveKeepalive:
     def test_comment_mode_returns_legacy_comment(self):
         from omlx.server import _KEEPALIVE_COMMENT, _resolve_keepalive, _server_state
 
-        if _server_state.global_settings is None:
-            pytest.skip("global_settings not initialized")
         original = _server_state.global_settings.server.sse_keepalive_mode
         try:
             self._set_mode("comment")
@@ -200,8 +215,6 @@ class TestResolveKeepalive:
     def test_off_mode_returns_none(self):
         from omlx.server import _resolve_keepalive, _server_state
 
-        if _server_state.global_settings is None:
-            pytest.skip("global_settings not initialized")
         original = _server_state.global_settings.server.sse_keepalive_mode
         try:
             self._set_mode("off")

@@ -236,7 +236,7 @@ class TestCompileWithStructuralTag:
     @patch("xgrammar.get_builtin_structural_tag")
     def test_calls_get_builtin_structural_tag(self, mock_get_tag):
         """Verifies xgrammar.get_builtin_structural_tag is called with correct args."""
-        xgr = pytest.importorskip("xgrammar")
+        pytest.importorskip("xgrammar")
 
         mock_tag = MagicMock()
         mock_tag.model_dump.return_value = {
@@ -258,7 +258,7 @@ class TestCompileWithStructuralTag:
     @requires_xgrammar
     @patch("xgrammar.get_builtin_structural_tag")
     def test_reasoning_false_when_thinking_disabled(self, mock_get_tag):
-        xgr = pytest.importorskip("xgrammar")
+        pytest.importorskip("xgrammar")
 
         mock_tag = MagicMock()
         mock_tag.model_dump.return_value = {
@@ -279,7 +279,7 @@ class TestCompileWithStructuralTag:
     @patch("xgrammar.get_builtin_structural_tag")
     def test_patches_user_grammar_into_tag(self, mock_get_tag):
         """The user's grammar should replace the any_text in the tag."""
-        xgr = pytest.importorskip("xgrammar")
+        pytest.importorskip("xgrammar")
 
         mock_tag = MagicMock()
         mock_tag.model_dump.return_value = {
@@ -735,39 +735,15 @@ class TestGrammarProcessorAdvance:
         assert isinstance(proc.matcher, xgr.GrammarMatcher)
 
 
-# =========================================================================
-# _apply_batched_grammar (scheduler _step integration)
-# =========================================================================
-
-class TestApplyBatchedGrammar:
-    """Tests for the batched grammar path in _step."""
-
-    @pytest.fixture()
-    def setup(self):
-        xgr = pytest.importorskip("xgrammar")
-        vocab = [f"<tok_{i}>" for i in range(256)]
-        vocab[ord("a")] = "a"
-        vocab[ord("b")] = "b"
-        vocab[ord("{")] = "{"
-        vocab[ord("}")] = "}"
-        ti = xgr.TokenizerInfo(vocab)
-        comp = xgr.GrammarCompiler(ti)
-        return comp, len(vocab)
-
-    @pytest.mark.skip(reason="Batched grammar optimization removed in mlx-lm BatchGenerator refactor. Grammar now runs via per-request logits_processors in GenerationBatch._step().")
-    def test_batched_grammar_masks_logits(self, setup):
-        """Batched grammar correctly masks logits for multiple requests."""
-        pass
-
-    @pytest.mark.skip(reason="Batched grammar optimization removed in mlx-lm BatchGenerator refactor. Grammar now runs via per-request logits_processors in GenerationBatch._step().")
-    def test_non_grammar_processors_still_run(self, setup):
-        """ThinkingBudgetProcessor and other processors still run per-request."""
-        pass
-
-    @pytest.mark.skip(reason="Batched grammar optimization removed in mlx-lm BatchGenerator refactor. Grammar now runs via per-request logits_processors in GenerationBatch._step().")
-    def test_terminated_processors_skipped(self, setup):
-        """Terminated grammar processors don't participate in batch fill."""
-        pass
+# Note: a former ``TestApplyBatchedGrammar`` class covered the batched
+# grammar optimization that lived in the old ``Scheduler._step`` path.
+# That optimization was removed when mlx-lm's BatchGenerator refactor
+# moved grammar to per-request ``logits_processors`` in
+# ``GenerationBatch._step``. Its replacement is exercised by
+# ``TestGrammarConstraintProcessor``, ``TestSchedulerGrammarPath``, and
+# ``TestGrammarProcessorAdvance`` above, plus
+# ``tests/test_scheduler_logits_processors.py`` — the deleted tests had
+# empty bodies and were dead documentation.
 
 
 # =========================================================================
