@@ -412,29 +412,23 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Include MCP routes. Wire MCP's per-route _verify_auth dep to verify_api_key
-# so the router's dependencies=[Depends(verify_api_key)] is not the only
-# layer (avoid duplicated 401 paths and keeps test-injectable seams that
-# bypass server-state Bearer enforcement working in production too).
+# Include MCP routes. Auth is gated at the router level via
+# ``dependencies=[Depends(verify_api_key)]``; tests that exercise the
+# bare router (not via the production app) install their own auth or
+# accept the unauthenticated default.
 from .api.mcp_routes import router as mcp_router, set_mcp_manager_getter
-from .api.mcp_routes import set_auth_dependency as _set_mcp_auth_dependency
 set_mcp_manager_getter(get_mcp_manager)
-_set_mcp_auth_dependency(verify_api_key)
 app.include_router(mcp_router, dependencies=[Depends(verify_api_key)])
 
 # Include audio routes only when mlx-audio is installed.
 # audio_routes.py itself only imports fastapi/stdlib at module level, so it
 # would always import successfully — we need an explicit mlx-audio check.
-# Wire audio_routes' _verify_auth + settings manager getter; without this
-# every /v1/audio/* endpoint returns 401 "Auth not configured".
 try:
     import mlx_audio as _  # noqa: F401
     from .api.audio_routes import (
         router as audio_router,
-        set_auth_dependency as _set_audio_auth_dependency,
         set_settings_manager_getter as _set_audio_settings_getter,
     )
-    _set_audio_auth_dependency(verify_api_key)
     _set_audio_settings_getter(lambda: _server_state.settings_manager)
     app.include_router(audio_router, dependencies=[Depends(verify_api_key)])
     del _
@@ -1187,6 +1181,50 @@ def resolve_model_id(model_id: str | None) -> str | None:
     if pool is None:
         return model_id
     return pool.resolve_model_id(model_id, _server_state.settings_manager)
+
+
+def _resolve_chat_template_settings(
+    resolved_model: str,
+    request_chat_template_kwargs: dict | None = None,
+) -> tuple[dict, set[str], int | None, str | None]:
+    """Build merged chat-template kwargs + forced_keys + per-model settings.
+
+    Pulls ``chat_template_kwargs`` / ``enable_thinking`` / ``preserve_thinking``
+    from ModelSettings, then layers ``request_chat_template_kwargs`` on top
+    (skipping keys in ``forced_ct_kwargs``). Used by every endpoint that
+    builds a chat-template invocation — chat completions, anthropic
+    messages, and responses.
+
+    ``request_chat_template_kwargs`` is None for endpoints whose request
+    body doesn't carry chat_template_kwargs (e.g. /v1/responses).
+
+    Returns:
+        (merged_ct_kwargs, forced_keys, max_tool_result_tokens,
+         reasoning_parser).
+    """
+    merged_ct_kwargs: dict = {}
+    forced_keys: set[str] = set()
+    max_tool_result_tokens: int | None = None
+    reasoning_parser: str | None = None
+    if _server_state.settings_manager:
+        ms = _server_state.settings_manager.get_settings(resolved_model)
+        max_tool_result_tokens = ms.max_tool_result_tokens
+        reasoning_parser = ms.reasoning_parser
+        if ms.chat_template_kwargs:
+            merged_ct_kwargs.update(ms.chat_template_kwargs)
+        forced_keys = set(ms.forced_ct_kwargs or [])
+        # Dedicated enable_thinking toggle takes precedence over chat_template_kwargs
+        if ms.enable_thinking is not None:
+            merged_ct_kwargs["enable_thinking"] = ms.enable_thinking
+        # preserve_thinking: keep <think> blocks in historical turns (Qwen 3.6+)
+        if ms.preserve_thinking is not None:
+            merged_ct_kwargs["preserve_thinking"] = ms.preserve_thinking
+    # Per-request kwargs override model settings (except forced keys)
+    if request_chat_template_kwargs:
+        for k, v in request_chat_template_kwargs.items():
+            if k not in forced_keys:
+                merged_ct_kwargs[k] = v
+    return merged_ct_kwargs, forced_keys, max_tool_result_tokens, reasoning_parser
 
 
 def _get_ocr_defaults(model_id: str | None) -> dict | None:
@@ -2437,29 +2475,15 @@ async def create_chat_completion(
         engine = await get_engine_for_model(request.model, resolved_id=resolved_model)
         model_load_duration = time.perf_counter() - load_start
 
-        # Get per-model settings
-        max_tool_result_tokens = None
-        merged_ct_kwargs = {}
-        forced_keys: set[str] = set()
-        reasoning_parser = None
-        if _server_state.settings_manager:
-            ms = _server_state.settings_manager.get_settings(resolved_model)
-            max_tool_result_tokens = ms.max_tool_result_tokens
-            reasoning_parser = ms.reasoning_parser
-            if ms.chat_template_kwargs:
-                merged_ct_kwargs.update(ms.chat_template_kwargs)
-            forced_keys = set(ms.forced_ct_kwargs or [])
-            # Dedicated enable_thinking toggle takes precedence over chat_template_kwargs
-            if ms.enable_thinking is not None:
-                merged_ct_kwargs["enable_thinking"] = ms.enable_thinking
-            # preserve_thinking: keep <think> blocks in historical turns (Qwen 3.6+)
-            if ms.preserve_thinking is not None:
-                merged_ct_kwargs["preserve_thinking"] = ms.preserve_thinking
-        # Per-request kwargs override model settings (except forced keys)
-        if request.chat_template_kwargs:
-            for k, v in request.chat_template_kwargs.items():
-                if k not in forced_keys:
-                    merged_ct_kwargs[k] = v
+        # Get per-model settings (chat-template merge + forced keys)
+        (
+            merged_ct_kwargs,
+            forced_keys,
+            max_tool_result_tokens,
+            reasoning_parser,
+        ) = _resolve_chat_template_settings(
+            resolved_model, request.chat_template_kwargs
+        )
 
         # Extract messages - different engines need different content handling.
         # Templates that expose message.reasoning_content natively (Qwen 3.6+)
@@ -2623,14 +2647,20 @@ async def create_chat_completion(
         # SpecPrefill: per-request overrides (fall back to model_settings)
         if request.specprefill is not None:
             chat_kwargs["specprefill"] = request.specprefill
+        # ms is no longer in scope (helper consumes it) — re-fetch once for
+        # specprefill_*. Cheap dict lookup; only this endpoint uses it.
+        _ms = (
+            _server_state.settings_manager.get_settings(resolved_model)
+            if _server_state.settings_manager else None
+        )
         if request.specprefill_keep_pct is not None:
             chat_kwargs["specprefill_keep_pct"] = request.specprefill_keep_pct
-        elif _server_state.settings_manager and ms.specprefill_keep_pct is not None:
-            chat_kwargs["specprefill_keep_pct"] = ms.specprefill_keep_pct
+        elif _ms is not None and _ms.specprefill_keep_pct is not None:
+            chat_kwargs["specprefill_keep_pct"] = _ms.specprefill_keep_pct
         if getattr(request, "specprefill_threshold", None) is not None:
             chat_kwargs["specprefill_threshold"] = request.specprefill_threshold
-        elif _server_state.settings_manager and ms.specprefill_threshold is not None:
-            chat_kwargs["specprefill_threshold"] = ms.specprefill_threshold
+        elif _ms is not None and _ms.specprefill_threshold is not None:
+            chat_kwargs["specprefill_threshold"] = _ms.specprefill_threshold
 
         if request.stop:
             chat_kwargs["stop"] = request.stop
@@ -3802,27 +3832,15 @@ async def create_anthropic_message(
     try:
         engine = await get_engine_for_model(request.model, resolved_id=resolved_model)
 
-        # Get per-model settings
-        max_tool_result_tokens = None
-        merged_ct_kwargs = {}
-        forced_keys: set[str] = set()
-        if _server_state.settings_manager:
-            ms = _server_state.settings_manager.get_settings(resolved_model)
-            max_tool_result_tokens = ms.max_tool_result_tokens
-            if ms.chat_template_kwargs:
-                merged_ct_kwargs.update(ms.chat_template_kwargs)
-            forced_keys = set(ms.forced_ct_kwargs or [])
-            # Dedicated enable_thinking toggle takes precedence over chat_template_kwargs
-            if ms.enable_thinking is not None:
-                merged_ct_kwargs["enable_thinking"] = ms.enable_thinking
-            # preserve_thinking: keep <think> blocks in historical turns (Qwen 3.6+)
-            if ms.preserve_thinking is not None:
-                merged_ct_kwargs["preserve_thinking"] = ms.preserve_thinking
-        # Per-request kwargs override model settings (except forced keys)
-        if request.chat_template_kwargs:
-            for k, v in request.chat_template_kwargs.items():
-                if k not in forced_keys:
-                    merged_ct_kwargs[k] = v
+        # Get per-model settings (chat-template merge + forced keys)
+        (
+            merged_ct_kwargs,
+            forced_keys,
+            max_tool_result_tokens,
+            _,  # reasoning_parser not used in anthropic path
+        ) = _resolve_chat_template_settings(
+            resolved_model, request.chat_template_kwargs
+        )
 
         # Pass Anthropic thinking config to chat template (except forced keys)
         if hasattr(request, 'thinking') and request.thinking:
@@ -4247,20 +4265,15 @@ async def create_response(
         # Convert tools: flat → nested
         openai_tools = convert_responses_tools(request.tools)
 
-        # Get per-model settings
-        merged_ct_kwargs = {}
-        reasoning_parser = None
-        if _server_state.settings_manager:
-            ms = _server_state.settings_manager.get_settings(resolved_model)
-            reasoning_parser = ms.reasoning_parser
-            if ms.chat_template_kwargs:
-                merged_ct_kwargs.update(ms.chat_template_kwargs)
-            # Dedicated enable_thinking toggle takes precedence over chat_template_kwargs
-            if ms.enable_thinking is not None:
-                merged_ct_kwargs["enable_thinking"] = ms.enable_thinking
-            # preserve_thinking: keep <think> blocks in historical turns (Qwen 3.6+)
-            if ms.preserve_thinking is not None:
-                merged_ct_kwargs["preserve_thinking"] = ms.preserve_thinking
+        # Get per-model settings (chat-template merge + forced keys).
+        # /v1/responses doesn't carry chat_template_kwargs on the request body,
+        # so request_chat_template_kwargs=None.
+        (
+            merged_ct_kwargs,
+            _,  # forced_keys not used: no per-request kwargs to override
+            _,  # max_tool_result_tokens not consumed in responses path
+            reasoning_parser,
+        ) = _resolve_chat_template_settings(resolved_model, None)
 
         # Note: extract_text_content/extract_harmony_messages/extract_multimodal_content
         # are NOT called here because convert_responses_input_to_messages() already

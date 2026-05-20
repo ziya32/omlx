@@ -294,6 +294,18 @@ class MockEnginePool:
             raise ValueError(f"No reranker engine for {model_id}")
         return self._llm_engine
 
+    def acquire_engine(self, model_id: str) -> None:
+        """No-op for tests — production tracks active_uses for eviction guards."""
+
+    def release_engine(self, model_id: str) -> None:
+        """No-op for tests — production decrements active_uses."""
+
+    def ensure_engine_alive(self, model_id: str, engine_ref) -> None:
+        """No-op for tests — production raises EngineEvictedError on race."""
+
+    def get_loaded_model_ids(self) -> List[str]:
+        return [m["id"] for m in self._models if m["loaded"]]
+
 
 @pytest.fixture
 def mock_llm_engine():
@@ -327,22 +339,15 @@ def mock_engine_pool(mock_llm_engine, mock_embedding_engine, mock_reranker_engin
 def client(mock_engine_pool):
     """Create a test client with mocked server state."""
     from omlx.server import app, _server_state
-    from omlx.api.mcp_routes import set_auth_dependency as _set_mcp_auth
 
     # Store original state
     original_pool = _server_state.engine_pool
     original_default = _server_state.default_model
 
-    # Set mock state
+    # Set mock state. api_key stays at its default (None), so the router-
+    # level verify_api_key returns True without a token.
     _server_state.engine_pool = mock_engine_pool
     _server_state.default_model = "test-model"
-
-    # The MCP router's _verify_auth raises 401 until set_auth_dependency
-    # is wired (server.py does this at startup; TestClient bypasses the
-    # lifespan path that wires it). Permissive dep + teardown restore.
-    async def _permit(request=None, credentials=None) -> bool:
-        return True
-    _set_mcp_auth(_permit)
 
     try:
         yield TestClient(app)
@@ -350,7 +355,6 @@ def client(mock_engine_pool):
         # Restore original state
         _server_state.engine_pool = original_pool
         _server_state.default_model = original_default
-        _set_mcp_auth(None)
 
 
 class TestHealthEndpoint:

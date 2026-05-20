@@ -95,20 +95,11 @@ def client_with_import_error_pool(import_error_pool):
             default_language=None,
         )
 
-        # Bypass the audio router's _verify_auth dep (separate layer from
-        # server-level verify_api_key).
-        import omlx.api.audio_routes as ar
-        original_auth = ar._auth_dependency
-
-        async def _allow(request, credentials=None):
-            return True
-
-        ar._auth_dependency = _allow
-        try:
-            with TestClient(app, raise_server_exceptions=False) as client:
-                yield client
-        finally:
-            ar._auth_dependency = original_auth
+        # Router-level verify_api_key returns True when api_key is None
+        # (the mock above sets it via mock_state.api_key = None), so the
+        # endpoint chain runs unauthenticated for these capability tests.
+        with TestClient(app, raise_server_exceptions=False) as client:
+            yield client
 
 
 # ---------------------------------------------------------------------------
@@ -287,18 +278,10 @@ class TestNoMlxAudioRoutes:
             mock_state.ms_downloader = None
             mock_state.mcp_manager = None
 
-            import omlx.api.audio_routes as ar
-            original_auth = ar._auth_dependency
-
-            async def _allow(request, credentials=None):
-                return True
-
-            ar._auth_dependency = _allow
-            try:
-                with TestClient(app, raise_server_exceptions=False) as client:
-                    resp = client.get("/v1/audio/speakers?model=fake-tts")
-            finally:
-                ar._auth_dependency = original_auth
+            # api_key=None above → router-level verify_api_key passes
+            # without a token.
+            with TestClient(app, raise_server_exceptions=False) as client:
+                resp = client.get("/v1/audio/speakers?model=fake-tts")
 
         assert resp.status_code == 200
         assert resp.json() == {"speakers": []}

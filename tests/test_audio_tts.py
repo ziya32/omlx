@@ -87,31 +87,6 @@ def _ensure_audio_routes(app):
         app.include_router(audio_router)
 
 
-@pytest.fixture(autouse=True)
-def _permissive_audio_auth():
-    """Auto-wire the audio router's _verify_auth dependency for every test
-    in this module.
-
-    The audio router's ``_verify_auth`` raises 401 "Auth not configured"
-    until ``set_auth_dependency()`` is called — server.py does this at
-    startup, but TestClient bypasses that path. Without this fixture
-    every TTS test that POSTs to ``/v1/audio/speech`` lands on 401 instead
-    of reaching the mocked engine. Module-scoped autouse so it applies to
-    the dedicated ``server_tts_client`` fixture and to the inline
-    TestClient blocks in TestTTSStreamingResponse / TestTTSPCMStreaming /
-    TestTTSVoiceCloneEndpoint without duplicating boilerplate.
-    """
-    from omlx.api.audio_routes import set_auth_dependency
-
-    async def _permit(request=None, credentials=None) -> bool:
-        return True
-    set_auth_dependency(_permit)
-    try:
-        yield
-    finally:
-        set_auth_dependency(None)
-
-
 @pytest.fixture
 def server_tts_client():
     """TestClient using the full omlx server app with mocked TTS pool."""

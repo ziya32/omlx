@@ -352,41 +352,18 @@ class TTSEngine(BaseNonStreamingEngine):
             gen_kwargs.update(kwargs)
             return gen_kwargs
 
-        def _synthesize_sync():
-            # model.generate() returns an iterable of results,
-            # each with .audio (array) and .sample_rate (int).
-            gen_kwargs = _build_generate_kwargs()
+        def _create_gen():
+            # iter() so a model.generate() that returns a list (mocks,
+            # eager iterables) still supports next(g, None) per segment.
+            return iter(model.generate(**_build_generate_kwargs()))
 
-            results = model.generate(**gen_kwargs)
+        _SEG_DONE = object()
 
-            # Prefer model.sample_rate (Qwen3-TTS), but fall back to the
-            # first result segment's sample_rate (mock and mlx-audio paths)
-            # and finally the default.
-            model_sr = getattr(model, "sample_rate", None)
-            if isinstance(model_sr, (int, float)):
-                sample_rate = int(model_sr)
-            else:
-                sample_rate = None
+        def _next_seg(g):
+            return next(g, _SEG_DONE)
 
-            audio_chunks = []
-
-            for i, result in enumerate(results):
-                audio = result.audio
-                if isinstance(audio, mx.array) and audio.dtype == mx.bfloat16:
-                    audio = audio.astype(mx.float32)
-                audio_chunks.append(np.array(audio))
-                if sample_rate is None:
-                    seg_sr = getattr(result, "sample_rate", None)
-                    if isinstance(seg_sr, (int, float)):
-                        sample_rate = int(seg_sr)
-
-            if sample_rate is None:
-                sample_rate = _DEFAULT_SAMPLE_RATE
-
-            if not audio_chunks:
-                raise RuntimeError("TTS model produced no audio output")
-
-            audio = np.concatenate(audio_chunks, axis=0)
+        def _finalize(chunks, sample_rate):
+            audio = np.concatenate(chunks, axis=0)
             wav_bytes = _audio_to_wav_bytes(audio, sample_rate)
             duration = len(audio) / sample_rate if sample_rate else 0.0
             return SpeechOutput(
@@ -402,8 +379,45 @@ class TTSEngine(BaseNonStreamingEngine):
         )
         try:
             loop = asyncio.get_running_loop()
+            executor = get_mlx_executor()
+
+            # Step 1: create the generator on the executor (quick).
+            gen = await loop.run_in_executor(executor, _create_gen)
+            self._raise_if_aborted()
+
+            # Prefer model.sample_rate (Qwen3-TTS), fall back to the first
+            # segment's sample_rate, finally _DEFAULT_SAMPLE_RATE.
+            model_sr = getattr(model, "sample_rate", None)
+            sample_rate = int(model_sr) if isinstance(model_sr, (int, float)) else None
+
+            # Step 2: consume one segment per executor call. Yields the
+            # event loop between segments so LLM/VLM scheduler.step() can
+            # interleave on the same single-threaded MLX executor — without
+            # this, a long TTS synth blocks every other engine.
+            audio_chunks: list[np.ndarray] = []
+            while True:
+                seg = await loop.run_in_executor(executor, _next_seg, gen)
+                # Abort between segments — discards any computed segments.
+                self._raise_if_aborted()
+                if seg is _SEG_DONE:
+                    break
+                audio = seg.audio
+                if isinstance(audio, mx.array) and audio.dtype == mx.bfloat16:
+                    audio = audio.astype(mx.float32)
+                audio_chunks.append(np.array(audio))
+                if sample_rate is None:
+                    seg_sr = getattr(seg, "sample_rate", None)
+                    if isinstance(seg_sr, (int, float)):
+                        sample_rate = int(seg_sr)
+
+            if sample_rate is None:
+                sample_rate = _DEFAULT_SAMPLE_RATE
+            if not audio_chunks:
+                raise RuntimeError("TTS model produced no audio output")
+
+            # Step 3: concatenate + WAV-encode on the executor (numpy + io).
             result = await loop.run_in_executor(
-                get_mlx_executor(), _synthesize_sync
+                executor, _finalize, audio_chunks, sample_rate
             )
 
             elapsed = time.monotonic() - t0
@@ -519,6 +533,9 @@ class TTSEngine(BaseNonStreamingEngine):
             loop = asyncio.get_running_loop()
             while True:
                 chunk = await loop.run_in_executor(get_mlx_executor(), _next_pcm_chunk)
+                # Abort between PCM chunks — discards any in-flight chunk
+                # and surfaces RequestAbortedError to the streaming handler.
+                self._raise_if_aborted()
                 if chunk is sentinel:
                     break
                 if chunk is None:

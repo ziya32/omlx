@@ -25,9 +25,8 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncIterator, Optional
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import PlainTextResponse, Response, StreamingResponse
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from ..engine.audio_utils import wav_bytes_to_pcm_frames, wav_header
 from .audio_models import (
@@ -62,27 +61,11 @@ _VIDEO_CONTAINERS = {".mp4", ".mkv", ".mov", ".m4v", ".webm", ".avi"}
 
 
 # ---------------------------------------------------------------------------
-# Auth dependency — wired by server.py via set_auth_dependency()
+# Auth wiring lives in server.py at router-include time via
+# ``app.include_router(audio_router, dependencies=[Depends(verify_api_key)])``.
+# Tests that mount the bare router get an unauthenticated router — install
+# auth via ``app.dependency_overrides`` or by re-including with a deps list.
 # ---------------------------------------------------------------------------
-
-_auth_dependency = None
-_security = HTTPBearer(auto_error=False)
-
-
-def set_auth_dependency(dep):
-    """Set the auth dependency function (called by server.py after verify_api_key is defined)."""
-    global _auth_dependency
-    _auth_dependency = dep
-
-
-async def _verify_auth(
-    request: Request,
-    credentials: HTTPAuthorizationCredentials = Depends(_security),
-) -> bool:
-    """Forward to server's verify_api_key if wired, otherwise reject."""
-    if _auth_dependency is None:
-        raise HTTPException(status_code=401, detail="Auth not configured")
-    return await _auth_dependency(request=request, credentials=credentials)
 
 
 # ---------------------------------------------------------------------------
@@ -607,7 +590,6 @@ async def _stream_with_prefetched_chunk(
 @router.post("/v1/audio/transcriptions")
 async def create_transcription(
     http_request: Request,
-    _: bool = Depends(_verify_auth),
 ):
     """
     Transcribe audio to text.
@@ -744,7 +726,6 @@ async def create_transcription(
 @router.post("/v1/audio/speech")
 async def create_speech(
     request: AudioSpeechRequest,
-    _: bool = Depends(_verify_auth),
 ):
     """
     Generate speech from text.
@@ -1004,7 +985,6 @@ async def create_speech(
 async def process_audio(
     file: UploadFile = File(...),
     model: str = Form(...),
-    _: bool = Depends(_verify_auth),
 ):
     """Audio processing endpoint (speech enhancement, source separation, STS).
 
@@ -1013,56 +993,44 @@ async def process_audio(
     SAMAudio, LFM2.5-Audio), and returns WAV bytes of the processed audio.
     """
     from omlx.engine.sts import STSEngine
-    from omlx.exceptions import ModelNotFoundError
 
-    pool = _get_engine_pool()
     model = _resolve_model(model)
 
-    # Load the engine via pool (handles model loading and LRU eviction)
-    try:
-        engine = await pool.get_engine(model)
-    except ModelNotFoundError as exc:
-        avail = ", ".join(exc.available_models) if exc.available_models else "(none)"
-        raise HTTPException(
-            status_code=404,
-            detail=f"Model '{model}' not found. Available: {avail}",
-        ) from exc
-    except ImportError as exc:
-        # See create_speech — 501 for missing optional dep (mlx-audio).
-        raise HTTPException(status_code=501, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    # Hold the engine lease for the duration of process() so STS doesn't
+    # race onto the single-threaded MLX executor alongside an exclusive
+    # VLM. Mirrors the LLM/embedding/rerank endpoints' acquire_engine
+    # pattern in server.py.
+    async with _use_engine(model) as engine:
+        if not isinstance(engine, STSEngine):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Model '{model}' is not a speech-to-speech / audio processing model",
+            )
 
-    if not isinstance(engine, STSEngine):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Model '{model}' is not a speech-to-speech / audio processing model",
-        )
+        # Save uploaded file to a temp path so the engine can open it by path.
+        # Remap video container extensions to .m4a so mlx-audio routes them
+        # through ffmpeg instead of miniaudio (which can't decode containers).
+        suffix = os.path.splitext(file.filename or "audio.wav")[1] or ".wav"
+        if suffix.lower() in _VIDEO_CONTAINERS:
+            suffix = ".m4a"
+        tmp_path = None
+        try:
+            content = await _read_upload(file)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp_path = tmp.name
+                tmp.write(content)
 
-    # Save uploaded file to a temp path so the engine can open it by path.
-    # Remap video container extensions to .m4a so mlx-audio routes them
-    # through ffmpeg instead of miniaudio (which can't decode containers).
-    suffix = os.path.splitext(file.filename or "audio.wav")[1] or ".wav"
-    if suffix.lower() in _VIDEO_CONTAINERS:
-        suffix = ".m4a"
-    tmp_path = None
-    try:
-        content = await _read_upload(file)
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp_path = tmp.name
-            tmp.write(content)
-
-        wav_bytes = await engine.process(tmp_path)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-    finally:
-        if tmp_path and os.path.exists(tmp_path):
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+            wav_bytes = await engine.process(tmp_path)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
     return Response(content=wav_bytes, media_type="audio/wav")
 
@@ -1070,7 +1038,6 @@ async def process_audio(
 @router.get("/v1/audio/speakers")
 async def list_speakers(
     model: str | None = None,
-    _: bool = Depends(_verify_auth),
 ) -> SpeakersResponse:
     """
     List available TTS speakers for a CustomVoice model.
@@ -1110,7 +1077,6 @@ async def list_speakers(
 @router.get("/v1/audio/languages")
 async def list_languages(
     model: str | None = None,
-    _: bool = Depends(_verify_auth),
 ) -> LanguagesResponse:
     """
     List supported languages for an ASR model.

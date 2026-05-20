@@ -83,25 +83,14 @@ def _make_mock_pool(stt_engine=None, model_id: str = "whisper-tiny") -> MagicMoc
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture(autouse=True)
-def _permissive_audio_auth():
-    """Auto-wire the audio router's _verify_auth dependency for every test
-    in this module — see test_audio_tts.py for full rationale.
-    """
-    from omlx.api.audio_routes import set_auth_dependency
-
-    async def _permit(request=None, credentials=None) -> bool:
-        return True
-    set_auth_dependency(_permit)
-    try:
-        yield
-    finally:
-        set_auth_dependency(None)
-
-
 @pytest.fixture
 def audio_client():
-    """TestClient for the audio router with a mocked STT engine."""
+    """TestClient for the audio router with a mocked STT engine.
+
+    The bare audio router carries no auth wiring (auth is applied by
+    server.py at include_router time via ``dependencies=[Depends(verify_api_key)]``);
+    mounting the router directly here gives us an unauthenticated app.
+    """
     from fastapi import FastAPI
 
     from omlx.api.audio_routes import router
@@ -139,7 +128,7 @@ class TestSTTEngineLanguageForwarding:
         normalizes "chinese" -> "zh" for the language token, and Qwen3-ASR
         lowercases its supported-language list before matching.
         """
-        from omlx.engine.stt import TranscriptionOutput, STTEngine
+        from omlx.engine.stt import STTEngine
 
         generate_call = {}
 
