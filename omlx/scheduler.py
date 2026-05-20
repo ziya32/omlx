@@ -1823,9 +1823,7 @@ class Scheduler:
             # See utils/proc_memory.py for why phys_footprint matters.
             if self._memory_limit_bytes > 0:
                 # Reuse the per-tick memory snapshot taken at step() start.
-                current = self._tick_memory_bytes or max(
-                    mx.get_active_memory(), get_phys_footprint()
-                )
+                current = self._current_tick_memory_bytes()
                 if (
                     self._memory_hard_limit_bytes > 0
                     and current > self._memory_hard_limit_bytes
@@ -2006,9 +2004,7 @@ class Scheduler:
         # before the kernel kills us.
         if self._memory_limit_bytes > 0:
             # Reuse the per-tick memory snapshot taken at step() start.
-            current = self._tick_memory_bytes or max(
-                mx.get_active_memory(), get_phys_footprint()
-            )
+            current = self._current_tick_memory_bytes()
             if (
                 self._memory_hard_limit_bytes > 0
                 and current > self._memory_hard_limit_bytes
@@ -4245,9 +4241,7 @@ class Scheduler:
             return None  # can't estimate, skip
 
         # Reuse the per-tick memory snapshot taken at step() start.
-        current = self._tick_memory_bytes or max(
-            mx.get_active_memory(), get_phys_footprint()
-        )
+        current = self._current_tick_memory_bytes()
 
         if current + peak > self._memory_hard_limit_bytes:
             from .utils.hardware import format_bytes
@@ -4323,9 +4317,7 @@ class Scheduler:
                 #      reconstruct_cache(). The next request's
                 #      cached_tokens drives this estimate.
                 # Reuse the per-tick memory snapshot taken at step() start.
-                current = self._tick_memory_bytes or max(
-                    mx.get_active_memory(), get_phys_footprint()
-                )
+                current = self._current_tick_memory_bytes()
                 per_request_estimate = (
                     int(self._model_size_bytes * 0.08)
                     if self._model_size_bytes > 0
@@ -6030,6 +6022,26 @@ class Scheduler:
         except Exception as e:
             logger.error(f"Failed to initialize paged SSD cache: {e}")
             self.paged_ssd_cache_manager = None
+
+    def _current_tick_memory_bytes(self) -> int:
+        """Return the per-tick jetsam-accurate memory snapshot.
+
+        The snapshot is taken at the start of each ``step()`` and cached
+        on ``self._tick_memory_bytes``. Callers reach for this rather than
+        calling ``max(mx.get_active_memory(), get_phys_footprint())``
+        directly so the 4-6 in-tick memory-guard sites share a single
+        kernel-syscall pair per step (see commit c07ad0b for the perf
+        rationale).
+
+        Falls back to a live measurement when invoked outside a
+        ``step()`` context (e.g. tests, admin tools) — the cached value
+        is reset to 0 between ticks, so a truthy check on
+        ``_tick_memory_bytes`` reliably picks the in-tick snapshot when
+        present.
+        """
+        return self._tick_memory_bytes or max(
+            mx.get_active_memory(), get_phys_footprint()
+        )
 
     def _check_memory_pressure(self) -> None:
         """Check memory and evict blocks if needed.
