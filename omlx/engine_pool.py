@@ -814,7 +814,21 @@ class EnginePool:
                     else:
                         if not isinstance(load_error, asyncio.CancelledError):
                             entry.load_error = load_error  # Set under lock
-                        entry.load_failed_at = time.time()
+                        # Skip the LOAD_COOLDOWN gate when the failure was
+                        # an enforcer-initiated abort. The model itself
+                        # didn't fail to load — memory pressure forced us
+                        # to drop it mid-load. Retries should be allowed
+                        # immediately so the client doesn't see 30s of
+                        # spurious 409s after a transient pressure spike.
+                        # ModelTooLargeError / InsufficientMemoryError do
+                        # need the cooldown (the model genuinely doesn't
+                        # fit; retrying for 30s won't change that).
+                        _aborted_for_pressure = (
+                            isinstance(load_error, ModelLoadingError)
+                            and "aborted" in str(load_error)
+                        )
+                        if not _aborted_for_pressure:
+                            entry.load_failed_at = time.time()
                         self._set_state(
                             entry, EngineState.UNLOADED, "load_failed"
                         )
