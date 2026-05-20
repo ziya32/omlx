@@ -303,7 +303,12 @@ class ProcessMemoryEnforcer:
 
         async with self._engine_pool._lock:
             while self._current_usage_bytes() > target:
-                victim = self._engine_pool._find_lru_victim()
+                # _find_drain_or_evict_candidate is the drain-aware
+                # successor to main's _find_lru_victim: same LRU-of-
+                # non-pinned semantics but also skips models in
+                # DRAINING/LOADING/UNLOADING states and prefers idle
+                # over busy candidates. See EnginePool.
+                victim = self._engine_pool._find_drain_or_evict_candidate()
                 if victim is not None:
                     loaded_non_pinned = [
                         mid

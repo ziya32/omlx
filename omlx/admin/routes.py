@@ -570,9 +570,10 @@ async def _apply_model_dirs_runtime(model_dirs: list[str]) -> tuple[bool, str]:
         except Exception as e:
             logger.warning(f"Error unloading {model_id}: {e}")
 
-    # Clear entries
+    # Clear entries. ``current_model_memory`` is now a @property that
+    # sums ACTIVE/DRAINING/LOADING/UNLOADING entries on demand — clearing
+    # _entries above brings it to 0; no cumulative counter to reset.
     pool._entries.clear()
-    pool._current_model_memory = 0
 
     # Update downloader model directories
     global _hf_downloader, _ms_downloader
@@ -669,10 +670,14 @@ async def _apply_max_model_memory_runtime(
         msg = f"Max model memory changed: {old_display} -> disabled (no limit)"
         return True, msg
 
-    # If current usage exceeds new limit, unload LRU models
+    # If current usage exceeds new limit, unload LRU models.
+    # ``current_model_memory`` is the public @property; ``_find_drain_
+    # _or_evict_candidate`` is the drain-aware successor to the
+    # pre-v0.3.9 ``_find_lru_victim`` (same non-pinned LRU semantics,
+    # skips DRAINING/LOADING/UNLOADING, prefers idle).
     unloaded = []
-    while pool._current_model_memory > max_memory_bytes:
-        victim = pool._find_lru_victim()
+    while pool.current_model_memory > max_memory_bytes:
+        victim = pool._find_drain_or_evict_candidate()
         if not victim:
             # All models are pinned, can't free more memory
             break
