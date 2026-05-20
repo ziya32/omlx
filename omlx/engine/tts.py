@@ -10,19 +10,110 @@ when mlx-audio is not installed.
 
 import asyncio
 import gc
+import json
 import logging
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 import mlx.core as mx
 import numpy as np
 
 from ..engine_core import get_mlx_executor
+from ..exceptions import AudioError
 from .audio_utils import DEFAULT_SAMPLE_RATE as _DEFAULT_SAMPLE_RATE
 from .audio_utils import audio_to_wav_bytes as _audio_to_wav_bytes
 from .base import BaseNonStreamingEngine
 
 logger = logging.getLogger(__name__)
+
+_SUPPORTED_FORMATS = {"wav", "mp3", "opus", "flac", "pcm"}
+
+_FORMAT_MEDIA_TYPES = {
+    "wav": "audio/wav",
+    "mp3": "audio/mpeg",
+    "opus": "audio/opus",
+    "flac": "audio/flac",
+    "pcm": "audio/pcm",
+}
+
+_FORMAT_EXTENSIONS = {
+    "wav": "wav",
+    "mp3": "mp3",
+    "opus": "opus",
+    "flac": "flac",
+    "pcm": "pcm",
+}
+
+
+def _convert_wav(wav_bytes: bytes, output_format: str, speed: float = 1.0) -> bytes:
+    """Convert WAV bytes to another audio format using ffmpeg.
+
+    Args:
+        wav_bytes: Input WAV audio bytes.
+        output_format: Target format ("mp3", "opus", "flac").
+        speed: Playback speed multiplier (0.25-4.0). 1.0 = no change.
+
+    Returns:
+        Converted audio bytes.
+
+    Raises:
+        AudioError: If ffmpeg is not available or conversion fails.
+    """
+    import shutil
+    import subprocess
+
+    ffmpeg_path = shutil.which("ffmpeg")
+    if not ffmpeg_path:
+        raise AudioError(
+            "ffmpeg is required for audio format conversion but was not found. "
+            "Install with: brew install ffmpeg"
+        )
+
+    cmd = [ffmpeg_path, "-i", "pipe:0", "-f", output_format]
+
+    # Apply speed change via atempo filter
+    if speed != 1.0:
+        filters = []
+        remaining = speed
+        while remaining > 2.0:
+            filters.append("atempo=2.0")
+            remaining /= 2.0
+        while remaining < 0.5:
+            filters.append("atempo=0.5")
+            remaining *= 2.0
+        filters.append(f"atempo={remaining}")
+        cmd.extend(["-af", ",".join(filters)])
+
+    cmd.extend(["-y", "pipe:1"])
+
+    try:
+        result = subprocess.run(
+            cmd,
+            input=wav_bytes,
+            capture_output=True,
+            timeout=300,
+        )
+    except FileNotFoundError:
+        raise AudioError("ffmpeg not found")
+    except subprocess.TimeoutExpired:
+        raise AudioError("Audio conversion timed out (>5 min)")
+
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="replace")[-500:]
+        raise AudioError(f"ffmpeg conversion failed: {stderr}")
+
+    return result.stdout
+
+
+@dataclass
+class SpeechOutput:
+    """Output from TTS synthesis."""
+
+    audio_bytes: bytes  # WAV file bytes
+    sample_rate: int = 24000
+    duration: float = 0.0  # seconds
 
 
 class TTSEngine(BaseNonStreamingEngine):
@@ -48,6 +139,7 @@ class TTSEngine(BaseNonStreamingEngine):
         self._model_name = model_name
         self._model = None
         self._kwargs = kwargs
+        self._variant = "custom_voice"  # Detected during start() via _detect_variant
 
     @staticmethod
     def _audio_array_to_pcm_bytes(audio: Any) -> bytes:
@@ -71,6 +163,23 @@ class TTSEngine(BaseNonStreamingEngine):
         except (TypeError, ValueError):
             return False
         return "stream" in gen_params and "streaming_interval" in gen_params
+
+    @staticmethod
+    def _detect_variant(model_path: str) -> str:
+        """Detect TTS variant from config.json tts_model_type field."""
+        config_path = Path(model_path) / "config.json"
+        if config_path.exists():
+            try:
+                with open(config_path) as f:
+                    config = json.load(f)
+                tts_type = config.get("tts_model_type", "")
+                if tts_type == "voice_design":
+                    return "voice_design"
+                if tts_type == "base":
+                    return "base"
+            except Exception:
+                pass
+        return "custom_voice"
 
     async def start(self) -> None:
         """Start the engine (load model if not loaded).
@@ -114,7 +223,10 @@ class TTSEngine(BaseNonStreamingEngine):
 
         loop = asyncio.get_running_loop()
         self._model = await loop.run_in_executor(get_mlx_executor(), _load_sync)
-        logger.info(f"TTS engine started: {self._model_name}")
+        self._variant = self._detect_variant(self._model_name)
+        logger.info(
+            f"TTS engine started: {self._model_name} (variant={self._variant})"
+        )
 
     async def stop(self) -> None:
         """Stop the engine and cleanup resources."""
@@ -150,7 +262,7 @@ class TTSEngine(BaseNonStreamingEngine):
         repetition_penalty: Optional[float] = None,
         max_tokens: Optional[int] = None,
         **kwargs,
-    ) -> bytes:
+    ) -> SpeechOutput:
         """
         Synthesize speech from text.
 
@@ -169,7 +281,7 @@ class TTSEngine(BaseNonStreamingEngine):
             **kwargs: Additional model-specific parameters
 
         Returns:
-            WAV-encoded bytes (RIFF header + 16-bit mono PCM)
+            SpeechOutput with WAV-encoded audio bytes, sample rate, and duration
         """
         # Cooperative-abort checkpoint BEFORE the model-None guard. Issue 4.
         self._raise_if_aborted()
@@ -188,6 +300,22 @@ class TTSEngine(BaseNonStreamingEngine):
         t0 = time.monotonic()
 
         def _build_generate_kwargs() -> Dict[str, Any]:
+            # VoiceDesign variant: always uses instruct, no signature inspection
+            if self._variant == "voice_design":
+                return {
+                    "text": text,
+                    "instruct": instructions or "A neutral narrator",
+                    **kwargs,
+                }
+
+            # Base variant with reference audio (voice cloning)
+            if self._variant == "base" and ref_audio:
+                kw: Dict[str, Any] = {"text": text, "ref_audio": ref_audio}
+                if ref_text:
+                    kw["ref_text"] = ref_text
+                kw.update(kwargs)
+                return kw
+
             gen_kwargs: Dict[str, Any] = {
                 "text": text,
                 "verbose": False,
@@ -231,21 +359,41 @@ class TTSEngine(BaseNonStreamingEngine):
 
             results = model.generate(**gen_kwargs)
 
-            # Use model.sample_rate if available (e.g. Qwen3-TTS)
-            sample_rate = getattr(model, "sample_rate", _DEFAULT_SAMPLE_RATE)
+            # Prefer model.sample_rate (Qwen3-TTS), but fall back to the
+            # first result segment's sample_rate (mock and mlx-audio paths)
+            # and finally the default.
+            model_sr = getattr(model, "sample_rate", None)
+            if isinstance(model_sr, (int, float)):
+                sample_rate = int(model_sr)
+            else:
+                sample_rate = None
+
             audio_chunks = []
 
-            for result in results:
+            for i, result in enumerate(results):
                 audio = result.audio
                 if isinstance(audio, mx.array) and audio.dtype == mx.bfloat16:
                     audio = audio.astype(mx.float32)
                 audio_chunks.append(np.array(audio))
+                if sample_rate is None:
+                    seg_sr = getattr(result, "sample_rate", None)
+                    if isinstance(seg_sr, (int, float)):
+                        sample_rate = int(seg_sr)
+
+            if sample_rate is None:
+                sample_rate = _DEFAULT_SAMPLE_RATE
 
             if not audio_chunks:
                 raise RuntimeError("TTS model produced no audio output")
 
             audio = np.concatenate(audio_chunks, axis=0)
-            return _audio_to_wav_bytes(audio, int(sample_rate))
+            wav_bytes = _audio_to_wav_bytes(audio, sample_rate)
+            duration = len(audio) / sample_rate if sample_rate else 0.0
+            return SpeechOutput(
+                audio_bytes=wav_bytes,
+                sample_rate=sample_rate,
+                duration=duration,
+            )
 
         activity_id = self._begin_activity(
             "synthesizing speech",
@@ -261,7 +409,7 @@ class TTSEngine(BaseNonStreamingEngine):
             elapsed = time.monotonic() - t0
             logger.info(
                 "TTS synthesize done: model=%s, %.2fs, %d bytes output",
-                self._model_name, elapsed, len(result),
+                self._model_name, elapsed, len(result.audio_bytes),
             )
             return result
         finally:
@@ -403,8 +551,38 @@ class TTSEngine(BaseNonStreamingEngine):
         return {
             "model_name": self._model_name,
             "loaded": self._model is not None,
+            "variant": self._variant,
         }
+
+    def get_model_info(self) -> Dict[str, Any]:
+        """Get model metadata including variant and speakers."""
+        if self._model is None:
+            return {
+                "loaded": False,
+                "model_name": self._model_name,
+            }
+        return {
+            "loaded": True,
+            "model_name": self._model_name,
+            "variant": self._variant,
+            "speakers": self.get_speakers(),
+        }
+
+    def get_speakers(self) -> list[str]:
+        """List available speakers (CustomVoice only)."""
+        if self._model is None or self._variant != "custom_voice":
+            return []
+        try:
+            talker_config = getattr(self._model.config, "talker_config", None)
+            if talker_config and "spk_id" in talker_config:
+                return list(talker_config["spk_id"].keys())
+        except Exception:
+            pass
+        return []
 
     def __repr__(self) -> str:
         status = "running" if self._model is not None else "stopped"
-        return f"<TTSEngine model={self._model_name} status={status}>"
+        return (
+            f"<TTSEngine model={self._model_name} "
+            f"status={status} variant={self._variant}>"
+        )

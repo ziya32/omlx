@@ -119,7 +119,6 @@ class TestTTSThreadSafety:
         from omlx.engine.tts import TTSEngine
 
         clear_cache_thread = None
-        original_clear_cache = None
 
         def _track_clear_cache():
             nonlocal clear_cache_thread
@@ -183,7 +182,7 @@ class TestSTTThreadSafety:
 
         transcribe_thread_name = None
 
-        def _mock_generate_transcription(**kwargs):
+        def _mock_generate(audio_path, **kwargs):
             nonlocal transcribe_thread_name
             transcribe_thread_name = threading.current_thread().name
             output = MagicMock()
@@ -192,22 +191,15 @@ class TestSTTThreadSafety:
             output.segments = [{"start": 0.0, "end": 1.0}]
             return output
 
-        mock_gen_module = MagicMock()
-        mock_gen_module.generate_transcription = _mock_generate_transcription
-
         engine = STTEngine(model_name="whisper-tiny")
         engine._model = MagicMock(sample_rate=16000)
+        engine._model.generate = _mock_generate
 
-        with patch.dict("sys.modules", {
-            "mlx_audio": MagicMock(),
-            "mlx_audio.stt": MagicMock(),
-            "mlx_audio.stt.generate": mock_gen_module,
-        }):
-            result = await engine.transcribe(wav_path)
+        await engine.transcribe(wav_path)
 
         executor_thread = _get_executor_thread_name()
         assert transcribe_thread_name == executor_thread, (
-            f"STT generate_transcription ran on thread '{transcribe_thread_name}', "
+            f"STT model.generate ran on thread '{transcribe_thread_name}', "
             f"expected MLX executor thread '{executor_thread}'. "
             f"This would cause Metal command buffer races!"
         )

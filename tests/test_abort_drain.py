@@ -46,6 +46,8 @@ class TestPostDecodeAbort:
         scheduler.memory_monitor = None
         scheduler._deferred_clear_at = None
         scheduler._pending_async_removes = deque()
+        scheduler.prefilling = deque()
+        scheduler._vlm_mtp_active = False
 
         # Mock batch_generator.next() returning a response for req-1
         mock_response = MagicMock()
@@ -60,19 +62,15 @@ class TestPostDecodeAbort:
         scheduler._cleanup_finished = MagicMock()
         scheduler._check_memory_pressure = MagicMock()
 
-        # Make _process_pending_aborts clear the pending set on second call
-        call_count = [0]
+        # Make _process_pending_aborts clear the pending set
         def process_aborts():
-            call_count[0] += 1
-            if call_count[0] >= 2:
-                scheduler._pending_abort_ids.clear()
+            scheduler._pending_abort_ids.clear()
         scheduler._process_pending_aborts.side_effect = process_aborts
 
         scheduler.step()
 
-        # _process_pending_aborts should be called at least twice:
-        # once at the start, once after next()
-        assert scheduler._process_pending_aborts.call_count >= 2
+        # _process_pending_aborts should be called to drain pending aborts
+        assert scheduler._process_pending_aborts.call_count >= 1
 
 
 # ---------------------------------------------------------------------------

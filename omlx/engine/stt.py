@@ -11,7 +11,8 @@ when mlx-audio is not installed.
 import asyncio
 import gc
 import logging
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Dict, List
 
 import mlx.core as mx
 
@@ -19,6 +20,16 @@ from ..engine_core import get_mlx_executor
 from .base import BaseNonStreamingEngine
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class TranscriptionOutput:
+    """Output from STT transcription."""
+
+    text: str
+    language: str | None = None
+    duration: float | None = None
+    segments: List[Dict[str, Any]] | None = None  # Raw segment dicts from mlx-audio
 
 
 # Lowercase full-names work for both Qwen3-ASR (its _build_prompt lowercases
@@ -209,7 +220,7 @@ class STTEngine(BaseNonStreamingEngine):
         audio_path: str,
         language: str | None = None,
         **kwargs,
-    ) -> dict[str, Any]:
+    ) -> TranscriptionOutput:
         """
         Transcribe an audio file.
 
@@ -219,11 +230,7 @@ class STTEngine(BaseNonStreamingEngine):
             **kwargs: Additional model-specific parameters
 
         Returns:
-            Dictionary with keys:
-                text: Transcribed text
-                language: Detected or specified language
-                segments: List of timed segments (may be empty)
-                duration: Audio duration in seconds
+            TranscriptionOutput with transcribed text, language, duration, and segments
         """
         # Cooperative-abort checkpoint BEFORE the model-None guard, so a
         # handler racing with enforcer eviction sees RequestAbortedError
@@ -289,21 +296,21 @@ class STTEngine(BaseNonStreamingEngine):
                     _normalize_segment(s) for s in raw_segs
                 ] if raw_segs else []
 
-                return {
-                    "text": result.text or "",
-                    "language": raw_lang,
-                    "segments": segments,
-                    "duration": getattr(
+                return TranscriptionOutput(
+                    text=result.text or "",
+                    language=raw_lang,
+                    segments=segments,
+                    duration=getattr(
                         result, "total_time", 0.0
                     ),
-                }
+                )
             # Fallback for unexpected return types
-            return {
-                "text": str(result),
-                "language": language,
-                "segments": [],
-                "duration": 0.0,
-            }
+            return TranscriptionOutput(
+                text=str(result),
+                language=language,
+                segments=[],
+                duration=0.0,
+            )
 
         activity_id = self._begin_activity(
             "transcribing",
@@ -317,7 +324,7 @@ class STTEngine(BaseNonStreamingEngine):
             )
 
             elapsed = time.monotonic() - t0
-            text_len = len(result.get("text", ""))
+            text_len = len(result.text)
             logger.info(
                 "STT transcribe done: model=%s, %.2fs, %d chars output",
                 self._model_name, elapsed, text_len,
@@ -336,6 +343,32 @@ class STTEngine(BaseNonStreamingEngine):
         return {
             "model_name": self._model_name,
             "loaded": self._model is not None,
+        }
+
+    def get_languages(self) -> list[str]:
+        """List supported languages for this STT model."""
+        if self._model is None:
+            return []
+        try:
+            tokenizer = getattr(self._model, "tokenizer", None)
+            if tokenizer:
+                all_langs = getattr(tokenizer, "all_language_tokens", None)
+                if isinstance(all_langs, dict):
+                    return sorted(all_langs.keys())
+                lang_map = getattr(tokenizer, "language_to_id", None)
+                if isinstance(lang_map, dict):
+                    return sorted(lang_map.keys())
+        except Exception:
+            pass
+        return []
+
+    def get_model_info(self) -> dict[str, Any]:
+        """Get basic model metadata."""
+        if self._model is None:
+            return {"loaded": False, "model_name": self._model_name}
+        return {
+            "loaded": True,
+            "model_name": self._model_name,
         }
 
     def __repr__(self) -> str:

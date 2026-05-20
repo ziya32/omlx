@@ -275,6 +275,7 @@ def client(tmp_path):
     """Create a test client with mock engines for audio and reranker endpoints."""
     import json as _json
     from omlx.server import app, _server_state
+    from omlx.api.audio_routes import set_auth_dependency
 
     # Write a TTS config.json so /v1/audio/speakers can read speakers from disk
     tts_dir = tmp_path / "test-tts-model"
@@ -294,6 +295,10 @@ def client(tmp_path):
     _server_state.engine_pool = pool
     _server_state.default_model = "test-llm-model"
     _server_state.api_key = TEST_API_KEY
+
+    # Wire up auth so _verify_auth delegates to server's verify_api_key
+    from omlx.server import verify_api_key
+    set_auth_dependency(verify_api_key)
 
     yield TestClient(app, headers={"Authorization": f"Bearer {TEST_API_KEY}"})
 
