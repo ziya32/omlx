@@ -2206,70 +2206,90 @@ async def create_embeddings(
             detail="Server is busy with oQ quantization. Please try again after quantization completes.",
         )
 
-    engine = await get_embedding_engine(request.model)
-
-    if request.items is not None:
-        embedding_inputs = normalize_embedding_items(request.items)
-    elif request.input is not None:
-        embedding_inputs = normalize_input(request.input)
-    else:
-        embedding_inputs = []
-
-    if not embedding_inputs:
-        raise HTTPException(status_code=400, detail="Input cannot be empty")
-
-    async def _build_embeddings():
-        start_time = time.perf_counter()
-        try:
-            output = await engine.embed(embedding_inputs)
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-        except TypeError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-
-        elapsed = time.perf_counter() - start_time
-        logger.info(
-            f"Embedding: {len(embedding_inputs)} inputs, {output.dimensions} dims, "
-            f"{output.total_tokens} tokens in {elapsed:.3f}s"
-        )
-        get_server_metrics().record_request_complete(
-            prompt_tokens=output.total_tokens,
-            completion_tokens=0,
-            cached_tokens=0,
-            prefill_duration=elapsed,
-            model_id=resolve_model_id(request.model) or request.model,
+    # Resolve once and acquire the lease BEFORE the get_engine await so
+    # the process_memory_enforcer sees active_uses >= 1 across the entire
+    # request lifetime and won't pick this engine as an eviction victim.
+    # Missing this was the root cause of test_17 embeddings getting
+    # "aborted due to memory pressure" 503 cascades — the embedding
+    # endpoint was the one acquire_engine site c485139 missed.
+    resolved_model = resolve_model_id(request.model) or request.model
+    pool = get_engine_pool()
+    pool.acquire_engine(resolved_model)
+    released = False
+    try:
+        engine = await get_engine(
+            request.model, EngineType.EMBEDDING, resolved_id=resolved_model
         )
 
-        data = []
-        for i, embedding in enumerate(output.embeddings):
-            if request.dimensions and request.dimensions < len(embedding):
-                embedding = truncate_embedding(embedding, request.dimensions)
+        if request.items is not None:
+            embedding_inputs = normalize_embedding_items(request.items)
+        elif request.input is not None:
+            embedding_inputs = normalize_input(request.input)
+        else:
+            embedding_inputs = []
 
-            if request.encoding_format == "base64":
-                formatted_embedding = encode_embedding_base64(embedding)
-            else:
-                formatted_embedding = embedding
+        if not embedding_inputs:
+            raise HTTPException(status_code=400, detail="Input cannot be empty")
 
-            data.append(
-                EmbeddingData(
-                    index=i,
-                    embedding=formatted_embedding,
-                )
+        async def _build_embeddings():
+            start_time = time.perf_counter()
+            try:
+                output = await engine.embed(embedding_inputs)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            except TypeError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+
+            elapsed = time.perf_counter() - start_time
+            logger.info(
+                f"Embedding: {len(embedding_inputs)} inputs, {output.dimensions} dims, "
+                f"{output.total_tokens} tokens in {elapsed:.3f}s"
+            )
+            get_server_metrics().record_request_complete(
+                prompt_tokens=output.total_tokens,
+                completion_tokens=0,
+                cached_tokens=0,
+                prefill_duration=elapsed,
+                model_id=resolved_model,
             )
 
-        return EmbeddingResponse(
-            data=data,
-            model=request.model,
-            usage=EmbeddingUsage(
-                prompt_tokens=output.total_tokens,
-                total_tokens=output.total_tokens,
-            ),
-        ).model_dump_json()
+            data = []
+            for i, embedding in enumerate(output.embeddings):
+                if request.dimensions and request.dimensions < len(embedding):
+                    embedding = truncate_embedding(embedding, request.dimensions)
 
-    return StreamingResponse(
-        _with_json_keepalive(http_request, _build_embeddings()),
-        media_type="application/json",
-    )
+                if request.encoding_format == "base64":
+                    formatted_embedding = encode_embedding_base64(embedding)
+                else:
+                    formatted_embedding = embedding
+
+                data.append(
+                    EmbeddingData(
+                        index=i,
+                        embedding=formatted_embedding,
+                    )
+                )
+
+            return EmbeddingResponse(
+                data=data,
+                model=request.model,
+                usage=EmbeddingUsage(
+                    prompt_tokens=output.total_tokens,
+                    total_tokens=output.total_tokens,
+                ),
+            ).model_dump_json()
+
+        released = True  # _with_engine_guard takes ownership
+        return StreamingResponse(
+            _with_engine_guard(
+                _with_json_keepalive(http_request, _build_embeddings()),
+                pool, resolved_model,
+            ),
+            media_type="application/json",
+        )
+    finally:
+        if not released:
+            pool.release_engine(resolved_model)
 
 
 # =============================================================================
