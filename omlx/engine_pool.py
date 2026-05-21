@@ -824,35 +824,34 @@ class EnginePool:
                         entry.last_access = time.time()
                         result = entry.engine  # Capture under lock
                     else:
-                        # Two error categories drive the cooldown +
-                        # post-wait-failure paths:
+                        # Default: record the load failure so waiters
+                        # see the typed exception (load_error) and so
+                        # quick-retry get_engine() calls hit the
+                        # LOAD_COOLDOWN gate (load_failed_at) — this
+                        # is what genuine load failures
+                        # (corrupt weights, OSError, missing
+                        # dependencies, etc.) want.
                         #
-                        # - TERMINAL: model can't load (ModelTooLargeError,
-                        #   InsufficientMemoryError, ModelNotFoundError).
-                        #   Retrying for 30s won't change physics — set
-                        #   ``load_failed_at`` so subsequent get_engine()
-                        #   calls within LOAD_COOLDOWN return 409, and
-                        #   set ``load_error`` so waiters on the
-                        #   ready_event see the typed failure.
-                        #
-                        # - TRANSIENT: enforcer-initiated abort,
-                        #   intermittent Metal allocation error, etc.
-                        #   Failure is recoverable — don't set either
-                        #   field, so the next get_engine() request
-                        #   loops back into the load path fresh
-                        #   instead of seeing a stale cooldown 409 or
-                        #   a stale load_error post-wait 409.
-                        _terminal = isinstance(
-                            load_error,
-                            (
-                                ModelTooLargeError,
-                                InsufficientMemoryError,
-                                ModelNotFoundError,
-                            ),
+                        # Skip recording for known-transient failures:
+                        # - ``CancelledError``: caller dropped, not a
+                        #   real load failure
+                        # - enforcer-initiated abort (ModelLoadingError
+                        #   with "aborted" in the message): pressure-
+                        #   driven mid-load termination. The model
+                        #   itself didn't fail to load; the next
+                        #   request can retry immediately. Recording
+                        #   here would cascade-503 stress workloads
+                        #   that exercise repeated eviction-then-reload
+                        #   on small non-pinned models.
+                        _enforcer_abort = (
+                            isinstance(load_error, ModelLoadingError)
+                            and "aborted" in str(load_error)
                         )
-                        if _terminal and not isinstance(
-                            load_error, asyncio.CancelledError
-                        ):
+                        _skip_record = (
+                            isinstance(load_error, asyncio.CancelledError)
+                            or _enforcer_abort
+                        )
+                        if not _skip_record:
                             entry.load_error = load_error
                             entry.load_failed_at = time.time()
                         self._set_state(
