@@ -1599,9 +1599,16 @@ class EnginePool:
         actively served by back-to-back requests can look idle for the
         instant the enforcer samples and get picked for eviction.
 
+        Note: the grace window is consulted HERE for ranking purposes
+        only (recently-accessed engines sort after fully-idle ones).
+        The enforcer's busy-victim filter uses
+        ``is_engine_actively_held`` (no grace) — sustained traffic
+        would otherwise prevent any eviction at all.
+
         Returns:
             Model ID of the candidate, or None if no evictable models exist.
         """
+        now = time.time()
         candidates = []
         for mid, e in self._entries.items():
             if e.engine is None or e.is_pinned:
@@ -1612,45 +1619,43 @@ class EnginePool:
                 EngineState.UNLOADING,
             ):
                 continue  # Lifecycle state in progress
-            candidates.append((self.is_engine_busy(e), e.last_access, mid))
+            actively_held = self.is_engine_actively_held(e)
+            recently_active = (
+                e.last_access > 0
+                and (now - e.last_access) < _ACTIVE_GRACE_SEC
+            )
+            # has_active=True ranks LAST in the sort tuple
+            candidates.append(
+                (actively_held or recently_active, e.last_access, mid)
+            )
         if not candidates:
             return None
         candidates.sort()  # (False, old_time) sorts before (True, old_time)
         return candidates[0][2]
 
-    def is_engine_busy(self, entry: EngineEntry) -> bool:
-        """Single source of truth for "is this engine currently in use".
+    def is_engine_actively_held(self, entry: EngineEntry) -> bool:
+        """Strict check: handler currently holds a lease OR scheduler is running.
 
-        Used by both the eviction candidate ranking (here) and the
-        process_memory_enforcer's busy-only-non-pinned filter so the
-        two views agree. Without a shared predicate they could
-        disagree when the grace window applies — the enforcer would
-        see ``has_active_requests == False AND active_uses == 0`` and
-        evict an engine that the candidate ranker had ranked as
-        "busy" via the grace window.
+        This is what the process_memory_enforcer's busy-victim filter
+        wants — "if I abort this engine right now, will I break an
+        in-flight request?". Active scheduler work or a positive
+        ``active_uses`` count is the only ground truth for that.
 
-        Returns True when ANY of:
-        - ``engine.has_active_requests()``  (scheduler has running work)
-        - ``active_uses > 0``               (handler holds a lease)
-        - ``last_access`` within ``_ACTIVE_GRACE_SEC`` (just released
-          a lease; another request may be en-route — closes the
-          FastAPI-dispatch / acquire_engine entry window race)
+        The grace window (recently_active) is NOT included here. It's a
+        sort-ranking signal for ``_find_drain_or_evict_candidate`` so
+        models in between back-to-back requests get ranked after fully
+        idle ones, NOT a "can't ever evict" lock. If we treated grace as
+        a hard block in the enforcer, sustained traffic would prevent
+        any eviction at all because every model's ``last_access`` keeps
+        refreshing inside the grace window — memory would grow past
+        limit without recovery.
         """
         if entry.engine is None:
             return False
         try:
-            has_active_now = (
-                entry.engine.has_active_requests() or entry.active_uses > 0
-            )
+            return entry.engine.has_active_requests() or entry.active_uses > 0
         except (AttributeError, TypeError):
-            has_active_now = False
-        if has_active_now:
-            return True
-        if entry.last_access > 0 and (
-            time.time() - entry.last_access
-        ) < _ACTIVE_GRACE_SEC:
-            return True
-        return False
+            return False
 
     # -------------------------------------------------------------------------
     # Engine unloading

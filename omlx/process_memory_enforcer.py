@@ -368,13 +368,19 @@ class ProcessMemoryEnforcer:
                 _busy_only_non_pinned = False
                 if victim is not None:
                     v_entry = self._engine_pool._entries.get(victim)
-                    if v_entry is not None and self._engine_pool.is_engine_busy(v_entry):
-                        # Best candidate is busy (in-flight requests
-                        # OR an open lease OR within the eviction grace
-                        # window). Don't evict it; let in-flight work
-                        # complete naturally. Mark so we also skip
-                        # escalating to aborting pinned engines below
-                        # — that would kill the VLM in stress tests.
+                    if v_entry is not None and self._engine_pool.is_engine_actively_held(v_entry):
+                        # Best candidate is actively held (in-flight
+                        # requests OR an open lease). Don't evict it;
+                        # let in-flight work complete naturally. Mark
+                        # so we also skip escalating to aborting
+                        # pinned engines below — that would kill the
+                        # VLM in stress tests.
+                        #
+                        # Grace-window engines DON'T trigger this
+                        # branch; they only rank later in the sort.
+                        # Without that distinction, sustained traffic
+                        # would keep every model in grace continuously
+                        # and the enforcer would never evict.
                         victim = None
                         _busy_only_non_pinned = True
                 if victim is not None:
