@@ -17,6 +17,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
+from omlx.exceptions import AudioError
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -666,7 +668,7 @@ class TestTTSVoiceRouting:
                     "Hello", voice=voice_value, instructions=instructions_value,
                     **synth_kwargs,
                 ))
-            except RuntimeError:
+            except (RuntimeError, AudioError):
                 pass  # "no audio output" is expected with empty generate
 
             return fake_model.generate.call_args
@@ -765,7 +767,7 @@ class TestTTSVoiceClonePassthrough:
                 asyncio.run(engine.synthesize(
                     "Hello", ref_audio=ref_audio_path, ref_text=ref_text,
                 ))
-            except RuntimeError:
+            except (RuntimeError, AudioError):
                 pass  # "no audio output" expected
 
             return fake_model.generate.call_args
@@ -1022,7 +1024,7 @@ class TestTTSGenerationParams:
 
             try:
                 asyncio.run(engine.synthesize("Hello", **synth_kwargs))
-            except RuntimeError:
+            except (RuntimeError, AudioError):
                 pass
 
             return fake_model.generate.call_args

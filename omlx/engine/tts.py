@@ -419,24 +419,50 @@ class TTSEngine(BaseNonStreamingEngine):
                 self._raise_if_aborted()
                 if seg is _SEG_DONE:
                     break
-                audio = seg.audio
-                if isinstance(audio, mx.array) and audio.dtype == mx.bfloat16:
-                    audio = audio.astype(mx.float32)
-                audio_chunks.append(np.array(audio))
-                if sample_rate is None:
-                    seg_sr = getattr(seg, "sample_rate", None)
-                    if isinstance(seg_sr, (int, float)):
-                        sample_rate = int(seg_sr)
+                # Segment audio access can raise if the producing model
+                # was torn down between yielding the segment and our
+                # touching its tensors (e.g. enforcer evicted mid-loop
+                # but the iterator already had a partial result in
+                # flight). Wrap so the failure is 422 not 500.
+                try:
+                    audio = seg.audio
+                    if isinstance(audio, mx.array) and audio.dtype == mx.bfloat16:
+                        audio = audio.astype(mx.float32)
+                    audio_chunks.append(np.array(audio))
+                    if sample_rate is None:
+                        seg_sr = getattr(seg, "sample_rate", None)
+                        if isinstance(seg_sr, (int, float)):
+                            sample_rate = int(seg_sr)
+                except (AudioError, VoiceCloningError):
+                    raise
+                except Exception as exc:
+                    raise AudioError(
+                        f"TTS segment processing failed: {exc}"
+                    ) from exc
 
             if sample_rate is None:
                 sample_rate = _DEFAULT_SAMPLE_RATE
             if not audio_chunks:
-                raise RuntimeError("TTS model produced no audio output")
+                # Under enforcer abort the iterator may exit cleanly
+                # before yielding any segment (the model's generate()
+                # loop unwinds when its scheduler is torn down).
+                # ``AudioError`` so the endpoint returns 422 — retryable —
+                # rather than 500.
+                raise AudioError("TTS model produced no audio output")
 
             # Step 3: concatenate + WAV-encode on the executor (numpy + io).
-            result = await loop.run_in_executor(
-                executor, _finalize, audio_chunks, sample_rate
-            )
+            # Wrap _finalize errors so np/wav-encoder failures (e.g. mx
+            # array detached from a freed model) surface as 422 not 500.
+            try:
+                result = await loop.run_in_executor(
+                    executor, _finalize, audio_chunks, sample_rate
+                )
+            except (AudioError, VoiceCloningError):
+                raise
+            except Exception as exc:
+                raise AudioError(
+                    f"TTS finalize failed: {exc}"
+                ) from exc
 
             elapsed = time.monotonic() - t0
             logger.info(
