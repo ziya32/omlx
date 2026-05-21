@@ -60,6 +60,18 @@ logger = logging.getLogger(__name__)
 # Cooldown after a load failure before retrying (seconds)
 LOAD_COOLDOWN = 30
 
+# Grace window for eviction-candidate selection. Engines accessed within
+# this many seconds count as "active" even when their current
+# active_uses is 0, so the FastAPI dispatch + acquire_engine entry
+# window between back-to-back requests doesn't expose the model to an
+# enforcer tick that races against the brief active_uses=0 dip.
+# Tuned to be comfortably larger than the inter-request gap in
+# concurrent stress workloads (~ms) but shorter than typical
+# inter-request gaps in real traffic (~seconds-to-minutes) so an
+# actually-idle model still gets evicted promptly under sustained
+# pressure.
+_ACTIVE_GRACE_SEC: float = 3.0
+
 
 class EngineState(Enum):
     """Lifecycle state for a model engine."""
@@ -1579,9 +1591,18 @@ class EnginePool:
         use-count (request handlers that have acquired the engine via
         acquire_engine).
 
+        Idle is computed as ``has_active_requests() == False AND
+        active_uses == 0 AND last_access > _ACTIVE_GRACE_SEC ago``.
+        The last clause closes the race where a tick samples between
+        ``release_engine`` of request N and ``acquire_engine`` of
+        request N+1 (a few ms window). Without it, a model being
+        actively served by back-to-back requests can look idle for the
+        instant the enforcer samples and get picked for eviction.
+
         Returns:
             Model ID of the candidate, or None if no evictable models exist.
         """
+        now = time.time()
         candidates = []
         for mid, e in self._entries.items():
             if e.engine is None or e.is_pinned:
@@ -1592,9 +1613,18 @@ class EnginePool:
                 continue  # Don't evict something being loaded
             if e.state == EngineState.UNLOADING:
                 continue  # Metal cleanup in progress
-            has_active = (
+            has_active_now = (
                 e.engine.has_active_requests() or e.active_uses > 0
             )
+            # 3-second grace: engines accessed in the last 3s count as
+            # active even if their current use-count is 0. Covers the
+            # FastAPI dispatch + acquire_engine entry window between
+            # back-to-back requests under sustained traffic.
+            recently_active = (
+                e.last_access > 0
+                and (now - e.last_access) < _ACTIVE_GRACE_SEC
+            )
+            has_active = has_active_now or recently_active
             candidates.append((has_active, e.last_access, mid))
         if not candidates:
             return None
