@@ -150,15 +150,27 @@ async def _use_engine(model_id: str):
     pool = _get_engine_pool()
     sm = _get_settings_manager()
     resolved = pool.resolve_model_id(model_id, sm) if sm else model_id
+
+    # Acquire the lease BEFORE the get_engine await — same pattern as
+    # server.py's ``use_engine``. If we acquired AFTER get_engine
+    # returned, the await at get_engine would yield the event loop and
+    # the process_memory_enforcer (or another scheduler step) could see
+    # ``active_uses == 0`` on this engine, pick it as an eviction
+    # victim, and abort the very engine reference about to be yielded
+    # to the caller. Acquiring first holds active_uses >= 1 across the
+    # await window so the enforcer's busy-filter (1f5eebc) catches it.
+    pool.acquire_engine(resolved)
     try:
         engine = await pool.get_engine(resolved)
     except ModelNotFoundError as exc:
+        pool.release_engine(resolved)
         avail = ", ".join(exc.available_models) if exc.available_models else "(none)"
         raise HTTPException(
             status_code=404,
             detail=f"Model '{model_id}' not found. Available: {avail}",
         ) from exc
     except ImportError as exc:
+        pool.release_engine(resolved)
         # Engine load needed an optional dep that isn't installed (e.g.
         # mlx-audio for TTS/STT/STS).  Surface the engine's actionable
         # message ("Install it with: pip install 'omlx[audio]'") via 501,
@@ -168,18 +180,23 @@ async def _use_engine(model_id: str):
         # uselessly pounding the endpoint.
         raise HTTPException(status_code=501, detail=str(exc)) from exc
     except ModelLoadingError as exc:
+        pool.release_engine(resolved)
         # Cooldown gate (model recently failed to load) OR transient load
         # failure (enforcer abort, intermittent Metal alloc error).
         # 503 lets the test client / SDK retry transparently.
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except (ModelTooLargeError, InsufficientMemoryError) as exc:
+        pool.release_engine(resolved)
         # Terminal — model doesn't fit. 507 Insufficient Storage matches
         # the LLM endpoints' mapping in server.py:751.
         raise HTTPException(status_code=507, detail=str(exc)) from exc
     except EnginePoolError as exc:
+        pool.release_engine(resolved)
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except BaseException:
+        pool.release_engine(resolved)
+        raise
 
-    pool.acquire_engine(resolved)
     try:
         # Close the race window between pool.get_engine's last yield
         # and the caller touching `engine`: if the process memory
