@@ -263,16 +263,31 @@ class ProcessMemoryEnforcer:
     async def _check_and_enforce(self) -> None:
         """Check current memory and enforce 2-watermark policy.
 
-        Pressure levels:
-        - ok (current < soft): no action, ensure admission unpaused.
-        - soft (soft <= current < hard): LRU non-pinned eviction + signal
-          schedulers to pause new admissions (in-flight requests proceed).
-        - hard (current >= hard): full enforcement — LRU evict, abort
-          in-flight when only pinned remain, abort in-progress model loads.
+        Pressure levels (consumed by scheduler admission control via
+        ``_propagate_memory_limit``):
 
-        Pressure target on recovery is the soft threshold (always evict
-        back below soft to avoid oscillation when single eviction lands
-        just under hard).
+        - ok   (current < soft):        no action.
+        - soft (soft <= current < hard): admission paused only — in-flight
+                                         requests drain naturally.
+        - hard (current >= hard):        admission paused, plus eviction
+                                         loop triggers IF current also
+                                         exceeds the absolute ``max_bytes``.
+
+        Eviction is gated on the absolute ``max_bytes`` limit (not on the
+        SOFT/HARD watermarks). SOFT/HARD signals fire proactively to
+        throttle admission before the limit is hit; eviction is the
+        last-resort lever once the limit IS hit. Eviction target is the
+        soft watermark — recover with margin so oscillation at the
+        boundary doesn't trigger repeated evictions.
+
+        Within the eviction loop:
+        - Multiple non-pinned + at least one idle: evict LRU idle.
+        - One non-pinned remaining (HARD): abort its in-flight, keep
+          model loaded (releases KV blocks).
+        - All non-pinned busy: defer to next tick (let in-flight drain).
+        - All loaded models pinned: reclaim by aborting in-flight on
+          pinned engines (Feature 102fe6b), then load-abort as last
+          resort.
         """
         if self._max_bytes <= 0:
             self._pressure_level = "ok"
@@ -311,13 +326,11 @@ class ProcessMemoryEnforcer:
         if new_level == "ok":
             return
 
-        # Full eviction loop is gated on the absolute ``max_bytes``
-        # limit, not the SOFT/HARD watermarks. SOFT/HARD signals are
-        # consumed by admission control (``_propagate_memory_limit``
-        # already paused new prefills above) and the HARD load-abort
-        # pass above — they fire proactively below max to give
-        # in-flight work a chance to drain naturally before any
-        # request abort.
+        # Eviction is gated on the absolute ``max_bytes`` limit. SOFT/
+        # HARD watermarks above only drive admission pausing via
+        # ``_propagate_memory_limit`` — they don't trigger eviction so
+        # in-flight work gets to drain naturally before any request
+        # abort.
         #
         # Pre-v0.3.9 semantics: ``if current <= self._max_bytes: return``.
         # The merge introduced the SOFT/HARD watermarks but kept the
@@ -355,21 +368,15 @@ class ProcessMemoryEnforcer:
                 _busy_only_non_pinned = False
                 if victim is not None:
                     v_entry = self._engine_pool._entries.get(victim)
-                    if v_entry is not None and v_entry.engine is not None:
-                        try:
-                            v_busy = (
-                                v_entry.engine.has_active_requests()
-                                or getattr(v_entry, "active_uses", 0) > 0
-                            )
-                        except (AttributeError, TypeError):
-                            v_busy = False
-                        if v_busy is True:
-                            # Best candidate is busy → no eviction-safe
-                            # target. Mark so we don't escalate to
-                            # aborting pinned engines' requests below
-                            # (which would kill the VLM in stress tests).
-                            victim = None
-                            _busy_only_non_pinned = True
+                    if v_entry is not None and self._engine_pool.is_engine_busy(v_entry):
+                        # Best candidate is busy (in-flight requests
+                        # OR an open lease OR within the eviction grace
+                        # window). Don't evict it; let in-flight work
+                        # complete naturally. Mark so we also skip
+                        # escalating to aborting pinned engines below
+                        # — that would kill the VLM in stress tests.
+                        victim = None
+                        _busy_only_non_pinned = True
                 if victim is not None:
                     loaded_non_pinned = [
                         mid

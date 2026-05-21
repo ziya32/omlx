@@ -1602,34 +1602,55 @@ class EnginePool:
         Returns:
             Model ID of the candidate, or None if no evictable models exist.
         """
-        now = time.time()
         candidates = []
         for mid, e in self._entries.items():
             if e.engine is None or e.is_pinned:
                 continue
-            if e.state == EngineState.DRAINING:
-                continue  # Already being drained
-            if e.state == EngineState.LOADING:
-                continue  # Don't evict something being loaded
-            if e.state == EngineState.UNLOADING:
-                continue  # Metal cleanup in progress
-            has_active_now = (
-                e.engine.has_active_requests() or e.active_uses > 0
-            )
-            # 3-second grace: engines accessed in the last 3s count as
-            # active even if their current use-count is 0. Covers the
-            # FastAPI dispatch + acquire_engine entry window between
-            # back-to-back requests under sustained traffic.
-            recently_active = (
-                e.last_access > 0
-                and (now - e.last_access) < _ACTIVE_GRACE_SEC
-            )
-            has_active = has_active_now or recently_active
-            candidates.append((has_active, e.last_access, mid))
+            if e.state in (
+                EngineState.DRAINING,
+                EngineState.LOADING,
+                EngineState.UNLOADING,
+            ):
+                continue  # Lifecycle state in progress
+            candidates.append((self.is_engine_busy(e), e.last_access, mid))
         if not candidates:
             return None
         candidates.sort()  # (False, old_time) sorts before (True, old_time)
         return candidates[0][2]
+
+    def is_engine_busy(self, entry: EngineEntry) -> bool:
+        """Single source of truth for "is this engine currently in use".
+
+        Used by both the eviction candidate ranking (here) and the
+        process_memory_enforcer's busy-only-non-pinned filter so the
+        two views agree. Without a shared predicate they could
+        disagree when the grace window applies — the enforcer would
+        see ``has_active_requests == False AND active_uses == 0`` and
+        evict an engine that the candidate ranker had ranked as
+        "busy" via the grace window.
+
+        Returns True when ANY of:
+        - ``engine.has_active_requests()``  (scheduler has running work)
+        - ``active_uses > 0``               (handler holds a lease)
+        - ``last_access`` within ``_ACTIVE_GRACE_SEC`` (just released
+          a lease; another request may be en-route — closes the
+          FastAPI-dispatch / acquire_engine entry window race)
+        """
+        if entry.engine is None:
+            return False
+        try:
+            has_active_now = (
+                entry.engine.has_active_requests() or entry.active_uses > 0
+            )
+        except (AttributeError, TypeError):
+            has_active_now = False
+        if has_active_now:
+            return True
+        if entry.last_access > 0 and (
+            time.time() - entry.last_access
+        ) < _ACTIVE_GRACE_SEC:
+            return True
+        return False
 
     # -------------------------------------------------------------------------
     # Engine unloading

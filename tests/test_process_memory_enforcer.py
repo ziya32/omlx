@@ -48,6 +48,12 @@ def mock_engine_pool():
     pool._find_drain_or_evict_candidate = MagicMock(return_value="model-a")
     pool._unload_engine = AsyncMock()
     pool._entries = {}
+    # is_engine_busy is the shared busy-predicate used by both the
+    # candidate ranker and the enforcer's busy-victim filter. Default
+    # to False so the eviction path proceeds in tests that don't
+    # explicitly model "busy" semantics; tests that DO care override
+    # this per-test.
+    pool.is_engine_busy = MagicMock(return_value=False)
     return pool
 
 
@@ -669,6 +675,7 @@ class TestTwoWatermarkPressureLevels:
         p._find_drain_or_evict_candidate = MagicMock(return_value=None)
         p._unload_engine = AsyncMock()
         p._entries = {}
+        p.is_engine_busy = MagicMock(return_value=False)
         return p
 
     @pytest.fixture

@@ -118,25 +118,26 @@ def _get_settings_manager():
 
 
 # ---------------------------------------------------------------------------
-# Local use_engine context manager
+# Engine acquisition helpers
 # ---------------------------------------------------------------------------
 
-@asynccontextmanager
-async def _use_engine(model_id: str):
-    """Get an engine with eviction protection for the duration of the block.
 
-    Engine-pool error mapping (mirrors the LLM endpoints'
-    ``get_engine_for_model`` path in server.py):
+def _raise_pool_acquire_http(exc: BaseException, model_id: str) -> None:
+    """Translate ``pool.get_engine`` failure into the right HTTP error.
+
+    Single source of truth for the audio-endpoint exception mapping
+    (mirrors the LLM endpoints' ``get_engine_for_model`` mapping in
+    ``server.py``). Always raises — never returns.
 
     - ``ModelNotFoundError``      → 404
     - ``ImportError``             → 501 (missing optional dep, e.g. mlx-audio)
-    - ``ModelLoadingError``       → 503 retryable (transient load failure
-                                    OR cooldown; the test client's retry
-                                    loop already handles 503)
-    - ``ModelTooLargeError``      → 507 (model doesn't fit, terminal)
-    - ``InsufficientMemoryError`` → 507 (can't free enough, terminal)
+    - ``ModelLoadingError``       → 503 (transient — cooldown / load abort;
+                                         retryable)
+    - ``ModelTooLargeError`` +
+      ``InsufficientMemoryError`` → 507 (model can't fit; terminal)
     - ``EngineEvictedError``      → 503 (post-acquire race; retryable)
     - other ``EnginePoolError``   → 500
+    - anything else               → re-raise as-is
     """
     from omlx.exceptions import (
         EngineEvictedError,
@@ -146,56 +147,54 @@ async def _use_engine(model_id: str):
         ModelNotFoundError,
         ModelTooLargeError,
     )
-
-    pool = _get_engine_pool()
-    sm = _get_settings_manager()
-    resolved = pool.resolve_model_id(model_id, sm) if sm else model_id
-
-    # Acquire the lease BEFORE the get_engine await — same pattern as
-    # server.py's ``use_engine``. If we acquired AFTER get_engine
-    # returned, the await at get_engine would yield the event loop and
-    # the process_memory_enforcer (or another scheduler step) could see
-    # ``active_uses == 0`` on this engine, pick it as an eviction
-    # victim, and abort the very engine reference about to be yielded
-    # to the caller. Acquiring first holds active_uses >= 1 across the
-    # await window so the enforcer's busy-filter (1f5eebc) catches it.
-    pool.acquire_engine(resolved)
-    try:
-        engine = await pool.get_engine(resolved)
-    except ModelNotFoundError as exc:
-        pool.release_engine(resolved)
+    if isinstance(exc, ModelNotFoundError):
         avail = ", ".join(exc.available_models) if exc.available_models else "(none)"
         raise HTTPException(
             status_code=404,
             detail=f"Model '{model_id}' not found. Available: {avail}",
         ) from exc
-    except ImportError as exc:
-        pool.release_engine(resolved)
-        # Engine load needed an optional dep that isn't installed (e.g.
-        # mlx-audio for TTS/STT/STS).  Surface the engine's actionable
-        # message ("Install it with: pip install 'omlx[audio]'") via 501,
-        # not 503 — this isn't a transient capacity problem, the server
-        # genuinely lacks the functionality until ops installs the dep.
-        # Using 501 also keeps clients with 503-retry policies from
-        # uselessly pounding the endpoint.
+    if isinstance(exc, ImportError):
         raise HTTPException(status_code=501, detail=str(exc)) from exc
-    except ModelLoadingError as exc:
-        pool.release_engine(resolved)
-        # Cooldown gate (model recently failed to load) OR transient load
-        # failure (enforcer abort, intermittent Metal alloc error).
-        # 503 lets the test client / SDK retry transparently.
+    if isinstance(exc, ModelLoadingError):
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    except (ModelTooLargeError, InsufficientMemoryError) as exc:
-        pool.release_engine(resolved)
-        # Terminal — model doesn't fit. 507 Insufficient Storage matches
-        # the LLM endpoints' mapping in server.py:751.
+    if isinstance(exc, (ModelTooLargeError, InsufficientMemoryError)):
         raise HTTPException(status_code=507, detail=str(exc)) from exc
-    except EnginePoolError as exc:
-        pool.release_engine(resolved)
+    if isinstance(exc, EngineEvictedError):
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if isinstance(exc, EnginePoolError):
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-    except BaseException:
+    raise exc
+
+
+# ---------------------------------------------------------------------------
+# Local use_engine context manager
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def _use_engine(model_id: str):
+    """Get an engine with eviction protection for the duration of the block.
+
+    Acquires the engine lease BEFORE the get_engine await — same pattern
+    as server.py's ``use_engine``. Without this ordering, the event-loop
+    yield at get_engine could let the process_memory_enforcer see
+    ``active_uses == 0`` and pick this engine as an eviction victim.
+
+    Engine-pool errors are mapped via ``_raise_pool_acquire_http`` to the
+    standard audio HTTP status codes — see that helper for the
+    taxonomy.
+    """
+    from omlx.exceptions import EngineEvictedError
+
+    pool = _get_engine_pool()
+    sm = _get_settings_manager()
+    resolved = pool.resolve_model_id(model_id, sm) if sm else model_id
+
+    pool.acquire_engine(resolved)
+    try:
+        engine = await pool.get_engine(resolved)
+    except BaseException as exc:
         pool.release_engine(resolved)
-        raise
+        _raise_pool_acquire_http(exc, model_id)
 
     try:
         # Close the race window between pool.get_engine's last yield
@@ -816,7 +815,7 @@ async def create_speech(
         _FORMAT_EXTENSIONS,
         _convert_wav,
     )
-    from omlx.exceptions import AudioError, ModelNotFoundError, VoiceCloningError
+    from omlx.exceptions import AudioError, VoiceCloningError
 
     req_id = str(uuid.uuid4())
     logger.info(
@@ -863,37 +862,15 @@ async def create_speech(
             if instruct is None and ms.default_instruct:
                 instruct = ms.default_instruct
 
-    # Load the engine via pool. Same error taxonomy as _use_engine
-    # (mcp_routes / LLM endpoints) — see audio_routes._use_engine for
-    # rationale on each status code.
-    from omlx.exceptions import (
-        EnginePoolError,
-        InsufficientMemoryError,
-        ModelLoadingError,
-        ModelTooLargeError,
-    )
+    # Pre-validation: load the engine to surface 4xx/5xx before the
+    # request body is fully consumed. No lease acquired here because
+    # the actual TTS call below uses ``_use_engine`` which acquires its
+    # own lease. ``pool.get_engine`` is idempotent (returns cached
+    # engine if loaded), so this is essentially a fast type-check.
     try:
         engine = await pool.get_engine(resolved_model)
-    except ModelNotFoundError as exc:
-        avail = ", ".join(exc.available_models) if exc.available_models else "(none)"
-        raise HTTPException(
-            status_code=404,
-            detail=f"Model '{resolved_model}' not found. Available: {avail}",
-        ) from exc
-    except ImportError as exc:
-        # Engine load needed an optional dep (mlx-audio).  Surface the
-        # engine's actionable install message via 501 — the server lacks
-        # the functionality until ops installs the dep, not a transient
-        # 503 condition.
-        raise HTTPException(status_code=501, detail=str(exc)) from exc
-    except ModelLoadingError as exc:
-        # Cooldown / transient load failure — retryable.
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-    except (ModelTooLargeError, InsufficientMemoryError) as exc:
-        # Terminal — model can't fit.
-        raise HTTPException(status_code=507, detail=str(exc)) from exc
-    except EnginePoolError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except BaseException as exc:
+        _raise_pool_acquire_http(exc, resolved_model)
 
     if not isinstance(engine, TTSEngine):
         raise HTTPException(
@@ -935,29 +912,20 @@ async def create_speech(
         pool = _get_engine_pool()
         sm = _get_settings_manager()
         resolved = pool.resolve_model_id(request.model, sm) if sm else request.model
+        # Acquire BEFORE the get_engine await (same race as bf99b5e fixed
+        # in ``_use_engine``).
+        pool.acquire_engine(resolved)
         try:
             engine = await pool.get_engine(resolved)
-        except ModelNotFoundError as exc:
-            avail = ", ".join(exc.available_models) if exc.available_models else "(none)"
-            raise HTTPException(
-                status_code=404,
-                detail=f"Model '{request.model}' not found. Available: {avail}",
-            ) from exc
-        except ImportError as exc:
-            # See non-streaming branch above — 501 for missing optional dep.
-            raise HTTPException(status_code=501, detail=str(exc)) from exc
-        except ModelLoadingError as exc:
-            raise HTTPException(status_code=503, detail=str(exc)) from exc
-        except (ModelTooLargeError, InsufficientMemoryError) as exc:
-            raise HTTPException(status_code=507, detail=str(exc)) from exc
-        except EnginePoolError as exc:
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        except BaseException as exc:
+            pool.release_engine(resolved)
+            _raise_pool_acquire_http(exc, request.model)
         if not isinstance(engine, TTSEngine):
+            pool.release_engine(resolved)
             raise HTTPException(
                 status_code=400,
                 detail=f"Model '{request.model}' is not a text-to-speech model",
             )
-        pool.acquire_engine(resolved)
 
         stream_ref_audio_path = _write_ref_audio_tempfile(ref_audio_bytes)
         released_flag = [False]
