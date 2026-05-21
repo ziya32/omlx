@@ -311,28 +311,6 @@ class ProcessMemoryEnforcer:
         if new_level == "ok":
             return
 
-        # HARD-only action: abort any in-progress model loads. Prevents
-        # further memory growth without touching loaded engines. Runs
-        # even when ``current`` is still under the absolute limit (HEAD
-        # measures via ``max(active, phys_footprint)`` which can flag
-        # HARD on transient phys_footprint overshoot before MLX-active
-        # actually saturates).
-        if new_level == "hard":
-            aborted_any = False
-            for entry in self._engine_pool._entries.values():
-                if entry.is_loading and not entry.abort_loading:
-                    logger.warning(
-                        f"Aborting in-progress load of "
-                        f"'{entry.model_id}' (hard memory pressure)"
-                    )
-                    entry.abort_loading = True
-                    aborted_any = True
-            if aborted_any:
-                # Aborting loads alone usually suffices to keep memory
-                # contained; let the next tick re-check before going
-                # further.
-                return
-
         # Full eviction loop is gated on the absolute ``max_bytes``
         # limit, not the SOFT/HARD watermarks. SOFT/HARD signals are
         # consumed by admission control (``_propagate_memory_limit``

@@ -807,6 +807,17 @@ class TestTwoWatermarkPressureLevels:
 
     @pytest.mark.asyncio
     async def test_hard_aborts_loading(self, enforcer_2wm, pool):
+        """Over-limit + no non-pinned victim → abort in-progress loads.
+
+        The HARD load-abort is now a last-resort lever inside the
+        eviction loop (only reached when ``current > max_bytes`` AND
+        ``_find_drain_or_evict_candidate`` returns None AND pinned
+        engines have no in-flight requests to abort). Tests with
+        gpf=99GB used to satisfy "HARD level" but were below
+        max_bytes=100GB — under the new semantics the enforcer
+        short-circuits at the "current <= max_bytes" gate. Bump
+        gpf to 110GB (over limit) so the eviction loop runs.
+        """
         loading_entry = _make_entry("loading", engine=None, is_loading=True)
         pool._entries = {"loading": loading_entry}
         pool._find_drain_or_evict_candidate.return_value = None
@@ -814,7 +825,7 @@ class TestTwoWatermarkPressureLevels:
         with patch("omlx.process_memory_enforcer.mx") as mock_mx, \
              patch("omlx.process_memory_enforcer.get_phys_footprint") as gpf:
             mock_mx.get_active_memory.return_value = 60 * 1024**3
-            gpf.return_value = 99 * 1024**3  # hard
+            gpf.return_value = 110 * 1024**3  # over max_bytes (100GB)
             await enforcer_2wm._check_and_enforce()
 
         assert loading_entry.abort_loading is True
