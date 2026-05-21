@@ -846,7 +846,15 @@ async def create_speech(
             if instruct is None and ms.default_instruct:
                 instruct = ms.default_instruct
 
-    # Load the engine via pool
+    # Load the engine via pool. Same error taxonomy as _use_engine
+    # (mcp_routes / LLM endpoints) — see audio_routes._use_engine for
+    # rationale on each status code.
+    from omlx.exceptions import (
+        EnginePoolError,
+        InsufficientMemoryError,
+        ModelLoadingError,
+        ModelTooLargeError,
+    )
     try:
         engine = await pool.get_engine(resolved_model)
     except ModelNotFoundError as exc:
@@ -861,7 +869,13 @@ async def create_speech(
         # the functionality until ops installs the dep, not a transient
         # 503 condition.
         raise HTTPException(status_code=501, detail=str(exc)) from exc
-    except Exception as exc:
+    except ModelLoadingError as exc:
+        # Cooldown / transient load failure — retryable.
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except (ModelTooLargeError, InsufficientMemoryError) as exc:
+        # Terminal — model can't fit.
+        raise HTTPException(status_code=507, detail=str(exc)) from exc
+    except EnginePoolError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     if not isinstance(engine, TTSEngine):
@@ -906,9 +920,21 @@ async def create_speech(
         resolved = pool.resolve_model_id(request.model, sm) if sm else request.model
         try:
             engine = await pool.get_engine(resolved)
+        except ModelNotFoundError as exc:
+            avail = ", ".join(exc.available_models) if exc.available_models else "(none)"
+            raise HTTPException(
+                status_code=404,
+                detail=f"Model '{request.model}' not found. Available: {avail}",
+            ) from exc
         except ImportError as exc:
             # See non-streaming branch above — 501 for missing optional dep.
             raise HTTPException(status_code=501, detail=str(exc)) from exc
+        except ModelLoadingError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except (ModelTooLargeError, InsufficientMemoryError) as exc:
+            raise HTTPException(status_code=507, detail=str(exc)) from exc
+        except EnginePoolError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
         if not isinstance(engine, TTSEngine):
             raise HTTPException(
                 status_code=400,
