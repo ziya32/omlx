@@ -358,12 +358,40 @@ class ProcessMemoryEnforcer:
 
         async with self._engine_pool._lock:
             while self._current_usage_bytes() > target:
-                # ``_find_drain_or_evict_candidate`` is the drain-aware
-                # successor of pre-v0.3.9 ``_find_lru_victim``: returns
-                # the LRU non-pinned model, skipping DRAINING/LOADING/
-                # UNLOADING, preferring idle, falling back to busy.
-                # Under HARD we evict regardless of busy state.
+                # ``_find_drain_or_evict_candidate`` ranks idle non-pinned
+                # first and busy non-pinned last. Under stress workloads
+                # where ALL non-pinned models are actively serving (the
+                # test_17_max_stress shape: 4 small models with concurrent
+                # requests), the LRU among busy models still gets returned.
+                # Aborting it cascades 503 responses to every client of
+                # that model.
+                #
+                # Pre-v0.3.9 ``_find_lru_victim`` filtered busy models out
+                # entirely — returned None when all non-pinned were busy.
+                # The enforcer then took no eviction action (just logged),
+                # letting the natural completion of in-flight work drain
+                # memory back under the limit. Preserve that semantic by
+                # re-checking the candidate's busy state and treating
+                # busy-only candidates as "no victim".
                 victim = self._engine_pool._find_drain_or_evict_candidate()
+                _busy_only_non_pinned = False
+                if victim is not None:
+                    v_entry = self._engine_pool._entries.get(victim)
+                    if v_entry is not None and v_entry.engine is not None:
+                        try:
+                            v_busy = (
+                                v_entry.engine.has_active_requests()
+                                or getattr(v_entry, "active_uses", 0) > 0
+                            )
+                        except (AttributeError, TypeError):
+                            v_busy = False
+                        if v_busy is True:
+                            # Best candidate is busy → no eviction-safe
+                            # target. Mark so we don't escalate to
+                            # aborting pinned engines' requests below
+                            # (which would kill the VLM in stress tests).
+                            victim = None
+                            _busy_only_non_pinned = True
                 if victim is not None:
                     loaded_non_pinned = [
                         mid
@@ -418,12 +446,27 @@ class ProcessMemoryEnforcer:
                     # signaled, eviction can't help further without aborts.
                     break
 
-                # No non-pinned victim — all loaded models are pinned.
-                # Feature 102fe6b: try reclaiming memory from in-flight
-                # requests on pinned engines without unloading the weights.
-                # KV cache + vision encoder activations are the dominant
-                # transient consumers; aborting active requests releases
-                # both while the model itself stays resident.
+                # No non-pinned victim. Two cases:
+                #
+                # 1. All non-pinned are also busy (we filtered to None
+                #    above). Aborting pinned engines' in-flight requests
+                #    here would kill the VLM stream under stress — the
+                #    very thing the test is trying to keep alive.
+                #    Just log + break; let natural completion drain.
+                # 2. All loaded models are genuinely pinned (no non-
+                #    pinned at all). Then pinned-abort is the only lever
+                #    left — Feature 102fe6b reclaims KV/vision-encoder
+                #    activations without unloading weights.
+                if _busy_only_non_pinned:
+                    logger.warning(
+                        "Memory over limit (current=%s, max=%s) but all "
+                        "non-pinned models are actively serving requests; "
+                        "deferring eviction to next tick. Admission pause "
+                        "already signaled.",
+                        _format_gb(current), _format_gb(self._max_bytes),
+                    )
+                    break
+
                 pinned_entries = [
                     e for e in self._engine_pool._entries.values()
                     if e.engine is not None and e.is_pinned
