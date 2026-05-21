@@ -2851,7 +2851,15 @@ async def create_chat_completion(
                 model=request.model,
                 choices=[ChatCompletionChoice(
                     message=AssistantMessage(
-                        content=cleaned_text.strip() if cleaned_text else None,
+                        # Always emit content as a string (possibly empty)
+                        # so the OpenAI-compatible JSON shape has the
+                        # ``content`` field present. ``model_dump_json
+                        # (exclude_none=True)`` would otherwise drop a
+                        # None-valued content entirely when the VLM emits
+                        # only reasoning_content or tool_calls — clients
+                        # expecting ``message.content`` (OpenAI spec) then
+                        # raise KeyError.
+                        content=cleaned_text.strip() if cleaned_text else "",
                         reasoning_content=cleaned_thinking if cleaned_thinking else None,
                         tool_calls=tool_calls,
                     ),
