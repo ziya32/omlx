@@ -125,13 +125,27 @@ def _get_settings_manager():
 async def _use_engine(model_id: str):
     """Get an engine with eviction protection for the duration of the block.
 
-    Converts ModelNotFoundError to HTTP 404, EngineEvictedError (raised by
-    pool.ensure_engine_alive on the post-get-engine race check) to HTTP 503,
-    and ImportError (raised by audio engine load when an optional dependency
-    like mlx-audio isn't installed) to HTTP 501 with the engine's actionable
-    install message — so callers don't need to handle them individually.
+    Engine-pool error mapping (mirrors the LLM endpoints'
+    ``get_engine_for_model`` path in server.py):
+
+    - ``ModelNotFoundError``      → 404
+    - ``ImportError``             → 501 (missing optional dep, e.g. mlx-audio)
+    - ``ModelLoadingError``       → 503 retryable (transient load failure
+                                    OR cooldown; the test client's retry
+                                    loop already handles 503)
+    - ``ModelTooLargeError``      → 507 (model doesn't fit, terminal)
+    - ``InsufficientMemoryError`` → 507 (can't free enough, terminal)
+    - ``EngineEvictedError``      → 503 (post-acquire race; retryable)
+    - other ``EnginePoolError``   → 500
     """
-    from omlx.exceptions import EngineEvictedError, ModelNotFoundError
+    from omlx.exceptions import (
+        EngineEvictedError,
+        EnginePoolError,
+        InsufficientMemoryError,
+        ModelLoadingError,
+        ModelNotFoundError,
+        ModelTooLargeError,
+    )
 
     pool = _get_engine_pool()
     sm = _get_settings_manager()
@@ -153,6 +167,17 @@ async def _use_engine(model_id: str):
         # Using 501 also keeps clients with 503-retry policies from
         # uselessly pounding the endpoint.
         raise HTTPException(status_code=501, detail=str(exc)) from exc
+    except ModelLoadingError as exc:
+        # Cooldown gate (model recently failed to load) OR transient load
+        # failure (enforcer abort, intermittent Metal alloc error).
+        # 503 lets the test client / SDK retry transparently.
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except (ModelTooLargeError, InsufficientMemoryError) as exc:
+        # Terminal — model doesn't fit. 507 Insufficient Storage matches
+        # the LLM endpoints' mapping in server.py:751.
+        raise HTTPException(status_code=507, detail=str(exc)) from exc
+    except EnginePoolError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     pool.acquire_engine(resolved)
     try:
