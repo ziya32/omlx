@@ -320,6 +320,7 @@ class TestEngineCoreAbortRequest:
 
             try:
                 await engine.start()
+                engine.scheduler.has_requests = lambda: False
 
                 request_id = await engine.add_request(prompt="Hello")
                 await engine.abort_request(request_id)
@@ -361,6 +362,7 @@ class TestEngineCoreAbortRequest:
 
             try:
                 await engine.start()
+                engine.scheduler.has_requests = lambda: False
 
                 request_id = await engine.add_request(prompt="Hello")
 
@@ -414,6 +416,7 @@ class TestEngineCoreAbortRequest:
 
             try:
                 await engine.start()
+                engine.scheduler.has_requests = lambda: False
 
                 # Prevent step() from running (MockModel can't support
                 # BatchGenerator — _do_external_prefill would fail with
@@ -570,6 +573,7 @@ class TestEngineCoreGenerateCancellation:
 
             try:
                 await engine.start()
+                engine.scheduler.has_requests = lambda: False
 
                 # Prevent step() from running (MockModel can't support
                 # BatchGenerator), so the engine loop stays idle and the
@@ -936,6 +940,7 @@ class TestEngineCoreAbortAllRequests:
 
             try:
                 await engine.start()
+                engine.scheduler.has_requests = lambda: False
 
                 # Add multiple requests
                 rid1 = await engine.add_request(prompt="Hello")
@@ -999,6 +1004,7 @@ class TestEngineCoreAbortAllRequests:
 
             try:
                 await engine.start()
+                engine.scheduler.has_requests = lambda: False
 
                 rid = await engine.add_request(prompt="Hello")
                 await engine.abort_all_requests()

@@ -24,6 +24,7 @@ import mlx.core as mx
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..exceptions import RequestAbortedError
+from ..utils.model_loading import maybe_apply_pre_load_patches
 from .base import BaseEngine, GenerationOutput
 
 logger = logging.getLogger(__name__)
@@ -127,6 +128,17 @@ class DFlashEngine(BaseEngine):
         # dflash_draft_sink_size, dflash_verify_mode, etc.). None means
         # stream_dflash_generate will use its own defaults.
         self._runtime_context: Any | None = None
+        # dflash prefix cache reference (populated in start() / cleared
+        # on eviction). Kept here so callers that touch the attribute
+        # after a failed start() don't AttributeError.
+        self._dflash_prefix_cache: Any | None = None
+        # L2 SSD cache max bytes (PR #1326). None falls back to the
+        # 20 GiB default; ``_resolve_dflash_l2_dir`` consumes this.
+        self._ssd_cache_max_bytes = int(
+            getattr(model_settings, "dflash_ssd_cache_max_bytes", 20 * 1024**3)
+            if model_settings
+            else 20 * 1024**3
+        )
         # Cached settings reads for #1276 tuning. None → let dflash-mlx pick
         # its default (window=1024, sink=64, verify_mode='adaptive').
         self._draft_window_size = (
@@ -247,9 +259,12 @@ class DFlashEngine(BaseEngine):
             prefix_cache_max_bytes=self._in_memory_cache_max_bytes,
             prefix_cache_l2=l2_enabled,
             prefix_cache_l2_dir=str(l2_dir) if l2_dir else "",
-            # 1 TiB sentinel — disk usage is bounded by the omlx SSD cache
-            # configuration; dflash's own byte limit is intentionally large.
-            prefix_cache_l2_max_bytes=1 << 40 if l2_enabled else 0,
+            # Per-model L2 disk budget. dflash-mlx's _evict_to_budget drops
+            # the oldest snapshots once dflash_l2/ exceeds this, so the
+            # directory stays bounded instead of filling the disk
+            # (PR #1326). Falls back to the 20 GiB default set in
+            # __init__ via ModelSettings.
+            prefix_cache_l2_max_bytes=self._ssd_cache_max_bytes if l2_enabled else 0,
             # None → dflash-mlx fills in DEFAULT_RUNTIME_CONFIG values
             # (window=1024, sink=64, verify_mode='adaptive').
             draft_window_size=self._draft_window_size,
@@ -346,7 +361,18 @@ class DFlashEngine(BaseEngine):
                 load_target_bundle, load_draft_bundle,
             )
 
+            # Apply the same pre-load patches BatchedEngine uses before
+            # mlx_lm.load() runs. MTP-bearing targets (e.g. Qwen3.6 *-mtp)
+            # need the MTP-compat sanitize patch or stock mlx-lm double-shifts
+            # the already-converted norm and emits garbage. dflash and mtp are
+            # mutually exclusive per model_settings, so this never attaches an
+            # MTP head; it only fixes sanitize. See issue #1318.
+            maybe_apply_pre_load_patches(
+                self._model_name, model_settings=self._model_settings
+            )
+
             model, tokenizer, meta = load_target_bundle(self._model_name)
+
             draft, draft_meta = load_draft_bundle(
                 self._draft_model_path,
                 quantize_draft=bool(self._draft_quant_bits),
