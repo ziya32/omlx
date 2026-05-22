@@ -383,10 +383,10 @@
             benchCopied: false,
             benchTip: null,
             benchDeviceInfo: null,
-            benchUploadResults: [],
-            benchUploadDone: null,
-            benchUploading: false,
-            benchUploadSkipped: null,  // { features: [...] } when upload was skipped due to experimental features
+            benchSaving: false,        // true while the backend persists the finished run
+            benchSaved: null,          // { saved, record } from the terminal 'saved' SSE event
+            benchSavedList: [],        // history of locally saved runs (GET /api/bench/saved)
+            benchSavedExpanded: {},    // { [id]: true } — which history rows are expanded
 
             // Bench sub-tab & dropdown
             benchTab: 'throughput',
@@ -554,6 +554,7 @@
                 if (value === 'bench') {
                     if (!this.benchDeviceInfo) await this.loadBenchDeviceInfo();
                     await this.loadAccState();
+                    await this.loadSavedBenchmarks();
                 }
             },
 
@@ -2475,10 +2476,8 @@
                 this.benchBatchResults = [];
                 this.benchError = '';
                 this.benchBenchId = null;
-                this.benchUploadResults = [];
-                this.benchUploadDone = null;
-                this.benchUploading = false;
-                this.benchUploadSkipped = null;
+                this.benchSaving = false;
+                this.benchSaved = null;
 
                 try {
                     const response = await fetch('/admin/api/bench/start', {
@@ -2540,31 +2539,24 @@
                                 this.benchBatchResults = [...this.benchBatchResults, data.data];
                             }
                         } else if (data.type === 'done') {
-                            // Benchmark tests done, uploading starts
-                            this.benchUploading = true;
+                            // Benchmark tests done, local save starts
+                            this.benchSaving = true;
                             this.benchProgress = {
-                                phase: 'upload',
-                                message: 'Uploading to community benchmarks...',
+                                phase: 'save',
+                                message: 'Saving results locally...',
                                 current: 0,
                                 total: 0,
                             };
                             this.loadModels();
-                        } else if (data.type === 'upload') {
-                            this.benchUploadResults = [...this.benchUploadResults, data.data];
-                        } else if (data.type === 'upload_done') {
-                            this.benchUploadDone = data.data;
-                            this.benchUploading = false;
+                        } else if (data.type === 'saved') {
+                            // Terminal event: run persisted to the base dir
+                            this.benchSaved = data.data;
+                            this.benchSaving = false;
                             this.benchRunning = false;
                             this.benchProgress = null;
                             es.close();
                             this.benchEventSource = null;
-                        } else if (data.type === 'upload_skipped') {
-                            this.benchUploadSkipped = { features: data.features || [] };
-                            this.benchUploading = false;
-                            this.benchRunning = false;
-                            this.benchProgress = null;
-                            es.close();
-                            this.benchEventSource = null;
+                            this.loadSavedBenchmarks();
                             this.loadModels();
                         } else if (data.type === 'error') {
                             this.benchError = data.message;
@@ -2599,6 +2591,60 @@
                     console.error('Failed to cancel benchmark:', err);
                 }
                 // SSE handler will update state when error/done event arrives
+            },
+
+            async loadSavedBenchmarks() {
+                try {
+                    const response = await fetch('/admin/api/bench/saved');
+                    if (response.status === 401) { window.location.href = '/admin'; return; }
+                    if (!response.ok) return;
+                    const data = await response.json();
+                    this.benchSavedList = data.benchmarks || [];
+                } catch (err) {
+                    console.error('Failed to load saved benchmarks:', err);
+                }
+            },
+
+            async deleteSavedBenchmark(id) {
+                try {
+                    const response = await fetch(`/admin/api/bench/saved/${encodeURIComponent(id)}`, { method: 'DELETE' });
+                    if (response.status === 401) { window.location.href = '/admin'; return; }
+                    if (response.ok || response.status === 404) {
+                        this.benchSavedList = this.benchSavedList.filter(b => b.id !== id);
+                        const { [id]: _removed, ...rest } = this.benchSavedExpanded;
+                        this.benchSavedExpanded = rest;
+                    }
+                } catch (err) {
+                    console.error('Failed to delete saved benchmark:', err);
+                }
+            },
+
+            async clearSavedBenchmarks() {
+                try {
+                    const response = await fetch('/admin/api/bench/saved', { method: 'DELETE' });
+                    if (response.status === 401) { window.location.href = '/admin'; return; }
+                    if (response.ok) {
+                        this.benchSavedList = [];
+                        this.benchSavedExpanded = {};
+                    }
+                } catch (err) {
+                    console.error('Failed to clear saved benchmarks:', err);
+                }
+            },
+
+            toggleSavedBenchmark(id) {
+                this.benchSavedExpanded = { ...this.benchSavedExpanded, [id]: !this.benchSavedExpanded[id] };
+            },
+
+            benchChipLabel(hw) {
+                if (!hw) return '';
+                return [hw.chip_name, hw.chip_variant].filter(Boolean).join(' ');
+            },
+
+            benchFormatSavedDate(ts) {
+                if (!ts) return '';
+                const d = new Date(ts);
+                return isNaN(d) ? ts : d.toLocaleString();
             },
 
             benchGetSpeedup(batchResult) {
@@ -3007,8 +3053,8 @@
                 for (const m of models) {
                     lines.push('');
                     lines.push('Model: ' + m);
-                    lines.push(rpad('Benchmark', 16) + pad('Accuracy', 10) + pad('Correct', 10) + pad('Total', 8) + pad('Time(s)', 10) + pad('Think', 8));
-                    lines.push('-'.repeat(62));
+                    lines.push(rpad('Benchmark', 16) + pad('Accuracy', 10) + pad('Correct', 10) + pad('Total', 8) + pad('Time(s)', 10) + pad('Think', 8) + '  ' + 'Completed');
+                    lines.push('-'.repeat(84));
                     for (const r of this.accAllResults.filter(r => r.model_id === m)) {
                         lines.push(
                             rpad(r.benchmark.toUpperCase(), 16) +
@@ -3016,7 +3062,8 @@
                             pad(r.correct, 10) +
                             pad(r.total, 8) +
                             pad(r.time_s, 10) +
-                            pad(r.thinking_used ? 'Yes' : 'No', 8)
+                            pad(r.thinking_used ? 'Yes' : 'No', 8) +
+                            '  ' + (r.timestamp ? this.benchFormatSavedDate(r.timestamp) : '-')
                         );
                     }
                 }

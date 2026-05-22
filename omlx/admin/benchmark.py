@@ -12,6 +12,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -329,8 +330,6 @@ async def _run_batch_test(
     }
 
 
-OMLX_AI_API_URL = "https://omlx.ai/api/benchmarks"
-
 # Quantization patterns to strip from model directory names
 _QUANT_SUFFIXES = re.compile(
     r"[-_](2bit|3bit|4bit|6bit|8bit|fp16|bf16|fp32|MXFP4|NVFP4)$", re.IGNORECASE
@@ -378,90 +377,94 @@ def _clean_model_name(model_id: str, quantization: str) -> str:
     return name.strip("-_ ")
 
 
-def _sanitize_upload_error(resp: Any) -> str:
-    """Extract a user-presentable error string from a failed upload response.
+# --- Local persistence (disk-backed) ---
+#
+# Perf benchmark runs were previously POSTed to the omlx.ai community
+# leaderboard. They are now persisted locally under the oMLX base dir and
+# surfaced in the admin "Saved Benchmarks" panel instead. A single JSON file
+# holds the list of saved runs.
 
-    Avoids dumping raw HTML bodies (e.g. Cloudflare's "Just a moment..."
-    challenge interstitial) into the dashboard's red-x error column.
-    Detects CF mitigation specifically so users get actionable context
-    instead of a 5KB markup blob.
 
-    Resolution order:
-    1. Cloudflare challenge — header ``cf-mitigated: challenge`` is
-       authoritative; a body sniff for "just a moment" / "cf-chl" covers
-       edge transports that strip the header.
-    2. JSON envelope — the omlx.ai API's normal error shape; extract
-       ``error`` / ``detail`` / ``message`` if present, truncated.
-    3. Plain-text body — short responses only; HTML-looking bodies are
-       collapsed to a one-line "non-JSON response (N bytes)" hint.
-    4. Fallback to the bare HTTP status code.
-    """
-    headers = getattr(resp, "headers", {}) or {}
-    cf_mitigated = str(headers.get("cf-mitigated", "")).lower()
-    body = getattr(resp, "text", "") or ""
-    status = getattr(resp, "status_code", "?")
-
-    body_head = body[:512].lower()
-    if cf_mitigated == "challenge" or "just a moment" in body_head or "cf-chl" in body_head:
-        return (
-            f"Upload blocked by Cloudflare (HTTP {status}). "
-            f"This is a server-side issue with omlx.ai — retry later or "
-            f"report it to the maintainer."
-        )
-
+def _perf_results_file() -> Optional[Path]:
+    """Return {base_path}/perf_benchmarks.json, or None if settings unavailable."""
     try:
-        data = resp.json()
-        msg = data.get("error") or data.get("detail") or data.get("message")
-        if msg:
-            return str(msg)[:300]
-    except Exception:
-        pass
-
-    text = body.strip()
-    if "<" in text and ">" in text:
-        return f"HTTP {status} — unexpected non-JSON response ({len(body)} bytes)"
-    return text[:300] or f"HTTP {status}"
+        from ..settings import get_settings
+        return get_settings().base_path / "perf_benchmarks.json"
+    except Exception as e:
+        logger.debug(f"Perf benchmarks: settings not ready yet ({e})")
+        return None
 
 
-async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
-    """Upload benchmark results to omlx.ai community benchmarks.
+def load_saved_benchmarks() -> list[dict]:
+    """Load saved perf benchmark records from disk, newest first.
 
-    Sends each single-request result as a separate submission,
-    grouped by submission_group. Upload failures don't affect
-    the benchmark run status.
+    Missing file or parse errors are treated as an empty result set.
     """
-    import requests
+    path = _perf_results_file()
+    if path is None or not path.exists():
+        return []
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        logger.warning(f"Failed to load perf benchmarks from {path}: {e}")
+        return []
+    records = [r for r in data if isinstance(r, dict)] if isinstance(data, list) else []
+    records.sort(key=lambda r: r.get("timestamp", ""), reverse=True)
+    return records
 
+
+def _write_saved_benchmarks(records: list[dict]) -> None:
+    """Persist the full list of saved records atomically (temp file + rename)."""
+    path = _perf_results_file()
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(records, f, ensure_ascii=False, indent=2)
+    tmp.replace(path)
+
+
+def delete_saved_benchmark(saved_id: str) -> bool:
+    """Delete a saved benchmark record by id. Returns True if one was removed."""
+    records = load_saved_benchmarks()
+    remaining = [r for r in records if r.get("id") != saved_id]
+    if len(remaining) == len(records):
+        return False
+    _write_saved_benchmarks(remaining)
+    return True
+
+
+def clear_saved_benchmarks() -> int:
+    """Delete all saved benchmark records. Returns the number removed."""
+    records = load_saved_benchmarks()
+    if records:
+        _write_saved_benchmarks([])
+    return len(records)
+
+
+async def _save_benchmark_results(run: BenchmarkRun, engine_pool: Any) -> None:
+    """Persist a completed benchmark run to the local oMLX base dir.
+
+    Builds a self-contained record (hardware, model, single-request and
+    batching results) and appends it to {base_path}/perf_benchmarks.json.
+    The admin "Saved Benchmarks" panel reads these back. Save failures
+    don't affect the benchmark run status.
+    """
     from .._version import __version__
     from ..utils.hardware import (
-        compute_owner_hash,
         get_chip_name,
         get_gpu_core_count,
-        get_io_platform_uuid,
         get_os_version,
         get_total_memory_gb,
         parse_chip_info,
     )
 
-    # Skip upload when experimental features were active during the run.
-    # These features (DFlash, SpecPrefill, TurboQuant KV) skew throughput
-    # and would pollute the community leaderboard if mixed in unmarked.
-    if run.experimental_features:
-        await _send_event(run, {
-            "type": "upload_skipped",
-            "reason": "experimental_features",
-            "features": list(run.experimental_features),
-        })
-        logger.info(
-            f"Benchmark upload skipped: experimental features active: "
-            f"{run.experimental_features}"
-        )
-        return
-
     await _send_event(run, {
         "type": "progress",
-        "phase": "upload",
-        "message": "Uploading to community benchmarks...",
+        "phase": "save",
+        "message": "Saving results locally...",
         "current": 0,
         "total": 0,
     })
@@ -472,16 +475,6 @@ async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
     memory_gb = round(get_total_memory_gb())
     gpu_cores = get_gpu_core_count()
     os_version = get_os_version()
-    omlx_version = __version__
-
-    # Compute owner_hash
-    owner_hash_full = None
-    owner_hash_display = None
-    io_uuid = get_io_platform_uuid()
-    if io_uuid:
-        owner_hash_full = compute_owner_hash(io_uuid, chip_name, gpu_cores, memory_gb)
-        # Display hash is without the verify character
-        owner_hash_display = owner_hash_full[:-1]
 
     # Get model info
     entry = engine_pool.get_entry(run.request.model_id)
@@ -489,144 +482,88 @@ async def _upload_to_omlx_ai(run: BenchmarkRun, engine_pool: Any) -> None:
     quantization = _detect_quantization(model_path)
     model_name = _clean_model_name(run.request.model_id, quantization)
 
-    # Generate submission group
-    submission_group = str(uuid.uuid4())
-
     # Collect single results and batch results
     single_results = [r for r in run.results if r.get("test_type") == "single"]
     batch_results = [r for r in run.results if r.get("test_type") == "batch"]
 
-    # Build batching_results from batch data
-    batching_results = []
+    single_out = []
+    for result in single_results:
+        peak_mem_gb = None
+        if result.get("peak_memory_bytes") and result["peak_memory_bytes"] > 0:
+            peak_mem_gb = round(result["peak_memory_bytes"] / (1024**3), 2)
+        single_out.append({
+            "context_length": result["pp"],
+            "pp_tps": result["processing_tps"],
+            "tg_tps": result["gen_tps"],
+            "ttft_ms": result.get("ttft_ms"),
+            "peak_memory_gb": peak_mem_gb,
+        })
+
+    # Build batching_results: speedups relative to the pp1024 baseline.
+    batching_out = []
     pp1024_single = next(
         (r for r in single_results if r.get("pp") == 1024), None
     )
     if pp1024_single and batch_results:
         baseline_tps = pp1024_single["gen_tps"]
-        batching_results.append({
+        batching_out.append({
             "batch_size": 1,
             "tg_tps": baseline_tps,
             "speedup": 1.0,
         })
         for br in batch_results:
             speedup = round(br["tg_tps"] / baseline_tps, 2) if baseline_tps > 0 else 1.0
-            batching_results.append({
+            batching_out.append({
                 "batch_size": br["batch_size"],
                 "tg_tps": br["tg_tps"],
                 "speedup": speedup,
             })
 
-    success_count = 0
-    failed_count = 0
-
-    for result in single_results:
-        context_length = result["pp"]
-        peak_mem_gb = None
-        if result.get("peak_memory_bytes") and result["peak_memory_bytes"] > 0:
-            peak_mem_gb = round(result["peak_memory_bytes"] / (1024**3), 2)
-
-        payload = {
+    record = {
+        "id": run.bench_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "model_id": run.request.model_id,
+        "model_name": model_name,
+        "quantization": quantization,
+        # Non-empty when DFlash/SpecPrefill/TurboQuant KV were active. These
+        # skew throughput, so the UI badges such runs as not comparable.
+        "experimental_features": list(run.experimental_features),
+        "hardware": {
             "chip_name": chip_name,
             "chip_variant": chip_variant,
             "memory_gb": memory_gb,
             "gpu_cores": gpu_cores,
-            "omlx_version": omlx_version,
             "os_version": os_version,
-            "model_name": model_name,
-            "quantization": quantization,
-            "context_length": context_length,
-            "pp_tps": result["processing_tps"],
-            "tg_tps": result["gen_tps"],
-            "ttft_ms": result.get("ttft_ms"),
-            "peak_memory_gb": peak_mem_gb,
-            "submission_group": submission_group,
-        }
+            "omlx_version": __version__,
+        },
+        "single_results": single_out,
+        "batching_results": batching_out,
+    }
 
-        if owner_hash_full:
-            payload["owner_hash"] = owner_hash_full
-
-        # Attach batching_results only to the first submission (lowest context_length)
-        if context_length == single_results[0]["pp"] and batching_results:
-            payload["batching_results"] = batching_results
-
-        try:
-            resp = await asyncio.to_thread(
-                requests.post,
-                OMLX_AI_API_URL,
-                json=payload,
-                timeout=15,
-            )
-
-            if resp.status_code == 201:
-                data = resp.json()
-                success_count += 1
-                await _send_event(run, {
-                    "type": "upload",
-                    "data": {
-                        "context_length": context_length,
-                        "id": data.get("id"),
-                        "url": data.get("url"),
-                    },
-                })
-            elif resp.status_code == 409:
-                data = resp.json()
-                success_count += 1  # Duplicate is still ok
-                await _send_event(run, {
-                    "type": "upload",
-                    "data": {
-                        "context_length": context_length,
-                        "id": data.get("existing_id"),
-                        "url": data.get("existing_url"),
-                        "duplicate": True,
-                    },
-                })
-            else:
-                failed_count += 1
-                error_msg = _sanitize_upload_error(resp)
-                await _send_event(run, {
-                    "type": "upload",
-                    "data": {
-                        "context_length": context_length,
-                        "error": error_msg,
-                    },
-                })
-                # Surface the sanitized message to ops; the full body
-                # (truncated) goes to debug so it can still be retrieved
-                # from the log file if needed.
-                logger.warning(
-                    f"Benchmark upload failed for pp{context_length}: "
-                    f"{resp.status_code} {error_msg}"
-                )
-                if (resp.text or "")[:1] not in ("{", "["):
-                    logger.debug(
-                        "Benchmark upload non-JSON body (truncated): %r",
-                        (resp.text or "")[:500],
-                    )
-
-        except Exception as e:
-            failed_count += 1
-            await _send_event(run, {
-                "type": "upload",
-                "data": {
-                    "context_length": context_length,
-                    "error": str(e),
-                },
-            })
-            logger.warning(f"Benchmark upload error for pp{context_length}: {e}")
+    saved = False
+    try:
+        records = load_saved_benchmarks()
+        # Replace any existing record with the same id (idempotent re-save).
+        records = [r for r in records if r.get("id") != record["id"]]
+        records.append(record)
+        await asyncio.to_thread(_write_saved_benchmarks, records)
+        saved = True
+    except Exception as e:
+        logger.warning(f"Failed to save benchmark {run.bench_id} locally: {e}")
 
     await _send_event(run, {
-        "type": "upload_done",
+        "type": "saved",
         "data": {
-            "owner_hash": owner_hash_display,
-            "total": len(single_results),
-            "success": success_count,
-            "failed": failed_count,
+            "saved": saved,
+            "record": record if saved else None,
         },
     })
 
-    logger.info(
-        f"Benchmark upload complete: {success_count}/{len(single_results)} succeeded"
-    )
+    if saved:
+        logger.info(
+            f"Benchmark saved locally: {model_name} "
+            f"({len(single_out)} context length(s)) -> {_perf_results_file()}"
+        )
 
 
 async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
@@ -721,8 +658,6 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
         logger.info("Benchmark: warmup complete")
 
         # Phase 3: Single request tests
-        single_pp1024_gen_tps = None
-
         for pp_len in request.prompt_lengths:
             current_test += 1
             await _send_event(run, {
@@ -749,10 +684,6 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             run.results.append(result)
 
             await _send_event(run, {"type": "result", "data": result})
-
-            # Store pp1024 gen_tps for speedup calculation
-            if pp_len == 1024:
-                single_pp1024_gen_tps = metrics["gen_tps"]
 
         # Phase 4: Batch tests
         # Each request has a unique UUID prefix (no cache hits)
@@ -819,18 +750,18 @@ async def run_benchmark(run: BenchmarkRun, engine_pool: Any) -> None:
             },
         })
 
-        # Upload results to omlx.ai (failures don't affect benchmark status)
+        # Save results locally (failures don't affect benchmark status).
+        # The "saved" event is terminal for the SSE stream, so emit one
+        # even if persistence raised, otherwise the client hangs.
         try:
-            await _upload_to_omlx_ai(run, engine_pool)
+            await _save_benchmark_results(run, engine_pool)
         except Exception as e:
-            logger.warning(f"Benchmark upload to omlx.ai failed: {e}")
+            logger.warning(f"Benchmark local save failed: {e}")
             await _send_event(run, {
-                "type": "upload_done",
+                "type": "saved",
                 "data": {
-                    "owner_hash": None,
-                    "total": 0,
-                    "success": 0,
-                    "failed": 0,
+                    "saved": False,
+                    "record": None,
                     "error": str(e),
                 },
             })

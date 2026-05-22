@@ -5108,7 +5108,7 @@ async def stream_benchmark(
                 yield f"data: {json.dumps(event)}\n\n"
 
                 # Stop streaming on terminal events
-                if event.get("type") in ("upload_done", "error"):
+                if event.get("type") in ("saved", "error"):
                     break
         except asyncio.CancelledError:
             pass
@@ -5166,6 +5166,42 @@ async def get_benchmark_results(
         "results": run.results,
         "error": run.error_message if run.error_message else None,
     }
+
+
+@router.get("/api/bench/saved")
+async def list_saved_benchmarks(
+    is_admin: bool = Depends(require_admin),
+):
+    """List perf benchmark runs saved locally under the oMLX base dir."""
+    from .benchmark import load_saved_benchmarks
+
+    return {"benchmarks": load_saved_benchmarks()}
+
+
+@router.delete("/api/bench/saved")
+async def clear_saved_benchmarks_route(
+    is_admin: bool = Depends(require_admin),
+):
+    """Delete all locally saved perf benchmark runs."""
+    from .benchmark import clear_saved_benchmarks
+
+    removed = clear_saved_benchmarks()
+    return {"status": "cleared", "removed": removed}
+
+
+@router.delete("/api/bench/saved/{saved_id}")
+async def delete_saved_benchmark_route(
+    saved_id: str,
+    is_admin: bool = Depends(require_admin),
+):
+    """Delete a locally saved perf benchmark run by id."""
+    from .benchmark import delete_saved_benchmark
+
+    if not delete_saved_benchmark(saved_id):
+        raise HTTPException(
+            status_code=404, detail=f"Saved benchmark not found: {saved_id}"
+        )
+    return {"status": "deleted", "id": saved_id}
 
 
 @router.get("/api/device-info")
