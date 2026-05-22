@@ -4432,7 +4432,7 @@ class Scheduler:
                     > self._memory_limit_bytes
                 ):
                     now = time.monotonic()
-                    if now - self._last_defer_log_time >= 5.0:
+                    if now - self._last_defer_log_time >= 60.0:
                         self._last_defer_log_time = now
                         logger.info(
                             "Generation memory guard: deferring scheduling "
