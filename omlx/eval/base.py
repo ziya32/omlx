@@ -49,6 +49,12 @@ class BaseBenchmark(ABC):
 
     name: str = ""
     quick_size: int = 100
+    # Max concurrent answer-scoring operations. 0 ties it to the generation
+    # concurrency (batch_size). Benchmarks whose check_answer is a cheap
+    # string/number comparison leave this at 0; code benchmarks that execute
+    # generated code in subprocesses set a fixed cap so scoring can neither
+    # storm CPU/memory nor stall generation, no matter how high batch_size is.
+    score_concurrency: int = 0
 
     @abstractmethod
     async def load_dataset(self, sample_size: int = 0) -> list[dict]:
@@ -212,6 +218,28 @@ class BaseBenchmark(ABC):
             logger.warning(f"Engine error on question {index}: {e}")
             return index, item, "", prompt_text, ""
 
+    async def _score_result(
+        self, item: dict, response_text: str
+    ) -> tuple[str, bool]:
+        """Extract and check the answer for one generated response.
+
+        Returns (predicted, is_correct). The default runs inline, which is
+        correct for benchmarks whose check_answer is a cheap string/number
+        comparison. Code benchmarks override this to offload subprocess
+        execution to a thread so it doesn't block in-flight generation.
+        """
+        predicted = self.extract_answer(response_text, item)
+        is_correct = self.check_answer(predicted, item)
+        return predicted, is_correct
+
+    def _expected_label(self, item: dict) -> str:
+        """Value stored as the 'expected' answer in exported results."""
+        return str(item.get("answer", ""))
+
+    def _predicted_for_export(self, predicted: str) -> str:
+        """Transform the predicted answer for storage/export (e.g. truncate)."""
+        return predicted
+
     async def run(
         self,
         engine: Any,
@@ -223,101 +251,145 @@ class BaseBenchmark(ABC):
     ) -> BenchmarkResult:
         """Run the benchmark on all items.
 
+        Generation runs as a sliding window that keeps ``batch_size`` requests
+        in flight at all times: the moment one response returns, the next item
+        is dispatched, rather than waiting for a whole batch to finish. Answer
+        scoring happens as each response arrives, bounded separately (see
+        ``score_concurrency``) so a heavy scorer can't stall generation.
+
         Args:
             engine: oMLX engine instance with chat() method.
             items: Dataset items to evaluate.
             on_progress: Callback(current, total) for progress reporting.
-            batch_size: Number of concurrent requests (1 = sequential).
-            enable_thinking: Enable thinking mode for reasoning models.
-                When False, auto-detects if the model outputs <think> tags
-                and re-runs the first batch with thinking enabled.
+            batch_size: Number of concurrent requests in flight (1 = sequential).
+            enable_thinking: Enable thinking mode for reasoning models. When
+                False, probes the first item and, if the model emits <think>
+                tags anyway, switches the whole run to thinking mode (raising
+                the token budget so the answer isn't starved by the think block).
 
         Returns:
             BenchmarkResult with accuracy and per-question details.
         """
-        results: list[QuestionResult] = []
+        start_time = time.time()
+        total = len(items)
+        if total == 0:
+            return BenchmarkResult(
+                benchmark_name=self.name,
+                accuracy=0.0,
+                total_questions=0,
+                correct_count=0,
+                time_seconds=0.0,
+                question_results=[],
+                category_scores=None,
+                thinking_used=enable_thinking,
+            )
+
+        concurrency = max(1, batch_size)
+        thinking_used = enable_thinking
+
+        # Probe item 0 to detect models that emit <think> despite
+        # enable_thinking=False. The default answer budget is small, so a think
+        # block would consume it before the answer appears; detecting this lets
+        # the whole run use the larger thinking budget instead. The probe's
+        # output is reused (not regenerated) when no switch is needed.
+        probe: Optional[tuple] = None
+        if not thinking_used:
+            t0 = time.perf_counter()
+            probe_out = await self._eval_single(
+                engine, items[0], 0, sampling_kwargs, False
+            )
+            probe_latency = time.perf_counter() - t0
+            if "<think>" in probe_out[4]:
+                logger.warning(
+                    f"{self.name}: model outputs <think> tags with "
+                    "enable_thinking=False, switching to thinking mode"
+                )
+                thinking_used = True
+            else:
+                probe = (probe_out, probe_latency)
+
+        gen_sem = asyncio.Semaphore(concurrency)
+        score_sem = asyncio.Semaphore(
+            self.score_concurrency if self.score_concurrency > 0 else concurrency
+        )
+        # index -> (item, predicted, is_correct, response_text, prompt_text, latency)
+        collected: dict[int, tuple] = {}
+        completed = 0
+        progress_lock = asyncio.Lock()
+
+        async def handle(
+            index: int, item: dict, pre: Optional[tuple] = None
+        ) -> None:
+            nonlocal completed
+            if pre is None:
+                async with gen_sem:
+                    t = time.perf_counter()
+                    out = await self._eval_single(
+                        engine, item, index, sampling_kwargs, thinking_used
+                    )
+                    latency = time.perf_counter() - t
+            else:
+                out, latency = pre
+            response_text, prompt_text = out[2], out[3]
+            async with score_sem:
+                predicted, is_correct = await self._score_result(item, response_text)
+            collected[index] = (
+                item, predicted, is_correct, response_text, prompt_text, latency
+            )
+            async with progress_lock:
+                completed += 1
+                current = completed
+            if on_progress:
+                await on_progress(current, total)
+
+        tasks = [
+            asyncio.create_task(
+                handle(i, item, probe if (i == 0 and probe is not None) else None)
+            )
+            for i, item in enumerate(items)
+        ]
+        try:
+            await asyncio.gather(*tasks)
+        except BaseException:
+            # Includes CancelledError (raised by on_progress on user cancel):
+            # cancel any still-running generations before propagating.
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+
+        # Aggregate in item order.
         correct = 0
         category_correct: dict[str, int] = {}
         category_total: dict[str, int] = {}
-        start_time = time.time()
-        completed = 0
+        results: list[QuestionResult] = []
+        for index in range(total):
+            item, predicted, is_correct, response_text, prompt_text, latency = (
+                collected[index]
+            )
+            if is_correct:
+                correct += 1
 
-        thinking_used = enable_thinking
-        auto_switched = False
-
-        # Process in batches
-        for batch_start in range(0, len(items), batch_size):
-            batch_end = min(batch_start + batch_size, len(items))
-            batch = items[batch_start:batch_end]
-            batch_start_time = time.time()
-
-            # Launch concurrent requests
-            tasks = [
-                self._eval_single(
-                    engine, item, batch_start + j, sampling_kwargs, thinking_used
-                )
-                for j, item in enumerate(batch)
-            ]
-            batch_results = await asyncio.gather(*tasks)
-
-            # Auto-detection: check first batch for <think> tags
-            if not thinking_used and not auto_switched and batch_start == 0:
-                auto_switched = True
-                has_think_tags = any(
-                    "<think>" in raw for _, _, _, _, raw in batch_results
-                )
-                if has_think_tags:
-                    logger.warning(
-                        f"{self.name}: model outputs <think> tags with "
-                        "enable_thinking=False, auto-switching to thinking mode"
-                    )
-                    thinking_used = True
-                    # Re-run first batch with increased token budget
-                    tasks = [
-                        self._eval_single(
-                            engine, item, batch_start + j, sampling_kwargs, True
-                        )
-                        for j, item in enumerate(batch)
-                    ]
-                    batch_results = await asyncio.gather(*tasks)
-
-            batch_elapsed = time.time() - batch_start_time
-
-            # Process results in order
-            for idx, item, response_text, prompt_text, _raw in sorted(batch_results, key=lambda x: x[0]):
-                predicted = self.extract_answer(response_text, item)
-                is_correct = self.check_answer(predicted, item)
-
+            cat = self.get_category(item)
+            if cat is not None:
+                category_total[cat] = category_total.get(cat, 0) + 1
                 if is_correct:
-                    correct += 1
+                    category_correct[cat] = category_correct.get(cat, 0) + 1
 
-                cat = self.get_category(item)
-                if cat is not None:
-                    category_total[cat] = category_total.get(cat, 0) + 1
-                    if is_correct:
-                        category_correct[cat] = category_correct.get(cat, 0) + 1
-
-                q_id = item.get("id", str(idx))
-                expected = item.get("answer", "")
-                results.append(
-                    QuestionResult(
-                        question_id=str(q_id),
-                        correct=is_correct,
-                        expected=str(expected),
-                        predicted=predicted,
-                        time_seconds=batch_elapsed / len(batch),
-                        question_text=prompt_text,
-                        raw_response=response_text,
-                        category=cat,
-                    )
+            results.append(
+                QuestionResult(
+                    question_id=str(item.get("id", index)),
+                    correct=is_correct,
+                    expected=self._expected_label(item),
+                    predicted=self._predicted_for_export(predicted),
+                    time_seconds=latency,
+                    question_text=prompt_text,
+                    raw_response=response_text,
+                    category=cat,
                 )
-
-            completed += len(batch)
-            if on_progress:
-                await on_progress(completed, len(items))
+            )
 
         total_time = time.time() - start_time
-        total = len(items)
         accuracy = correct / total if total > 0 else 0.0
 
         cat_scores = None

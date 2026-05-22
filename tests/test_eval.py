@@ -1,8 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for accuracy evaluation modules."""
 
+import asyncio
+from types import SimpleNamespace
+
 import pytest
 
+from omlx.eval.base import BaseBenchmark
 from omlx.eval.datasets import deterministic_sample, stratified_sample
 from omlx.eval.gsm8k import GSM8KBenchmark, _extract_numeric_answer, _normalize_number
 from omlx.eval.hellaswag import HellaSwagBenchmark
@@ -404,3 +408,188 @@ async def test_load_sample_per_benchmark(name):
     items = await BENCHMARKS[name]().load_dataset(sample_size=10)
     assert items, f"{name} returned empty list"
     assert len(items) <= 10, f"{name} returned {len(items)} items"
+
+
+# --- Sliding-window run() pipeline ---
+
+
+class _FakeBench(BaseBenchmark):
+    """Minimal concrete benchmark for exercising BaseBenchmark.run."""
+
+    name = "fake"
+
+    async def load_dataset(self, sample_size: int = 0) -> list[dict]:
+        return [{"id": i, "answer": "A"} for i in range(sample_size or 1)]
+
+    def format_prompt(self, item: dict) -> list[dict[str, str]]:
+        return [{"role": "user", "content": f"q{item['id']}"}]
+
+    def extract_answer(self, response: str, item: dict) -> str:
+        return response.strip()
+
+    def check_answer(self, predicted: str, item: dict) -> bool:
+        return predicted == item["answer"]
+
+
+class _GatedEngine:
+    """chat() blocks until the test releases each call.
+
+    Tracks call-start order and concurrent in-flight count so a test can assert
+    the run holds batch_size requests in flight and refills a freed slot
+    immediately (sliding window) rather than waiting for a whole batch.
+    """
+
+    def __init__(self):
+        self.started = 0
+        self.inflight = 0
+        self.max_inflight = 0
+        self.events: list[asyncio.Event] = []
+
+    async def chat(self, messages, **kwargs):
+        self.started += 1
+        self.inflight += 1
+        self.max_inflight = max(self.max_inflight, self.inflight)
+        ev = asyncio.Event()
+        self.events.append(ev)
+        await ev.wait()
+        self.inflight -= 1
+        return SimpleNamespace(text="A")
+
+    def release_all(self):
+        for ev in self.events:
+            ev.set()
+
+
+class _InstantEngine:
+    """chat() returns immediately; counts calls and can vary text per call."""
+
+    def __init__(self, text="A", per_call=None):
+        self.calls = 0
+        self.text = text
+        self.per_call = per_call
+
+    async def chat(self, messages, **kwargs):
+        i = self.calls
+        self.calls += 1
+        if self.per_call is not None and i < len(self.per_call):
+            return SimpleNamespace(text=self.per_call[i])
+        return SimpleNamespace(text=self.text)
+
+
+async def _wait_until(cond, tries=400):
+    """Poll until cond() is true (≈2s budget). Avoids fixed sleeps."""
+    for _ in range(tries):
+        if cond():
+            return
+        await asyncio.sleep(0.005)
+    raise AssertionError("condition not met within timeout")
+
+
+class TestSlidingWindowRun:
+    async def test_keeps_batch_size_in_flight_and_refills(self):
+        """Window saturates at batch_size and refills a freed slot at once."""
+        eng = _GatedEngine()
+        bench = _FakeBench()
+        items = [{"id": i, "answer": "A"} for i in range(6)]
+
+        task = asyncio.create_task(
+            bench.run(eng, items, batch_size=3, enable_thinking=True)
+        )
+        try:
+            # Saturate at batch_size and stay there (never exceed it).
+            await _wait_until(lambda: eng.started == 3)
+            await asyncio.sleep(0.02)
+            assert eng.started == 3
+
+            # Free ONE slot: a sliding window starts the 4th request right
+            # away; a batch barrier would stay at 3 until all 3 complete.
+            eng.events[0].set()
+            await _wait_until(lambda: eng.started == 4)
+            assert not task.done()
+
+            while not task.done():
+                eng.release_all()
+                await asyncio.sleep(0.005)
+            result = await asyncio.wait_for(task, timeout=2.0)
+        finally:
+            eng.release_all()
+            task.cancel()
+
+        assert eng.max_inflight == 3
+        assert result.total_questions == 6
+        assert result.correct_count == 6
+        assert [qr.question_id for qr in result.question_results] == [
+            str(i) for i in range(6)
+        ]
+
+    async def test_results_ordered_and_scored(self):
+        eng = _InstantEngine(text="A")
+        items = [{"id": i, "answer": "A" if i % 2 == 0 else "B"} for i in range(5)]
+        result = await _FakeBench().run(eng, items, batch_size=4, enable_thinking=True)
+        assert result.total_questions == 5
+        # Engine always answers "A": even items match, odd ones don't.
+        assert result.correct_count == 3
+        assert [qr.question_id for qr in result.question_results] == \
+            ["0", "1", "2", "3", "4"]
+        assert [qr.correct for qr in result.question_results] == \
+            [True, False, True, False, True]
+
+    async def test_think_probe_reused_when_no_tags(self):
+        """No <think> tags: probe output is reused, item 0 not regenerated."""
+        eng = _InstantEngine(text="A")
+        items = [{"id": i, "answer": "A"} for i in range(4)]
+        result = await _FakeBench().run(eng, items, batch_size=2, enable_thinking=False)
+        assert result.thinking_used is False
+        assert eng.calls == 4  # probe(1) + items 1..3(3); item 0 reused
+        assert result.correct_count == 4
+
+    async def test_think_probe_switches_on_tags(self):
+        """<think> in the probe flips the whole run to thinking mode."""
+        eng = _InstantEngine(per_call=["<think>x</think>A", "A", "A", "A", "A"])
+        items = [{"id": i, "answer": "A"} for i in range(4)]
+        result = await _FakeBench().run(eng, items, batch_size=2, enable_thinking=False)
+        assert result.thinking_used is True
+        # probe(1, discarded) + window over all 4 (item 0 regenerated) = 5
+        assert eng.calls == 5
+        assert result.correct_count == 4
+
+    async def test_cancellation_propagates(self):
+        """on_progress raising CancelledError aborts the whole run."""
+        eng = _InstantEngine(text="A")
+        items = [{"id": i, "answer": "A"} for i in range(10)]
+        seen = {"n": 0}
+
+        async def on_progress(cur, total):
+            seen["n"] += 1
+            if seen["n"] == 1:
+                raise asyncio.CancelledError()
+
+        with pytest.raises(asyncio.CancelledError):
+            await _FakeBench().run(
+                eng, items, on_progress=on_progress,
+                batch_size=4, enable_thinking=True,
+            )
+
+    async def test_empty_items(self):
+        eng = _InstantEngine()
+        result = await _FakeBench().run(eng, [], batch_size=4)
+        assert result.total_questions == 0
+        assert result.accuracy == 0.0
+        assert eng.calls == 0
+
+    async def test_code_benchmark_scoring_offloaded(self):
+        """HumanEval scores via a real subprocess through _score_result."""
+        from omlx.eval.humaneval import HumanEvalBenchmark
+
+        bench = HumanEvalBenchmark()
+        item = {
+            "id": "t/0",
+            "prompt": "def add(a, b):\n    ",
+            "test": "def check(candidate):\n    assert candidate(1, 2) == 3",
+            "entry_point": "add",
+        }
+        eng = _InstantEngine(text="```python\ndef add(a, b):\n    return a + b\n```")
+        result = await bench.run(eng, [item], batch_size=1, enable_thinking=True)
+        assert result.total_questions == 1
+        assert result.correct_count == 1
+        assert result.question_results[0].expected == "(unit tests)"
