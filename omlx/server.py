@@ -1280,7 +1280,15 @@ def get_max_context_window(model_id: str | None = None) -> int | None:
     """
     Get effective max context window limit.
 
-    Priority: model setting > global setting.
+    Priority: per-model setting > model config.json (max_position_embeddings)
+    > global sampling default.
+
+    The model's own config.json is the source of truth for its context window;
+    the global ``sampling.max_context_window`` is only a last-resort fallback
+    for models whose config can't be read. Deriving from config.json keeps the
+    serving/validation limit consistent with the engine's context detection and
+    the vision-token sizing derived from it (which already reads config.json),
+    instead of silently capping every model at the global default.
 
     Returns:
         Max context window token count, or None if not set.
@@ -1294,6 +1302,18 @@ def get_max_context_window(model_id: str | None = None) -> int | None:
 
     if model_settings and model_settings.max_context_window is not None:
         return model_settings.max_context_window
+
+    # No explicit override: derive from the model's own config.json
+    # (max_position_embeddings), matching the engine's context detection and
+    # the vision-token sizing, rather than silently capping at the global
+    # default. The global sampling value is only used when the model's config
+    # can't be read.
+    if model_id and _server_state.engine_pool is not None:
+        entry = _server_state.engine_pool.get_entry(model_id)
+        if entry is not None:
+            cfg_ctx = EnginePool._read_context_window(entry)
+            if cfg_ctx > 0:
+                return cfg_ctx
 
     return _server_state.sampling.max_context_window
 
@@ -2030,6 +2050,15 @@ async def debug_reset_enforcer_peak(_: bool = Depends(verify_api_key)):
     return {"ok": True}
 
 
+# Test-only request-capture endpoints (/debug/last-request, /debug/reset-capture).
+# register_debug_endpoint() self-gates on OMLX_DEBUG_CAPTURE=1 (a no-op otherwise),
+# but it was defined and never invoked — so the routes 404'd even with capture
+# enabled, breaking the agent-context e2e tests. Wire it up alongside the other
+# /debug routes with the same api-key auth.
+from omlx.debug_capture import register_debug_endpoint as _register_debug_endpoint
+_register_debug_endpoint(app, verify_api_key)
+
+
 @app.get("/v1/models")
 async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
     """List all available models with load status."""
@@ -2579,6 +2608,17 @@ async def create_chat_completion(
         for i, msg in enumerate(request.messages):
             content_preview = str(msg.content)[:200] if msg.content else "(empty)"
             logger.log(5, "  Message[%d]: role=%s, content=%s...", i, msg.role, content_preview)
+
+    # Test-only request capture (no-op unless OMLX_DEBUG_CAPTURE=1). Records the
+    # exact model/messages/tools omlx received so the agent-context e2e tests can
+    # assert on the rendered context. capture_request self-gates → cheap in prod.
+    from omlx.debug_capture import capture_request
+    capture_request(
+        request.model,
+        request.messages,
+        len(getattr(request, "tools", None) or []),
+        getattr(request, "tool_choice", None),
+    )
 
     # Block inference during quantization to prevent GPU Metal errors
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
