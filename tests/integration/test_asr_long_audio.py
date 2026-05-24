@@ -140,6 +140,7 @@ async def server_app(model_ids):
             ModelSettings(model_type_override="embedding"),
         )
 
+        original_api_key = _server_state.api_key
         init_server(model_dirs=str(MODEL_DIR), max_model_memory=max_mem)
         _server_state.api_key = TEST_API_KEY
         _server_state.engine_pool.apply_settings_overrides(settings_mgr)
@@ -160,6 +161,10 @@ async def server_app(model_ids):
                 mx.clear_cache()
             except Exception:
                 pass
+            # Restore the global api_key: _server_state is a process-wide
+            # singleton, so leaving auth enabled here would 401 every later
+            # module that assumes api_key is None (e.g. test_server_endpoints).
+            _server_state.api_key = original_api_key
 
 
 @pytest_asyncio.fixture(loop_scope="session", scope="module")

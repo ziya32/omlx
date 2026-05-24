@@ -343,11 +343,14 @@ def client(mock_engine_pool):
     # Store original state
     original_pool = _server_state.engine_pool
     original_default = _server_state.default_model
+    original_api_key = _server_state.api_key
 
-    # Set mock state. api_key stays at its default (None), so the router-
-    # level verify_api_key returns True without a token.
+    # Set mock state. Force api_key to None so the router-level verify_api_key
+    # returns True without a token — _server_state is a process-wide singleton,
+    # and an earlier real-server module may have left auth enabled.
     _server_state.engine_pool = mock_engine_pool
     _server_state.default_model = "test-model"
+    _server_state.api_key = None
 
     try:
         yield TestClient(app)
@@ -355,6 +358,7 @@ def client(mock_engine_pool):
         # Restore original state
         _server_state.engine_pool = original_pool
         _server_state.default_model = original_default
+        _server_state.api_key = original_api_key
 
 
 class TestHealthEndpoint:
@@ -435,9 +439,11 @@ class TestResponsesEndpoint:
         original_pool = _server_state.engine_pool
         original_default = _server_state.default_model
         original_store = _server_state.responses_store
+        original_api_key = _server_state.api_key
         try:
             _server_state.engine_pool = pool
             _server_state.default_model = "test-model"
+            _server_state.api_key = None
             _server_state.responses_store = ResponseStore(state_dir=state_dir)
             client = TestClient(app)
 
@@ -474,6 +480,7 @@ class TestResponsesEndpoint:
             _server_state.engine_pool = original_pool
             _server_state.default_model = original_default
             _server_state.responses_store = original_store
+            _server_state.api_key = original_api_key
 
     def test_previous_response_id_persists_across_store_restart(self, tmp_path):
         from omlx.server import app, _server_state
@@ -496,9 +503,11 @@ class TestResponsesEndpoint:
         original_pool = _server_state.engine_pool
         original_default = _server_state.default_model
         original_store = _server_state.responses_store
+        original_api_key = _server_state.api_key
         try:
             _server_state.engine_pool = pool
             _server_state.default_model = "test-model"
+            _server_state.api_key = None
             _server_state.responses_store = ResponseStore(state_dir=state_dir)
             client = TestClient(app)
 
@@ -541,6 +550,7 @@ class TestResponsesEndpoint:
             _server_state.engine_pool = original_pool
             _server_state.default_model = original_default
             _server_state.responses_store = original_store
+            _server_state.api_key = original_api_key
 
     def test_missing_previous_response_id_returns_404(self, tmp_path):
         from omlx.server import app, _server_state
@@ -551,9 +561,11 @@ class TestResponsesEndpoint:
         original_pool = _server_state.engine_pool
         original_default = _server_state.default_model
         original_store = _server_state.responses_store
+        original_api_key = _server_state.api_key
         try:
             _server_state.engine_pool = pool
             _server_state.default_model = "test-model"
+            _server_state.api_key = None
             _server_state.responses_store = ResponseStore(
                 state_dir=tmp_path / "response-state"
             )
@@ -572,6 +584,7 @@ class TestResponsesEndpoint:
             _server_state.engine_pool = original_pool
             _server_state.default_model = original_default
             _server_state.responses_store = original_store
+            _server_state.api_key = original_api_key
 
 
 class TestModelsStatusEndpoint:

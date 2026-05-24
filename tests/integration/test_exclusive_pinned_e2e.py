@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import io
+import logging
 import math
 import os
 import struct
@@ -41,6 +42,8 @@ import httpx
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport
+
+logger = logging.getLogger(__name__)
 
 TEST_API_KEY = "test-exclusive-pin"
 
@@ -153,13 +156,11 @@ async def _request_with_retry(
     Raises RetryExhausted if all retries fail.
     Raises AssertionError if a non-retryable error occurs.
     """
-    last_resp = None
     for attempt in range(1, max_retries + 1):
         resp = await client.request(method, url, **kwargs)
         if resp.status_code == 200:
             return resp
         if resp.status_code in RETRYABLE_CODES:
-            last_resp = resp
             detail = ""
             try:
                 detail = resp.json().get("detail", "")[:200]
@@ -243,6 +244,7 @@ async def server_app(model_dir, check_models):
         for mid in [RERANKER_MODEL, TTS_CUSTOM_MODEL, TTS_DESIGN_MODEL, ASR_MODEL]:
             settings_mgr.set_settings(mid, ModelSettings(ttl_seconds=30))
 
+        original_api_key = _server_state.api_key
         init_server(
             model_dirs=str(model_dir),
             max_model_memory=max_mem,
@@ -271,6 +273,10 @@ async def server_app(model_dir, check_models):
                 mx.clear_cache()
             except Exception:
                 pass
+            # Restore the global api_key: _server_state is a process-wide
+            # singleton, so leaving auth enabled here would 401 every later
+            # module that assumes api_key is None (e.g. test_server_endpoints).
+            _server_state.api_key = original_api_key
 
 
 @pytest_asyncio.fixture(loop_scope="session", scope="module")
@@ -367,6 +373,31 @@ async def do_rerank(client: httpx.AsyncClient) -> dict:
     return data
 
 
+def _log_audio_capture(label: str, audio: bytes) -> None:
+    """Always-on diagnostic: log what a TTS response actually contains.
+
+    Records byte count, sample rate, and decoded duration so a content-loss
+    failure (e.g. transcript 'ah.') can be diagnosed — was the audio truncated
+    (tiny duration) or full-length-but-garbled? Logged at WARNING so it
+    survives the test runner's WARNING+ capture, and emitted before any
+    assertion so it is recorded regardless of pass/fail. Never raises.
+    """
+    info: dict = {"bytes": len(audio)}
+    try:
+        from omlx.engine.audio_utils import wav_bytes_to_pcm_frames
+
+        sr, ch, sw, pcm = wav_bytes_to_pcm_frames(audio)
+        info["sample_rate"] = sr
+        info["channels"] = ch
+        info["sample_width"] = sw
+        info["duration_s"] = (
+            round(len(pcm) / (sr * ch * sw), 3) if (sr and ch and sw) else None
+        )
+    except Exception as exc:  # noqa: BLE001 — diagnostic must never break the test
+        info["wav_parse_error"] = repr(exc)
+    logger.warning("[ROUNDTRIP-CAPTURE] %s audio=%r", label, info)
+
+
 async def do_tts(
     client: httpx.AsyncClient,
     model: str = TTS_CUSTOM_MODEL,
@@ -388,6 +419,7 @@ async def do_tts(
         json=payload,
     )
     audio = resp.content
+    _log_audio_capture(f"tts({model})", audio)
     assert len(audio) > 44, f"TTS audio too small: {len(audio)} bytes"
     assert audio[:4] == b"RIFF", "TTS output is not a valid WAV file"
     assert audio[8:12] == b"WAVE"
@@ -403,6 +435,7 @@ async def do_asr(client: httpx.AsyncClient, wav_bytes: bytes) -> dict:
         files={"file": ("test.wav", wav_bytes, "audio/wav")},
     )
     data = resp.json()
+    logger.warning("[ROUNDTRIP-CAPTURE] asr full response=%r", data)
     assert "text" in data, f"ASR response missing 'text': {data}"
     return data
 
@@ -459,10 +492,14 @@ class TestExclusivePinnedSequential:
         audio = await do_tts(client, TTS_CUSTOM_MODEL)
         data = await do_asr(client, audio)
         text = data["text"].strip().lower()
-        assert len(text) > 0, "ASR returned empty transcript from TTS audio"
         # Check at least some words survived
         key_words = ["hello", "test", "speech", "synthesis"]
         matched = [w for w in key_words if w in text]
+        logger.warning(
+            "[ROUNDTRIP-CAPTURE] test_08 transcript=%r matched=%s",
+            data.get("text"), matched,
+        )
+        assert len(text) > 0, "ASR returned empty transcript from TTS audio"
         assert len(matched) >= 1, (
             f"Round-trip lost content. Transcript: {text!r}, "
             f"matched: {matched}"

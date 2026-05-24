@@ -207,6 +207,7 @@ async def server_app(model_dir, model_ids):
         )
         # Qwen3-Reranker is auto-detected via CausalLM arch + directory name
 
+        original_api_key = _server_state.api_key
         init_server(
             model_dirs=str(model_dir),
             max_model_memory=max_mem,
@@ -234,6 +235,10 @@ async def server_app(model_dir, model_ids):
                 mx.clear_cache()
             except Exception:
                 pass
+            # Restore the global api_key: _server_state is a process-wide
+            # singleton, so leaving auth enabled here would 401 every later
+            # module that assumes api_key is None (e.g. test_server_endpoints).
+            _server_state.api_key = original_api_key
 
 
 @pytest_asyncio.fixture(loop_scope="session", scope="module")
