@@ -34,6 +34,7 @@ from typing import Any
 import numpy as np
 
 from omlx.utils.formatting import format_bytes
+from omlx.mx_buffer_lock import mx_buffer_access_lock
 
 from .interface import CacheManager
 from .stats import PagedSSDCacheStats
@@ -43,7 +44,6 @@ logger = logging.getLogger(__name__)
 # Check for MLX
 try:
     import mlx.core as mx
-    from mlx.utils import tree_flatten, tree_unflatten
 
     HAS_MLX = True
 except ImportError:
@@ -224,10 +224,18 @@ def _extract_tensor_bytes(arr: mx.array) -> tuple[bytes, str, list[int]]:
     """
     dtype_str = _MX_TO_ST_DTYPE[arr.dtype]
     shape = list(arr.shape)
-    if arr.dtype == mx.bfloat16:
-        raw = bytes(memoryview(arr.view(mx.uint16)))
-    else:
-        raw = bytes(memoryview(arr))
+    # Serialize the raw buffer-protocol read against clear_cache/synchronize on
+    # other threads (inference + engine-pool load/evict/idle teardown). Those
+    # reclaim the Metal buffer pool, and doing so mid-read corrupts an in-flight
+    # GPU command buffer -> SIGABRT / kIOGPUCommandBufferCallbackError* (Timeout
+    # or OutOfMemory). This is the single chokepoint for every off-thread
+    # reader: phase-2 KV-cache SSD save, boundary-snapshot save, and
+    # vision-feature-cache save. (#1106)
+    with mx_buffer_access_lock:
+        if arr.dtype == mx.bfloat16:
+            raw = bytes(memoryview(arr.view(mx.uint16)))
+        else:
+            raw = bytes(memoryview(arr))
     return raw, dtype_str, shape
 
 

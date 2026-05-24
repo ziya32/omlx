@@ -52,6 +52,7 @@ from .exceptions import (
 )
 from .model_discovery import discover_models, format_size
 from .engine_core import get_mlx_executor
+from .mx_buffer_lock import locked_sync_and_clear_cache
 from .utils.proc_memory import get_phys_footprint
 from .scheduler import SchedulerConfig
 
@@ -804,7 +805,7 @@ class EnginePool:
                     # new ones for the model load.
                     gc.collect()
                     loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(get_mlx_executor(), mx.clear_cache)
+                    await loop.run_in_executor(get_mlx_executor(), locked_sync_and_clear_cache)
 
                 # Load the model (long operation, outside lock)
                 load_error = None
@@ -1160,7 +1161,7 @@ class EnginePool:
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(
                 get_mlx_executor(),
-                lambda: (mx.synchronize(), mx.clear_cache()),
+                locked_sync_and_clear_cache,
             )
         except Exception as e:
             logger.warning(
@@ -1751,7 +1752,7 @@ class EnginePool:
             gc.collect()
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(
-                get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
+                get_mlx_executor(), locked_sync_and_clear_cache
             )
         finally:
             # Phase 2 complete: transition from UNLOADING → UNLOADED.
@@ -1917,7 +1918,7 @@ class EnginePool:
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
                     get_mlx_executor(),
-                    lambda: (mx.synchronize(), mx.clear_cache()),
+                    locked_sync_and_clear_cache,
                 )
 
                 if effective_type == "vlm":
@@ -1967,7 +1968,7 @@ class EnginePool:
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
                     get_mlx_executor(),
-                    lambda: (mx.synchronize(), mx.clear_cache()),
+                    locked_sync_and_clear_cache,
                 )
 
                 enforcer = self._process_memory_enforcer
@@ -2006,7 +2007,7 @@ class EnginePool:
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
                     get_mlx_executor(),
-                    lambda: (mx.synchronize(), mx.clear_cache()),
+                    locked_sync_and_clear_cache,
                 )
 
                 engine = BatchedEngine(
@@ -2047,7 +2048,7 @@ class EnginePool:
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(
                 get_mlx_executor(),
-                lambda: (mx.synchronize(), mx.clear_cache()),
+                locked_sync_and_clear_cache,
             )
             raise ModelLoadingError(
                 f"Model {model_id} load aborted: "
@@ -2070,7 +2071,7 @@ class EnginePool:
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
             get_mlx_executor(),
-            lambda: (mx.synchronize(), mx.clear_cache()),
+            locked_sync_and_clear_cache,
         )
 
         elapsed = time.monotonic() - t0

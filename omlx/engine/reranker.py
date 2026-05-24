@@ -13,9 +13,8 @@ import gc
 import logging
 from typing import Any, Dict
 
-import mlx.core as mx
-
 from ..engine_core import get_mlx_executor
+from ..mx_buffer_lock import locked_sync_and_clear_cache, run_locked
 from ..models.reranker import MLXRerankerModel, RerankOutput
 from .base import BaseNonStreamingEngine
 
@@ -76,7 +75,7 @@ class RerankerEngine(BaseNonStreamingEngine):
             self._model_name, trust_remote_code=self._trust_remote_code
         )
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(get_mlx_executor(), self._model.load)
+        await loop.run_in_executor(get_mlx_executor(), lambda: run_locked(self._model.load))
         logger.info(f"Reranker engine started: {self._model_name}")
 
     async def stop(self) -> None:
@@ -95,7 +94,7 @@ class RerankerEngine(BaseNonStreamingEngine):
         gc.collect()
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
-            get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
+            get_mlx_executor(), locked_sync_and_clear_cache
         )
         logger.info(f"Reranker engine stopped: {self._model_name}")
 
@@ -174,7 +173,7 @@ class RerankerEngine(BaseNonStreamingEngine):
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
                     get_mlx_executor(),
-                    lambda: (mx.synchronize(), mx.clear_cache()),
+                    locked_sync_and_clear_cache,
                 )
 
     def get_stats(self) -> Dict[str, Any]:

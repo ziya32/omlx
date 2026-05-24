@@ -26,6 +26,7 @@ from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..exceptions import RequestAbortedError
 from ..utils.model_loading import maybe_apply_pre_load_patches
 from .base import BaseEngine, GenerationOutput
+from ..mx_buffer_lock import locked_sync_and_clear_cache, run_locked
 
 logger = logging.getLogger(__name__)
 
@@ -379,7 +380,7 @@ class DFlashEngine(BaseEngine):
             )
             return model, tokenizer, meta, draft
 
-        result = await loop.run_in_executor(get_mlx_executor(), _load_models)
+        result = await loop.run_in_executor(get_mlx_executor(), lambda: run_locked(_load_models))
         self._target_model, self._tokenizer_obj, target_meta, self._draft_model = result
 
         # Deep-copy tokenizer for executor-thread usage (dflash generation).
@@ -449,7 +450,7 @@ class DFlashEngine(BaseEngine):
         gc.collect()
         await loop.run_in_executor(
             get_mlx_executor(),
-            lambda: (mx.synchronize(), mx.clear_cache()),
+            locked_sync_and_clear_cache,
         )
 
         # Poll for actual memory release (same pattern as engine_pool._unload_engine)
@@ -466,7 +467,7 @@ class DFlashEngine(BaseEngine):
             gc.collect()
             await loop.run_in_executor(
                 get_mlx_executor(),
-                lambda: (mx.synchronize(), mx.clear_cache()),
+                locked_sync_and_clear_cache,
             )
         else:
             logger.warning("DFlash model eviction: memory settle timed out")

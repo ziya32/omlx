@@ -16,7 +16,6 @@ import copy
 import gc
 import logging
 import os
-import threading
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable
@@ -94,7 +93,7 @@ class _VLMMTPResponse:
 # _async_store_cache_worker reads tensor bytes via memoryview while the
 # inference thread concurrently issues a reclaim-triggering mx op.
 # See: https://github.com/jundot/omlx/issues/1106
-_mx_buffer_access_lock = threading.RLock()
+from omlx.mx_buffer_lock import mx_buffer_access_lock as _mx_buffer_access_lock
 
 
 def _sync_and_clear_cache():

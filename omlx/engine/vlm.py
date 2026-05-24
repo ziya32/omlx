@@ -39,6 +39,7 @@ import mlx.core as mx
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..cache.vision_feature_cache import VisionFeatureSSDCache
+from ..mx_buffer_lock import locked_sync_and_clear_cache
 from ..exceptions import RequestAbortedError
 from ..models.vlm import VLMModelAdapter
 from ..patches.gated_delta_advance import apply_gated_delta_advance_patch
@@ -1203,7 +1204,7 @@ class VLMBatchedEngine(BaseEngine):
         # Clear cache first so active_mem reflects real committed memory,
         # not stale allocations from recently-unloaded models.
         try:
-            mx.clear_cache()
+            locked_sync_and_clear_cache()
             active_mem = mx.get_active_memory()
         except Exception:
             active_mem = 0
@@ -2017,7 +2018,7 @@ class VLMBatchedEngine(BaseEngine):
                     active_before_chunk / 1024**3,
                     active_after_chunk / 1024**3,
                 )
-                mx.clear_cache()
+                locked_sync_and_clear_cache()
                 all_hidden.append(hidden)
 
             hidden_states = (
@@ -2558,8 +2559,7 @@ class VLMBatchedEngine(BaseEngine):
             # that stay in the Metal cache pool until explicitly cleared.
             # Without this, repeated VLM requests accumulate memory and
             # eventually trigger ProcessMemoryEnforcer aborts (see #667).
-            mx.synchronize()
-            mx.clear_cache()
+            locked_sync_and_clear_cache()
 
         return (
             token_ids,

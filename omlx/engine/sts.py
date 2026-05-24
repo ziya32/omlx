@@ -26,6 +26,7 @@ import mlx.core as mx
 import numpy as np
 
 from ..engine_core import get_mlx_executor
+from ..mx_buffer_lock import locked_sync_and_clear_cache, run_locked
 from .audio_utils import DEFAULT_SAMPLE_RATE as _DEFAULT_SAMPLE_RATE
 from .audio_utils import audio_to_wav_bytes as _audio_to_wav_bytes
 from .base import BaseNonStreamingEngine
@@ -315,7 +316,7 @@ class STSEngine(BaseNonStreamingEngine):
                 ) from exc
 
         loop = asyncio.get_running_loop()
-        self._model = await loop.run_in_executor(get_mlx_executor(), _load_sync)
+        self._model = await loop.run_in_executor(get_mlx_executor(), lambda: run_locked(_load_sync))
         logger.info(f"STS engine started: {self._model_name}")
 
     async def stop(self) -> None:
@@ -334,7 +335,7 @@ class STSEngine(BaseNonStreamingEngine):
         gc.collect()
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
-            get_mlx_executor(), lambda: (mx.synchronize(), mx.clear_cache())
+            get_mlx_executor(), locked_sync_and_clear_cache
         )
         logger.info(f"STS engine stopped: {self._model_name}")
 
@@ -411,7 +412,7 @@ class STSEngine(BaseNonStreamingEngine):
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(
                     get_mlx_executor(),
-                    lambda: (mx.synchronize(), mx.clear_cache()),
+                    locked_sync_and_clear_cache,
                 )
 
     def get_stats(self) -> Dict[str, Any]:
