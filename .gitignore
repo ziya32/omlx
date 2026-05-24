@@ -122,3 +122,6 @@ test-reports/
 
 # UV lockfile
 uv.lock
+
+# Claude Code agent worktrees / settings (not for VCS)
+.claude/
