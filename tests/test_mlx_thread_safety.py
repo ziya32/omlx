@@ -115,7 +115,7 @@ class TestTTSThreadSafety:
         )
 
     async def test_stop_clears_cache_on_executor_thread(self):
-        """TTS mx.clear_cache must run on the executor thread."""
+        """TTS cache clear (the locked helper) must run on the executor thread."""
         from omlx.engine.tts import TTSEngine
 
         clear_cache_thread = None
@@ -127,14 +127,13 @@ class TestTTSThreadSafety:
         engine = TTSEngine(model_name="test-tts")
         engine._model = MagicMock()
 
-        with patch("omlx.engine.tts.mx") as mock_mx, \
+        with patch("omlx.engine.tts.locked_sync_and_clear_cache", side_effect=_track_clear_cache), \
              patch("omlx.engine.tts.gc"):
-            mock_mx.clear_cache = _track_clear_cache
             await engine.stop()
 
         executor_thread = _get_executor_thread_name()
         assert clear_cache_thread == executor_thread, (
-            f"TTS mx.clear_cache ran on thread '{clear_cache_thread}', "
+            f"TTS cache clear ran on thread '{clear_cache_thread}', "
             f"expected MLX executor thread '{executor_thread}'. "
             f"This would cause Metal command buffer races!"
         )
@@ -205,7 +204,7 @@ class TestSTTThreadSafety:
         )
 
     async def test_stop_clears_cache_on_executor_thread(self):
-        """STT mx.clear_cache must run on the executor thread."""
+        """STT cache clear (the locked helper) must run on the executor thread."""
         from omlx.engine.stt import STTEngine
 
         clear_cache_thread = None
@@ -217,14 +216,13 @@ class TestSTTThreadSafety:
         engine = STTEngine(model_name="whisper-tiny")
         engine._model = MagicMock()
 
-        with patch("omlx.engine.stt.mx") as mock_mx, \
+        with patch("omlx.engine.stt.locked_sync_and_clear_cache", side_effect=_track_clear_cache), \
              patch("omlx.engine.stt.gc"):
-            mock_mx.clear_cache = _track_clear_cache
             await engine.stop()
 
         executor_thread = _get_executor_thread_name()
         assert clear_cache_thread == executor_thread, (
-            f"STT mx.clear_cache ran on thread '{clear_cache_thread}', "
+            f"STT cache clear ran on thread '{clear_cache_thread}', "
             f"expected MLX executor thread '{executor_thread}'. "
             f"This would cause Metal command buffer races!"
         )
@@ -261,7 +259,7 @@ class TestEmbeddingThreadSafety:
         )
 
     async def test_stop_clears_cache_on_executor_thread(self):
-        """Embedding mx.clear_cache must run on the executor thread."""
+        """Embedding cache clear (the locked helper) must run on the executor thread."""
         from omlx.engine.embedding import EmbeddingEngine
 
         clear_cache_thread = None
@@ -273,14 +271,13 @@ class TestEmbeddingThreadSafety:
         engine = EmbeddingEngine(model_name="test-embed")
         engine._model = MagicMock()
 
-        with patch("omlx.engine.embedding.mx") as mock_mx, \
+        with patch("omlx.engine.embedding.locked_sync_and_clear_cache", side_effect=_track_clear_cache), \
              patch("omlx.engine.embedding.gc"):
-            mock_mx.clear_cache = _track_clear_cache
             await engine.stop()
 
         executor_thread = _get_executor_thread_name()
         assert clear_cache_thread == executor_thread, (
-            f"Embedding mx.clear_cache ran on thread '{clear_cache_thread}', "
+            f"Embedding cache clear ran on thread '{clear_cache_thread}', "
             f"expected MLX executor thread '{executor_thread}'. "
             f"This would cause Metal command buffer races!"
         )

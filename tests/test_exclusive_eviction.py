@@ -166,10 +166,10 @@ class TestNoOpWhenClean:
         model B is UNLOADED. _clear_for_exclusive returns None."""
         pool = pool_ab
         entry_a = pool.get_entry("model-a")
-        entry_b = pool.get_entry("model-b")
+        pool.get_entry("model-b")
 
         _activate_entry(entry_a, pinned=True, exclusive=True)
-        # entry_b stays UNLOADED (default)
+        # model-b stays UNLOADED (default)
 
         async with pool._tracked_lock("test"):
             result = await pool._clear_for_exclusive(entry_a)
@@ -776,7 +776,7 @@ class TestTimeoutErrorType:
         pool._max_wait_timeout = 0.1  # very short timeout
 
         entry_a = pool.get_entry("model-a")
-        entry_b = pool.get_entry("model-b")
+        pool.get_entry("model-b")
 
         _activate_entry(entry_a, pinned=True, exclusive=True)
         entry_a.active_uses = 1
@@ -828,25 +828,18 @@ class TestSetExclusiveCleansUpState:
 
 
 class TestSignalExclusiveIdleMxOps:
-    """_signal_exclusive_idle calls mx.synchronize and mx.clear_cache,
+    """_signal_exclusive_idle runs the locked sync+clear helper,
     then sets the event."""
 
     async def test_mx_ops_called_and_event_set(self, pool_ab):
-        """mx.synchronize and mx.clear_cache are called, and the event
+        """The locked sync+clear helper is dispatched, and the event
         is set."""
         pool = pool_ab
         event = asyncio.Event()
 
-        with patch("omlx.engine_pool.mx") as mock_mx, \
-             patch("omlx.engine_pool.get_mlx_executor") as mock_get_exec:
-            # Make run_in_executor actually run the lambda
-            mock_executor = MagicMock()
-
-            async def fake_run_in_executor(executor, fn):
-                fn()
-
+        with patch("omlx.engine_pool.locked_sync_and_clear_cache") as mock_clear, \
+             patch("omlx.engine_pool.get_mlx_executor"):
             loop = asyncio.get_running_loop()
-            original_run_in_executor = loop.run_in_executor
 
             async def patched_run_in_executor(executor, fn):
                 fn()
@@ -854,9 +847,8 @@ class TestSignalExclusiveIdleMxOps:
             with patch.object(loop, "run_in_executor", side_effect=patched_run_in_executor):
                 await pool._signal_exclusive_idle(event)
 
-        # mx.synchronize and mx.clear_cache should have been called
-        assert mock_mx.synchronize.called
-        assert mock_mx.clear_cache.called
+        # The locked sync+clear helper should have been dispatched.
+        assert mock_clear.called
 
         # Event should be set
         assert event.is_set()
@@ -867,8 +859,8 @@ class TestSignalExclusiveIdleMxOps:
         pool = pool_ab
         event = asyncio.Event()
 
-        with patch("omlx.engine_pool.mx") as mock_mx, \
-             patch("omlx.engine_pool.get_mlx_executor") as mock_get_exec:
+        with patch("omlx.engine_pool.mx"), \
+             patch("omlx.engine_pool.get_mlx_executor"):
 
             loop = asyncio.get_running_loop()
 

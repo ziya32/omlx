@@ -161,9 +161,9 @@ class TestSTTEngineLifecycle:
 
         mock_stt.load.assert_called_once()
 
-    @patch("omlx.engine.stt.mx")
+    @patch("omlx.engine.stt.locked_sync_and_clear_cache")
     @patch("omlx.engine.stt.gc")
-    async def test_stop_clears_model(self, mock_gc, mock_mx):
+    async def test_stop_clears_model(self, mock_gc, mock_clear):
         from omlx.engine.stt import STTEngine
         engine = STTEngine(model_name="whisper-tiny")
         engine._model = MagicMock()
@@ -172,8 +172,8 @@ class TestSTTEngineLifecycle:
 
         assert engine._model is None
         mock_gc.collect.assert_called_once()
-        # mx.clear_cache is called via the MLX executor (run_in_executor)
-        mock_mx.clear_cache.assert_called_once()
+        # The Metal cache clear is dispatched through the locked helper on the executor.
+        mock_clear.assert_called_once()
 
     async def test_stop_when_not_started_is_noop(self):
         from omlx.engine.stt import STTEngine
@@ -517,9 +517,9 @@ class TestTTSEngineLifecycle:
 
         mock_load_model.assert_called_once()
 
-    @patch("omlx.engine.tts.mx")
+    @patch("omlx.engine.tts.locked_sync_and_clear_cache")
     @patch("omlx.engine.tts.gc")
-    async def test_stop_clears_model(self, mock_gc, mock_mx):
+    async def test_stop_clears_model(self, mock_gc, mock_clear):
         from omlx.engine.tts import TTSEngine
         engine = TTSEngine(model_name="qwen3-tts")
         engine._model = MagicMock()
@@ -528,7 +528,8 @@ class TestTTSEngineLifecycle:
 
         assert engine._model is None
         mock_gc.collect.assert_called_once()
-        mock_mx.clear_cache.assert_called_once()
+        # The Metal cache clear is dispatched through the locked helper on the executor.
+        mock_clear.assert_called_once()
 
     async def test_stop_when_not_started_is_noop(self):
         from omlx.engine.tts import TTSEngine

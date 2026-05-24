@@ -794,7 +794,7 @@ class TestEmbeddingEngine:
         engine = EmbeddingEngine("test-model")
 
         with patch("omlx.engine.embedding.MLXEmbeddingModel") as MockModel, \
-             patch("omlx.engine.embedding.mx") as mock_mx:
+             patch("omlx.engine.embedding.locked_sync_and_clear_cache") as mock_clear:
             mock_model = MagicMock()
             mock_model.embed.return_value = EmbeddingOutput(
                 embeddings=[[0.1, 0.2]],
@@ -806,8 +806,8 @@ class TestEmbeddingEngine:
             asyncio.run(engine.start())
             asyncio.run(engine.embed(["Hello"]))
 
-            mock_mx.synchronize.assert_called()
-            mock_mx.clear_cache.assert_called()
+            # sync + clear are bundled in the locked helper, dispatched on the executor.
+            mock_clear.assert_called()
 
 
 class TestEmbeddingModelsPydantic:
