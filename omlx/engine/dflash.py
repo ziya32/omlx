@@ -26,7 +26,7 @@ from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..exceptions import RequestAbortedError
 from ..utils.model_loading import maybe_apply_pre_load_patches
 from .base import BaseEngine, GenerationOutput
-from ..mx_buffer_lock import locked_sync_and_clear_cache, run_locked
+from ..mx_buffer_lock import locked_free_and_clear, locked_sync_and_clear_cache, run_locked
 
 logger = logging.getLogger(__name__)
 
@@ -504,6 +504,12 @@ class DFlashEngine(BaseEngine):
         if self._fallback_engine is not None:
             await self._fallback_engine.stop()
             self._fallback_engine = None
+        # Hand the model refs to the executor and free them THERE (drop + gc)
+        # under the buffer lock, so the eviction's buffer frees serialize with
+        # any in-flight generation on the executor instead of racing it from
+        # the event-loop thread (corrupts that generation). See issue #85.
+        holder = [self._target_model, self._draft_model,
+                  self._tokenizer_obj, self._executor_tokenizer]
         self._target_model = None
         self._draft_model = None
         self._tokenizer_obj = None
@@ -515,6 +521,11 @@ class DFlashEngine(BaseEngine):
         self._abort_event.clear()
         with self._active_request_lock:
             self._active_request_id = None
+        from ..engine_core import get_mlx_executor
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            get_mlx_executor(), lambda: locked_free_and_clear(holder.clear)
+        )
         logger.info("DFlashEngine stopped")
 
     def _apply_chat_template(

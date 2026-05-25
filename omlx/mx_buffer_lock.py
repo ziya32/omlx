@@ -48,6 +48,32 @@ def locked_sync_and_clear_cache() -> None:
         mx.clear_cache()
 
 
+def locked_free_and_clear(drop=None) -> None:
+    """Drop a model reference, ``gc.collect()``, then ``synchronize`` +
+    ``clear_cache`` — all under the buffer-access lock.
+
+    MUST be run on the MLX executor thread (via ``run_in_executor``). Model
+    eviction frees the victim's MLX arrays; if that free runs on the
+    asyncio event-loop thread (the old ``self._model = None; gc.collect()``
+    in each engine ``stop()``) it races buffer allocations from in-flight
+    generation on the executor thread, corrupting the in-flight GPU work
+    (garbled TTS audio / bad inference) — same hazard class as the
+    ``clear_cache`` race (#85). Running the drop+gc here, on the executor and
+    under the lock, serializes the free with generation and every other
+    buffer-pool party.
+    """
+    import gc
+
+    import mlx.core as mx
+
+    with mx_buffer_access_lock:
+        if drop is not None:
+            drop()
+        gc.collect()
+        mx.synchronize()
+        mx.clear_cache()
+
+
 def run_locked(fn):
     """Run ``fn()`` while holding the buffer-access lock; return its result.
 

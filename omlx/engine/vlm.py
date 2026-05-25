@@ -39,7 +39,7 @@ import mlx.core as mx
 from ..api.tool_calling import convert_tools_for_template
 from ..api.utils import clean_special_tokens, detect_and_strip_partial
 from ..cache.vision_feature_cache import VisionFeatureSSDCache
-from ..mx_buffer_lock import locked_sync_and_clear_cache
+from ..mx_buffer_lock import locked_free_and_clear, locked_sync_and_clear_cache
 from ..exceptions import RequestAbortedError
 from ..models.vlm import VLMModelAdapter
 from ..patches.gated_delta_advance import apply_gated_delta_advance_patch
@@ -1249,12 +1249,22 @@ class VLMBatchedEngine(BaseEngine):
         if self._vision_cache is not None:
             self._vision_cache.close()
             self._vision_cache = None
+        # Free model refs + gc on the executor under the buffer lock, so the
+        # eviction's buffer frees serialize with in-flight generation on the
+        # executor instead of racing it from the event-loop thread (#85).
+        from ..engine_core import get_mlx_executor
+        holder = [self._engine, self._vlm_model, self._processor,
+                  self._adapter, self._tokenizer]
         self._engine = None
         self._vlm_model = None
         self._processor = None
         self._adapter = None
         self._tokenizer = None
         self._loaded = False
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            get_mlx_executor(), lambda: locked_free_and_clear(holder.clear)
+        )
         logger.info("VLMBatchedEngine stopped")
 
     def _inject_tool_calling(self, tokenizer) -> None:

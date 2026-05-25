@@ -9,7 +9,6 @@ when mlx-audio is not installed.
 """
 
 import asyncio
-import gc
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -21,7 +20,7 @@ import mlx.core as mx
 import numpy as np
 
 from ..engine_core import get_mlx_executor
-from ..mx_buffer_lock import locked_sync_and_clear_cache, run_locked
+from ..mx_buffer_lock import locked_free_and_clear, locked_sync_and_clear_cache, run_locked
 from ..exceptions import AudioError, VoiceCloningError
 from .audio_utils import DEFAULT_SAMPLE_RATE as _DEFAULT_SAMPLE_RATE
 from .audio_utils import audio_to_wav_bytes as _audio_to_wav_bytes
@@ -240,12 +239,14 @@ class TTSEngine(BaseNonStreamingEngine):
             return
 
         logger.info(f"Stopping TTS engine: {self._model_name}")
+        # Free the model ref + gc on the executor under the buffer lock, so the
+        # eviction's buffer frees serialize with in-flight generation on the
+        # executor instead of racing it from the event-loop thread (#85).
+        holder = [self._model]
         self._model = None
-
-        gc.collect()
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
-            get_mlx_executor(), locked_sync_and_clear_cache
+            get_mlx_executor(), lambda: locked_free_and_clear(holder.clear)
         )
         logger.info(f"TTS engine stopped: {self._model_name}")
 
@@ -375,11 +376,35 @@ class TTSEngine(BaseNonStreamingEngine):
             # Same wrapping: per-segment errors from mlx-audio's iterator
             # become AudioError, not HTTP 500.
             try:
-                return next(g, _SEG_DONE)
+                seg = next(g, _SEG_DONE)
             except Exception as e:
                 raise AudioError(
                     f"TTS segment generation failed: {e}"
                 ) from e
+            if seg is _SEG_DONE:
+                return _SEG_DONE, None
+            # Materialize the segment audio HERE — on the single MLX executor
+            # thread and under the buffer-access lock. Reading the Metal buffer
+            # (np.array, plus the bf16 astype) off the executor / unlocked lets
+            # a concurrent model-switch buffer-pool reclaim (clear_cache or a
+            # load allocation, run under the same lock) reclaim the pool mid
+            # read, corrupting the in-flight GPU command buffer -> garbled audio
+            # or SIGABRT. This mirrors _extract_tensor_bytes and the STT/STS/
+            # streaming paths, which all read on the executor. See issue #85.
+            try:
+                audio = seg.audio
+                if isinstance(audio, mx.array) and audio.dtype == mx.bfloat16:
+                    audio = audio.astype(mx.float32)
+                audio_np = run_locked(lambda: np.array(audio))
+            except (AudioError, VoiceCloningError):
+                raise
+            except Exception as exc:
+                raise AudioError(
+                    f"TTS segment processing failed: {exc}"
+                ) from exc
+            seg_sr = getattr(seg, "sample_rate", None)
+            seg_sr = int(seg_sr) if isinstance(seg_sr, (int, float)) else None
+            return audio_np, seg_sr
 
         def _finalize(chunks, sample_rate):
             audio = np.concatenate(chunks, axis=0)
@@ -413,33 +438,24 @@ class TTSEngine(BaseNonStreamingEngine):
             # event loop between segments so LLM/VLM scheduler.step() can
             # interleave on the same single-threaded MLX executor — without
             # this, a long TTS synth blocks every other engine.
+            # _next_seg materializes each segment's audio to a NumPy array on
+            # the executor (under the buffer lock), so no mx.array is touched
+            # off the executor thread. Segment audio access there can raise if
+            # the producing model was torn down mid-loop (e.g. enforcer evicted
+            # but the iterator had a partial result in flight) — surfaced as
+            # AudioError (422) not 500.
             audio_chunks: list[np.ndarray] = []
             while True:
-                seg = await loop.run_in_executor(executor, _next_seg, gen)
+                seg_audio, seg_sr = await loop.run_in_executor(
+                    executor, _next_seg, gen
+                )
                 # Abort between segments — discards any computed segments.
                 self._raise_if_aborted()
-                if seg is _SEG_DONE:
+                if seg_audio is _SEG_DONE:
                     break
-                # Segment audio access can raise if the producing model
-                # was torn down between yielding the segment and our
-                # touching its tensors (e.g. enforcer evicted mid-loop
-                # but the iterator already had a partial result in
-                # flight). Wrap so the failure is 422 not 500.
-                try:
-                    audio = seg.audio
-                    if isinstance(audio, mx.array) and audio.dtype == mx.bfloat16:
-                        audio = audio.astype(mx.float32)
-                    audio_chunks.append(np.array(audio))
-                    if sample_rate is None:
-                        seg_sr = getattr(seg, "sample_rate", None)
-                        if isinstance(seg_sr, (int, float)):
-                            sample_rate = int(seg_sr)
-                except (AudioError, VoiceCloningError):
-                    raise
-                except Exception as exc:
-                    raise AudioError(
-                        f"TTS segment processing failed: {exc}"
-                    ) from exc
+                audio_chunks.append(seg_audio)
+                if sample_rate is None and seg_sr is not None:
+                    sample_rate = seg_sr
 
             if sample_rate is None:
                 sample_rate = _DEFAULT_SAMPLE_RATE

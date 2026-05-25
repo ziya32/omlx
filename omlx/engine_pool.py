@@ -52,7 +52,7 @@ from .exceptions import (
 )
 from .model_discovery import discover_models, format_size
 from .engine_core import get_mlx_executor
-from .mx_buffer_lock import locked_sync_and_clear_cache
+from .mx_buffer_lock import locked_free_and_clear, locked_sync_and_clear_cache
 from .utils.proc_memory import get_phys_footprint
 from .scheduler import SchedulerConfig
 
@@ -1743,16 +1743,18 @@ class EnginePool:
         # they're still reachable via the local `engine` variable.
         del engine
 
-        # Force garbage collection to release memory.
-        # Run mx.clear_cache on the global MLX executor to avoid concurrent
-        # Metal operations with running engines. See issue #85.
+        # Force garbage collection + clear_cache to release memory, ALL on the
+        # global MLX executor under the buffer lock (locked_free_and_clear).
+        # Doing the gc.collect() on the event-loop thread frees the victim's
+        # MLX arrays concurrently with in-flight generation on the executor,
+        # which corrupts that generation (e.g. garbled TTS audio). Running the
+        # free on the executor serializes it with generation. See issue #85.
         # Synchronize before clearing to prevent releasing Metal buffers
         # still referenced by in-flight command buffers. See issue #300.
         try:
-            gc.collect()
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(
-                get_mlx_executor(), locked_sync_and_clear_cache
+                get_mlx_executor(), locked_free_and_clear
             )
         finally:
             # Phase 2 complete: transition from UNLOADING → UNLOADED.

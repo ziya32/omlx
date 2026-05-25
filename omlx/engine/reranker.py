@@ -9,12 +9,11 @@ or chat completion.
 """
 
 import asyncio
-import gc
 import logging
 from typing import Any, Dict
 
 from ..engine_core import get_mlx_executor
-from ..mx_buffer_lock import locked_sync_and_clear_cache, run_locked
+from ..mx_buffer_lock import locked_free_and_clear, locked_sync_and_clear_cache, run_locked
 from ..models.reranker import MLXRerankerModel, RerankOutput
 from .base import BaseNonStreamingEngine
 
@@ -89,12 +88,14 @@ class RerankerEngine(BaseNonStreamingEngine):
         # _raise_if_aborted instead of a RuntimeError from the model
         # guard. See docs/enforcer-eviction-review.md #4.
         self._mark_stopped()
+        # Free the model ref + gc on the executor under the buffer lock, so the
+        # eviction's buffer frees serialize with in-flight generation on the
+        # executor instead of racing it from the event-loop thread (#85).
+        holder = [self._model]
         self._model = None
-
-        gc.collect()
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
-            get_mlx_executor(), locked_sync_and_clear_cache
+            get_mlx_executor(), lambda: locked_free_and_clear(holder.clear)
         )
         logger.info(f"Reranker engine stopped: {self._model_name}")
 

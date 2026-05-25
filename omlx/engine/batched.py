@@ -392,10 +392,20 @@ class BatchedEngine(BaseEngine):
                     self._engine.engine.close()
                 except Exception as e:
                     logger.warning(f"Error closing engine: {e}")
+        # Free model refs + gc on the executor under the buffer lock, so the
+        # eviction's buffer frees serialize with in-flight generation on the
+        # executor instead of racing it from the event-loop thread (#85).
+        from ..engine_core import get_mlx_executor
+        from ..mx_buffer_lock import locked_free_and_clear
+        holder = [self._engine, self._model, self._tokenizer]
         self._engine = None
         self._model = None
         self._tokenizer = None
         self._loaded = False
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            get_mlx_executor(), lambda: locked_free_and_clear(holder.clear)
+        )
         logger.info("BatchedEngine stopped")
 
     def _apply_chat_template(
