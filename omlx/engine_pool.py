@@ -61,6 +61,15 @@ logger = logging.getLogger(__name__)
 # Cooldown after a load failure before retrying (seconds)
 LOAD_COOLDOWN = 30
 
+# A load aborted mid-flight by the memory enforcer is transient (pressure),
+# not a real load failure: retry in-loop instead of surfacing a 503. Bounded
+# so a genuinely un-loadable model still errors out. Each retry re-enters the
+# memory-wait path (_prepare_memory_for); the small backoff prevents a hot
+# loop on the rare path where the pre-load check would 'proceed cautiously'
+# straight back into pressure.
+MAX_ENFORCER_ABORT_RETRIES = 8
+ENFORCER_ABORT_RETRY_BACKOFF = 2.0
+
 # Grace window for eviction-candidate selection. Engines accessed within
 # this many seconds count as "active" even when their current
 # active_uses is 0, so the FastAPI dispatch + acquire_engine entry
@@ -98,7 +107,9 @@ class EngineEntry:
     engine: BaseEngine | EmbeddingEngine | RerankerEngine | STTEngine | STSEngine | TTSEngine | None = None  # Loaded engine instance
     last_access: float = 0.0  # Timestamp for LRU (0 if never loaded)
     is_pinned: bool = False  # Never evict if True
-    abort_loading: bool = False  # Deprecated: kept for backward compat only
+    abort_loading: bool = False  # Enforcer→loader signal: abort this in-flight
+    #                              load (memory pressure). Reset at each load
+    #                              start so a prior abort can't poison reloads.
     _vision_limits_cache: dict | None = None  # Cached compute_vision_limits result
     # Diagnostic fields: actual_size is observed phys_footprint delta after load
     # settles (None until first load completes); loading_started_at lets the
@@ -584,6 +595,7 @@ class EnginePool:
         """
         start_time = time.monotonic()
         iterations = 0
+        enforcer_abort_retries = 0
 
         while True:
             iterations += 1
@@ -779,6 +791,13 @@ class EnginePool:
                         self._set_state(entry, EngineState.LOADING, "get_engine")
                         entry.ready_event = asyncio.Event()
                         entry.load_error = None
+                        # Clear any stale abort flag left by a previous
+                        # enforcer-aborted load. Without this the leftover
+                        # True makes _load_engine abort this fresh load
+                        # immediately (see the abort_loading check below), so
+                        # a model could never reload after its first
+                        # memory-pressure abort — poisoning it until restart.
+                        entry.abort_loading = False
                         entry.load_started = time.time()
                         should_load = True
                         logger.info(f"get_engine({model_id}) loading model {entry.model_path}")
@@ -814,6 +833,15 @@ class EnginePool:
                 except BaseException as e:
                     load_error = e
 
+                # An enforcer-initiated mid-load abort is transient (memory
+                # pressure), not a real load failure — detected by the
+                # ModelLoadingError "aborted" marker. Computed here so the
+                # post-lock retry decision (below) can see it too.
+                _enforcer_abort = (
+                    isinstance(load_error, ModelLoadingError)
+                    and "aborted" in str(load_error)
+                )
+
                 # ATOMIC state transition + signal — all under ONE lock hold.
                 # This ensures no TOCTOU gap between state change and event
                 # signal, and no gap between setting load_error and signaling.
@@ -844,10 +872,6 @@ class EnginePool:
                         #   here would cascade-503 stress workloads
                         #   that exercise repeated eviction-then-reload
                         #   on small non-pinned models.
-                        _enforcer_abort = (
-                            isinstance(load_error, ModelLoadingError)
-                            and "aborted" in str(load_error)
-                        )
                         _skip_record = (
                             isinstance(load_error, asyncio.CancelledError)
                             or _enforcer_abort
@@ -862,6 +886,28 @@ class EnginePool:
                     entry.ready_event.set()  # Signal under lock — ALWAYS
 
                 if load_error is not None:
+                    # Transient enforcer abort: the model is fine, memory was
+                    # just tight mid-load. Re-enter the loop to wait for memory
+                    # to free (via _prepare_memory_for's drain / exclusive-idle
+                    # waits) and retry, rather than surfacing a 503 the caller
+                    # can't act on. Bounded by the retry cap and the overall
+                    # max_wait_timeout so a genuinely un-loadable model still
+                    # raises a clear error.
+                    if (
+                        _enforcer_abort
+                        and enforcer_abort_retries < MAX_ENFORCER_ABORT_RETRIES
+                        and (time.monotonic() - start_time)
+                        < self._max_wait_timeout
+                    ):
+                        enforcer_abort_retries += 1
+                        logger.info(
+                            f"get_engine({model_id}) load aborted by memory "
+                            f"enforcer (retry {enforcer_abort_retries}/"
+                            f"{MAX_ENFORCER_ABORT_RETRIES}); waiting for "
+                            f"memory to free, then retrying"
+                        )
+                        await asyncio.sleep(ENFORCER_ABORT_RETRY_BACKOFF)
+                        continue
                     raise load_error
                 return result
 
@@ -2054,7 +2100,8 @@ class EnginePool:
             )
             raise ModelLoadingError(
                 f"Model {model_id} load aborted: "
-                f"process memory limit exceeded"
+                f"process memory limit exceeded",
+                model_id=model_id,
             )
 
         entry.engine = engine

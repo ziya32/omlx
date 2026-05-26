@@ -11,6 +11,7 @@ import pytest
 from omlx.engine_pool import EngineEntry, EnginePool, EngineState
 from omlx.exceptions import (
     InsufficientMemoryError,
+    ModelLoadingError,
     ModelNotFoundError,
     ModelTooLargeError,
 )
@@ -709,6 +710,74 @@ class TestEnginePoolAsync:
         mock_engine_a.stop.assert_called_once()
         mock_engine_b.stop.assert_called_once()
         assert pool.loaded_model_count == 0
+
+    @pytest.mark.asyncio
+    async def test_stale_abort_flag_does_not_poison_reload(
+        self, pool_with_mock_engines
+    ):
+        """A leftover abort_loading=True from a prior enforcer-aborted load
+        must not abort the next load.
+
+        Regression: the enforcer sets entry.abort_loading=True to abort an
+        in-flight load under memory pressure, but nothing reset it, so the
+        model could never load again (every reload hit the abort check at
+        the end of _load_engine). get_engine now clears it at load start.
+        """
+        pool = pool_with_mock_engines
+
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+        mock_engine.stop = AsyncMock()
+
+        # Simulate the stale flag left behind by a previous pressure abort.
+        pool._entries["model-a"].abort_loading = True
+
+        with patch("omlx.engine_pool.BatchedEngine", return_value=mock_engine):
+            engine = await pool.get_engine("model-a")
+
+        assert engine is mock_engine
+        assert pool.loaded_model_count == 1
+        # Flag cleared at load start so it can't poison future reloads.
+        assert pool._entries["model-a"].abort_loading is False
+
+    @pytest.mark.asyncio
+    async def test_enforcer_abort_retries_in_loop(
+        self, pool_with_mock_engines, monkeypatch
+    ):
+        """An enforcer-aborted load is retried in-loop (not surfaced as a
+        503) and succeeds once the transient pressure clears."""
+        pool = pool_with_mock_engines
+
+        mock_engine = MagicMock()
+        mock_engine.start = AsyncMock()
+        mock_engine.stop = AsyncMock()
+
+        # Avoid the real backoff sleep in the test.
+        monkeypatch.setattr(
+            "omlx.engine_pool.ENFORCER_ABORT_RETRY_BACKOFF", 0.0
+        )
+
+        calls = {"n": 0}
+
+        async def flaky_load(model_id, force_lm=False):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                # First attempt: enforcer aborts mid-load (transient).
+                raise ModelLoadingError(
+                    f"Model {model_id} load aborted: "
+                    f"process memory limit exceeded",
+                    model_id=model_id,
+                )
+            # Second attempt: pressure cleared, load succeeds.
+            pool._entries[model_id].engine = mock_engine
+
+        monkeypatch.setattr(pool, "_load_engine", flaky_load)
+
+        engine = await pool.get_engine("model-a")
+
+        assert engine is mock_engine
+        assert calls["n"] == 2  # aborted once, retried once, succeeded
+        assert pool._entries["model-a"].state == EngineState.ACTIVE
 
 
 class TestEnginePoolEviction:
