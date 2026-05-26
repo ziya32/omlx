@@ -160,7 +160,7 @@ override-dependencies = [
 # executor-thread TTS garble (categorical_sampling no longer captures the
 # thread-local mx.random.state at compile time). Editable so the working tree
 # (checked out to fix/qwen) is used directly.
-mlx-audio = { path = "/Volumes/S-T7-2TB/repos/skynet/mlx-audio-latest", editable = true }
+mlx-audio = { path = "/Volumes/S-T7-2TB/repos/skynet/mlx-audio", editable = true }
 
 [tool.black]
 line-length = 88
