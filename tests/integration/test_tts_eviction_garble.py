@@ -1,17 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Regression test: TTS audio must stay intelligible when a model is evicted
-during concurrent TTS generation.
+"""Eviction-safety test: TTS audio must stay intelligible when a model is
+evicted during concurrent TTS generation.
 
-Reproduces the nanobot voice/stress failure (test_omlx_stress_e2e
-``TestPriorityEviction``). Under a low ``--max-model-memory`` a pre-warmed
-embedding model is evicted the moment the TTS model loads; that eviction frees
-the victim's MLX arrays. If the free runs on the asyncio event-loop thread (the
-old ``self._model = None; gc.collect()`` in each engine ``stop()`` /
-``engine_pool._deferred_engine_cleanup``) it races concurrent TTS generation on
-the single MLX executor and corrupts the audio in place — same length, but only
-the first sentence survives (~18% word overlap vs ~84% clean). The fix routes
-those frees onto the executor under the buffer-access lock
-(``mx_buffer_lock.locked_free_and_clear``). See issue #85.
+Reproduces the nanobot voice/stress scenario (test_omlx_stress_e2e
+``TestPriorityEviction``): under a low ``--max-model-memory`` a pre-warmed
+embedding model is evicted the moment the TTS model loads, freeing the victim's
+MLX arrays while TTS generation runs on the single MLX executor.
+
+HISTORY (corrected): this test was originally written believing the eviction
+free — when it ran on the asyncio event-loop thread (the old ``self._model =
+None; gc.collect()`` in each engine ``stop()``) — was what corrupted the audio
+(~18% word overlap vs ~84% clean). It was NOT. That garble was an mx.compile +
+thread-local ``mx.random.state`` bug in mlx-audio's Qwen3-TTS sampler, fixed
+separately (fork fix/qwen); this test now passes because of that mlx-audio fix.
+It is retained as defense-in-depth that eviction frees — now serialized onto the
+executor under the buffer-access lock (``mx_buffer_lock.locked_free_and_clear``,
+issue #85) — don't corrupt concurrent TTS.
 
 Boots a REAL ``omlx serve`` subprocess (so the memory enforcer / engine-pool
 eviction actually run — the in-process ASGITransport fixtures do not start the
@@ -209,6 +213,7 @@ async def test_tts_audio_not_garbled_under_model_eviction():
     assert worst >= PASS_THRESHOLD, (
         f"TTS audio garbled under model eviction: word overlaps {[f'{o:.0%}' for o in overlaps]} "
         f"(worst {worst:.0%} < {PASS_THRESHOLD:.0%}; clean baseline ~84%). "
-        "An eviction's buffer free likely ran on the event-loop thread and raced "
-        "TTS generation on the MLX executor — see mx_buffer_lock.locked_free_and_clear / issue #85."
+        "Most likely the mlx-audio Qwen3-TTS sampler regressed (mx.compile + thread-local "
+        "mx.random.state off the executor thread; see fork fix/qwen). Less likely: an eviction "
+        "buffer free raced generation on the executor (mx_buffer_lock.locked_free_and_clear / #85)."
     )
