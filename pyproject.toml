@@ -94,11 +94,14 @@ modelscope = [
     "modelscope>=1.10.0",
 ]
 audio = [
-    # mlx-audio from commit (5175326) with tts/stt/sts extras
+    # mlx-audio with tts/stt/sts extras. PINNED to the local fork on branch
+    # fix/qwen (RNG-key thread-safety fix for the executor-thread TTS garble —
+    # categorical_sampling no longer captures thread-local mx.random.state). The
+    # local source path is declared in [tool.uv.sources] below.
     # tts extra: misaki, num2words, spacy, phonemizer-fork, espeakng-loader, sentencepiece
     # stt extra: tiktoken, mistral-common[audio]
     # sts extra: tts deps + stt deps + webrtcvad
-    "mlx-audio[tts,stt,sts] @ git+https://github.com/Blaizzy/mlx-audio@51753266e0a4f766fd5e6fbc46652224efc23981",
+    "mlx-audio[tts,stt,sts]",
 ]
 paroquant = [
     # ParoQuant runtime loader for paroquant-quantized models. Installed
@@ -154,6 +157,13 @@ include = ["omlx*"]
 override-dependencies = [
     "mlx-lm @ git+https://github.com/ml-explore/mlx-lm@ed1fca4cef15a824c5f1702c80f70b4cffc8e4dd",
 ]
+
+[tool.uv.sources]
+# Local fork on branch fix/qwen — RNG-key thread-safety fix for the
+# executor-thread TTS garble (categorical_sampling no longer captures the
+# thread-local mx.random.state at compile time). Editable so the working tree
+# (checked out to fix/qwen) is used directly.
+mlx-audio = { path = "/Volumes/S-T7-2TB/repos/skynet/mlx-audio-latest", editable = true }
 
 [tool.black]
 line-length = 88
