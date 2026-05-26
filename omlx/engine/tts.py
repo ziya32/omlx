@@ -20,7 +20,7 @@ import mlx.core as mx
 import numpy as np
 
 from ..engine_core import get_mlx_executor
-from ..mx_buffer_lock import locked_free_and_clear, locked_sync_and_clear_cache, run_locked
+from ..mx_buffer_lock import gtrace, locked_free_and_clear, locked_sync_and_clear_cache, run_locked
 from ..exceptions import AudioError, VoiceCloningError
 from .audio_utils import DEFAULT_SAMPLE_RATE as _DEFAULT_SAMPLE_RATE
 from .audio_utils import audio_to_wav_bytes as _audio_to_wav_bytes
@@ -376,8 +376,11 @@ class TTSEngine(BaseNonStreamingEngine):
             # Same wrapping: per-segment errors from mlx-audio's iterator
             # become AudioError, not HTTP 500.
             try:
+                gtrace("gen.next.enter")
                 seg = next(g, _SEG_DONE)
+                gtrace("gen.next.exit", "DONE" if seg is _SEG_DONE else "seg")
             except Exception as e:
+                gtrace("gen.next.error", repr(e))
                 raise AudioError(
                     f"TTS segment generation failed: {e}"
                 ) from e
@@ -404,6 +407,7 @@ class TTSEngine(BaseNonStreamingEngine):
                 ) from exc
             seg_sr = getattr(seg, "sample_rate", None)
             seg_sr = int(seg_sr) if isinstance(seg_sr, (int, float)) else None
+            gtrace("gen.seg.materialized", f"samples={getattr(audio_np, 'size', '?')} sr={seg_sr}")
             return audio_np, seg_sr
 
         def _finalize(chunks, sample_rate):

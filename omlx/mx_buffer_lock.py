@@ -25,7 +25,28 @@ without import cycles (it imports nothing from omlx).
 
 from __future__ import annotations
 
+import os
+import sys
 import threading
+import time
+
+# GTRACE: env-gated (OMLX_GTRACE=1) stderr tracing of buffer-pool parties, used to
+# diagnose whether any reclaim/free runs on a non-executor thread concurrently with
+# TTS generation (the garble hypothesis). Inert unless the env var is set.
+_GTRACE = os.environ.get("OMLX_GTRACE") == "1"
+
+
+def gtrace(event: str, detail: str = "") -> None:
+    if not _GTRACE:
+        return
+    try:
+        sys.stderr.write(
+            f"[GTRACE] {time.time():.4f} {threading.current_thread().name} {event} {detail}\n"
+        )
+        sys.stderr.flush()
+    except Exception:
+        pass
+
 
 # Reentrant: a single logical operation may acquire it more than once
 # (e.g. the synchronous store path already holds it around store_cache, which
@@ -43,9 +64,11 @@ def locked_sync_and_clear_cache() -> None:
     """
     import mlx.core as mx
 
+    gtrace("reclaim.enter")
     with mx_buffer_access_lock:
         mx.synchronize()
         mx.clear_cache()
+    gtrace("reclaim.exit")
 
 
 def locked_free_and_clear(drop=None) -> None:
@@ -66,12 +89,14 @@ def locked_free_and_clear(drop=None) -> None:
 
     import mlx.core as mx
 
+    gtrace("free.enter", f"drop={drop is not None}")
     with mx_buffer_access_lock:
         if drop is not None:
             drop()
         gc.collect()
         mx.synchronize()
         mx.clear_cache()
+    gtrace("free.exit")
 
 
 def run_locked(fn):
@@ -86,5 +111,9 @@ def run_locked(fn):
     nesting with ``locked_sync_and_clear_cache`` / ``_extract_tensor_bytes`` is
     safe.
     """
-    with mx_buffer_access_lock:
-        return fn()
+    gtrace("runlocked.enter")
+    try:
+        with mx_buffer_access_lock:
+            return fn()
+    finally:
+        gtrace("runlocked.exit")
