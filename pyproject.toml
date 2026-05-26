@@ -156,11 +156,13 @@ override-dependencies = [
 ]
 
 [tool.uv.sources]
-# Local fork on branch fix/qwen — RNG-key thread-safety fix for the
-# executor-thread TTS garble (categorical_sampling no longer captures the
-# thread-local mx.random.state at compile time). Editable so the working tree
-# (checked out to fix/qwen) is used directly.
-mlx-audio = { path = "/Volumes/S-T7-2TB/repos/skynet/mlx-audio", editable = true }
+# Fork on branch fix/qwen — RNG-key thread-safety fix for the executor-thread
+# TTS garble (categorical_sampling no longer captures the thread-local
+# mx.random.state at compile time). Public fork pinned over https so it resolves
+# reproducibly in CI without a local checkout; uv.lock pins the exact commit.
+# For local iteration on the fork, `uv pip install -e <checkout> --no-deps` over
+# this still works.
+mlx-audio = { git = "https://github.com/ziya32/mlx-audio", branch = "fix/qwen" }
 
 [tool.black]
 line-length = 88
