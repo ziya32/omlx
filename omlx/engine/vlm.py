@@ -1006,7 +1006,9 @@ class VLMBatchedEngine(BaseEngine):
         try:
             from ..utils.model_loading import maybe_apply_pre_load_patches
             maybe_apply_pre_load_patches(
-                self._model_name, model_settings=self._model_settings
+                self._model_name,
+                model_settings=self._model_settings,
+                for_vlm=True,
             )
         except Exception as e:
             logger.debug(f"pre-load patches skipped: {e}")
@@ -1841,12 +1843,29 @@ class VLMBatchedEngine(BaseEngine):
                         self._vision_cache.get(h, self._model_name) for h in per_hashes
                     ]
 
+                    # Whole-request fallback: when per-image split isn't
+                    # supported the encoder output is stored under the
+                    # whole-request image_hash (see the store branch below).
+                    # Read it back on a per-image miss so identical full
+                    # requests reuse it instead of re-encoding (#1417).
+                    cached_whole = None
+                    if not all(f is not None for f in cached_per_image):
+                        cached_whole = self._vision_cache.get(
+                            image_hash, self._model_name
+                        )
+
                     if all(f is not None for f in cached_per_image):
                         combined = mx.concatenate(cached_per_image, axis=0)
                         call_kwargs["cached_image_features"] = combined
                         logger.debug(
                             "Vision feature cache hit (per-image): all %d images cached",
                             num_images,
+                        )
+                    elif cached_whole is not None:
+                        call_kwargs["cached_image_features"] = cached_whole
+                        logger.debug(
+                            "Vision feature cache hit (whole-request): %s",
+                            image_hash[:16],
                         )
                     else:
                         try:

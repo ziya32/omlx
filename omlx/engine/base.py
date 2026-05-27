@@ -11,6 +11,11 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, List, Optional
 
+import mlx.core as mx
+
+from omlx.engine_core import get_mlx_executor
+from omlx.mx_buffer_lock import locked_sync_and_clear_cache
+
 
 @dataclass
 class GenerationOutput:
@@ -372,8 +377,8 @@ class BaseNonStreamingEngine(ABC):
             activity.update(self._sanitize_activity_metadata(updates))
             activity["last_activity_at"] = time.monotonic()
 
-    def _end_activity(self, activity_id: str) -> bool:
-        """End an activity and return True if cache should be cleared."""
+    def _end_activity(self, activity_id: str) -> None:
+        """End an activity."""
         with self._active_lock:
             removed = self._activities.pop(activity_id, None)
             if removed is None:
@@ -383,7 +388,25 @@ class BaseNonStreamingEngine(ABC):
             self._active_count -= 1
             if self._active_count < 0:
                 raise RuntimeError("Active request count became negative")
-            return self._active_count == 0
+
+    async def _finish_activity(self, activity_id: str) -> None:
+        """End an activity and clear the Metal buffer pool.
+
+        Always clears per request. Gating the clear on `_active_count == 0`
+        caused unbounded Metal pool growth under concurrent workloads (#684),
+        because indexing clients keep the active count above zero indefinitely.
+        `mx.synchronize()` is required before `mx.clear_cache()` to avoid
+        Metal buffer races on M3/M4 (#300, #888, #1106). The clear runs on
+        the MLX executor AND under the process-wide buffer-access lock
+        (`locked_sync_and_clear_cache`) so it can't reclaim the buffer pool
+        mid-read from the async phase-2 KV save or another engine path.
+        """
+        self._end_activity(activity_id)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            get_mlx_executor(),
+            locked_sync_and_clear_cache,
+        )
 
     async def abort_all_requests(self) -> int:
         """Signal all in-flight operations to abort at the next checkpoint.

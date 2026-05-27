@@ -159,7 +159,6 @@ class EnginePool:
 
     def __init__(
         self,
-        max_model_memory: int | None,
         scheduler_config: SchedulerConfig | None = None,
         drain_timeout: float = 120.0,
         max_wait_timeout: float = 300.0,
@@ -168,17 +167,22 @@ class EnginePool:
         Initialize the engine pool.
 
         Args:
-            max_model_memory: Maximum memory for loaded models in bytes,
-                or None for no limit (disabled)
             scheduler_config: Configuration for BatchedEngine schedulers
             drain_timeout: Seconds before force-aborting a draining model
             max_wait_timeout: Seconds before timing out a get_engine() wait
+
+        Note:
+            Pre-load admission consults the process memory enforcer's
+            dynamic tier ceiling (``get_final_ceiling()``) via
+            ``_current_ceiling()``. The enforcer is set by
+            ``server.init_server()``; until then the pool admits
+            unconditionally (ceiling == 0).
         """
         self._entries: dict[str, EngineEntry] = {}
         self._lock = asyncio.Lock()
-        self._max_model_memory = max_model_memory
         self._scheduler_config = scheduler_config or SchedulerConfig()
         self._process_memory_enforcer: object | None = None  # Set by server
+        self._get_final_ceiling: object | None = None  # Set by server (callback)
         self._settings_manager: object | None = None  # Set by server
         self._suppress_ttl: bool = False  # Suppress TTL during benchmarks
         # Exponentially-weighted moving average of observed load speed in
@@ -262,10 +266,38 @@ class EnginePool:
             )
         )
 
+    def _current_ceiling(self) -> int:
+        """Resolve the current memory ceiling (dynamic tier ceiling).
+
+        Prefers the ``_get_final_ceiling`` callback wired up by
+        ``server.init_server()`` (``enforcer.get_final_ceiling`` =
+        min(static, dynamic, metal_cap)); falls back to the enforcer
+        reference directly when only that is set (e.g. in tests). Returns
+        0 when neither is wired up or the memory guard is disabled —
+        callers treat 0 as "no limit".
+        """
+        cb = self._get_final_ceiling
+        if cb is not None:
+            try:
+                return int(cb())
+            except Exception:  # noqa: BLE001
+                return 0
+        enforcer = self._process_memory_enforcer
+        if enforcer is not None:
+            try:
+                return int(enforcer.get_final_ceiling())
+            except Exception:  # noqa: BLE001
+                return 0
+        return 0
+
     @property
     def max_model_memory(self) -> int | None:
-        """Maximum memory for loaded models in bytes, or None if disabled."""
-        return self._max_model_memory
+        """Memory ceiling for admission in bytes, or None if disabled.
+
+        Derived from the enforcer's dynamic tier ceiling (``_current_ceiling``)
+        now that the static ``max_model_memory`` setting is gone.
+        """
+        return self._current_ceiling() or None
 
     @property
     def current_model_memory(self) -> int:
@@ -427,7 +459,8 @@ class EnginePool:
             if model_id not in found_models:
                 logger.warning(f"Pinned model not found: {model_id}")
 
-        mem_display = "disabled" if self._max_model_memory is None else format_size(self._max_model_memory)
+        _ceil = self._current_ceiling()
+        mem_display = "disabled" if _ceil <= 0 else format_size(_ceil)
         logger.info(
             f"Discovered {len(self._entries)} models, "
             f"max memory: {mem_display}"
@@ -758,13 +791,11 @@ class EnginePool:
                     event = entry.unload_complete
 
                 elif entry.state == EngineState.UNLOADED:
-                    # Check if model is too large for memory limit
-                    if (
-                        self._max_model_memory is not None
-                        and entry.estimated_size > self._max_model_memory
-                    ):
+                    # Check if model is too large for the memory ceiling
+                    _ceil = self._current_ceiling()
+                    if _ceil > 0 and entry.estimated_size > _ceil:
                         raise ModelTooLargeError(
-                            model_id, entry.estimated_size, self._max_model_memory
+                            model_id, entry.estimated_size, _ceil
                         )
 
                     # Check load failure cooldown
@@ -1299,15 +1330,16 @@ class EnginePool:
                     )
                 return e.ready_event
 
-        if self._max_model_memory is None:
-            # No model memory limit — also check process memory
+        ceiling = self._current_ceiling()
+        if ceiling <= 0:
+            # No memory ceiling — also check process memory
             return await self._check_process_memory(entry)
 
         required = entry.estimated_size
         if entry.model_type not in ("audio_stt", "audio_tts", "audio_sts", "embedding", "reranker"):
             required += int(entry.estimated_size * 0.25)  # KV headroom
 
-        while self._committed_memory() + required > self._max_model_memory:
+        while self._committed_memory() + required > ceiling:
             victim_id = self._find_drain_or_evict_candidate()
             if victim_id is None:
                 # Can't evict anything. Find a draining model to wait on.
@@ -1328,17 +1360,17 @@ class EnginePool:
                 # Nothing draining, loading, or unloading.
                 # Try without KV headroom as a last resort
                 required_no_headroom = entry.estimated_size
-                if self._committed_memory() + required_no_headroom <= self._max_model_memory:
+                if self._committed_memory() + required_no_headroom <= ceiling:
                     logger.info(
                         f"Loading {entry.model_id} without KV headroom "
                         f"(need {format_size(required)}, "
-                        f"available {format_size(self._max_model_memory - self._committed_memory())})"
+                        f"available {format_size(ceiling - self._committed_memory())})"
                     )
                     break  # Proceed without headroom
 
                 # Truly stuck (all pinned)
                 raise ModelTooLargeError(
-                    entry.model_id, required, self._max_model_memory
+                    entry.model_id, required, ceiling
                 )
 
             victim = self._entries[victim_id]
@@ -1378,7 +1410,7 @@ class EnginePool:
             return None
 
         enforcer = self._process_memory_enforcer
-        if enforcer.max_bytes <= 0:
+        if enforcer.get_final_ceiling() <= 0:
             return None
 
         while True:
@@ -1388,7 +1420,7 @@ class EnginePool:
             # backed Metal on Apple Silicon UMA (95 GB gap on 31B+32k).
             current_active = max(mx.get_active_memory(), get_phys_footprint())
             projected = current_active + entry.estimated_size
-            if projected <= enforcer.max_bytes:
+            if projected <= enforcer.get_final_ceiling():
                 return None
 
             # Try to evict/drain an LRU model to free memory
@@ -1408,7 +1440,7 @@ class EnginePool:
                         f"Evicting '{victim_id}' to fit '{entry.model_id}' "
                         f"within process memory limit "
                         f"({format_size(projected)} > "
-                        f"{format_size(enforcer.max_bytes)})"
+                        f"{format_size(enforcer.get_final_ceiling())})"
                     )
                     await self._unload_engine(
                         victim_id, reason="evict_process_memory"
@@ -1440,13 +1472,13 @@ class EnginePool:
             # allocator may not have reclaimed pages even after clear_cache.
             current_active = max(mx.get_active_memory(), get_phys_footprint())
             projected = current_active + entry.estimated_size
-            if projected <= enforcer.max_bytes:
+            if projected <= enforcer.get_final_ceiling():
                 logger.info(
                     f"Process memory after cleanup: "
                     f"{format_size(current_active)} + "
                     f"{entry.model_id} ({format_size(entry.estimated_size)}) "
                     f"= {format_size(projected)} <= "
-                    f"{format_size(enforcer.max_bytes)}. Proceeding."
+                    f"{format_size(enforcer.get_final_ceiling())}. Proceeding."
                 )
                 return None
 
@@ -1474,10 +1506,10 @@ class EnginePool:
             # weights alone fit and the overshoot is modest (within 25%
             # headroom). Metal may reuse freed pages during the load.
             committed = self._committed_memory()
-            headroom = int(enforcer.max_bytes * 0.25)
+            headroom = int(enforcer.get_final_ceiling() * 0.25)
             if (
-                committed + entry.estimated_size <= enforcer.max_bytes
-                and projected <= enforcer.max_bytes + headroom
+                committed + entry.estimated_size <= enforcer.get_final_ceiling()
+                and projected <= enforcer.get_final_ceiling() + headroom
             ):
                 logger.warning(
                     f"Process memory after cleanup still high "
@@ -1498,7 +1530,7 @@ class EnginePool:
                 message=(
                     f"Cannot load {entry.model_id}: projected memory "
                     f"{format_size(projected)} would exceed process "
-                    f"limit {format_size(enforcer.max_bytes)} "
+                    f"limit {format_size(enforcer.get_final_ceiling())} "
                     f"(current Metal: {format_size(current_active)}, "
                     f"committed: {format_size(committed)}, "
                     f"model: {format_size(entry.estimated_size)})"
@@ -2252,7 +2284,7 @@ class EnginePool:
             Dictionary with pool status information
         """
         return {
-            "max_model_memory": self._max_model_memory,
+            "max_model_memory": self._current_ceiling() or None,
             "current_model_memory": self._committed_memory(),
             "model_count": len(self._entries),
             "loaded_count": sum(
@@ -2308,8 +2340,8 @@ class EnginePool:
             "lock_held": self._lock.locked(),
             "committed_memory_gb": round(self._committed_memory() / 1e9, 2),
             "max_model_memory_gb": (
-                round(self._max_model_memory / 1e9, 2)
-                if self._max_model_memory
+                round(self._current_ceiling() / 1e9, 2)
+                if self._current_ceiling()
                 else None
             ),
             "timeout_counter": self._timeout_counter,

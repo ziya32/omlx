@@ -41,6 +41,7 @@ from .cache.paged_cache import PagedCacheManager
 from .cache.prefix_cache import BlockAwarePrefixCache
 from .exceptions import is_cache_corruption_error
 from .prefill_progress import get_prefill_tracker
+from .prefill_transient_tracker import PrefillTransientTracker
 from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .speculative.vlm_mtp import VLMMTPDrafter, run_vlm_mtp_decode
 from .utils.proc_memory import get_phys_footprint
@@ -137,6 +138,66 @@ def _safe_sync_generation_stream():
     except RuntimeError as e:
         if "no Stream" not in str(e):
             raise
+
+
+class _StoreCacheGate:
+    """Bounded gate that throttles store-cache submissions.
+
+    Caps how many KV caches can be alive in the post-completion store-cache
+    pipeline at once. _cleanup_finished acquires a slot before handing work
+    to _store_cache_executor; the future's done callback releases it.
+
+    cap is adjusted at runtime from ProcessMemoryEnforcer so the pipeline
+    shrinks under memory pressure on smaller systems (#1383).
+    """
+
+    def __init__(self, cap: int) -> None:
+        self._cap = max(1, cap)
+        self._in_flight = 0
+        self._cond = threading.Condition()
+        self._shutdown = False
+
+    def acquire(self) -> bool:
+        """Block until in_flight < cap. Returns False if shut down."""
+        with self._cond:
+            while not self._shutdown and self._in_flight >= self._cap:
+                self._cond.wait()
+            if self._shutdown:
+                return False
+            self._in_flight += 1
+            return True
+
+    def release(self) -> None:
+        with self._cond:
+            if self._in_flight > 0:
+                self._in_flight -= 1
+            self._cond.notify_all()
+
+    def set_cap(self, cap: int) -> None:
+        with self._cond:
+            new_cap = max(1, cap)
+            if new_cap == self._cap:
+                return
+            grew = new_cap > self._cap
+            self._cap = new_cap
+            if grew:
+                self._cond.notify_all()
+
+    @property
+    def cap(self) -> int:
+        with self._cond:
+            return self._cap
+
+    @property
+    def in_flight(self) -> int:
+        with self._cond:
+            return self._in_flight
+
+    def shutdown(self) -> None:
+        """Wake all waiters and refuse further acquires."""
+        with self._cond:
+            self._shutdown = True
+            self._cond.notify_all()
 
 
 # Import tiered cache components
@@ -736,6 +797,18 @@ class Scheduler:
         # taken at the start of each step() tick. Read via
         # _current_tick_memory_bytes(); 0 outside a tick.
         self._tick_memory_bytes: int = 0
+        # Adaptive prefill throttle params, propagated from enforcer.
+        # Until set, _adaptive_chunk_size is a no-op (returns requested as-is).
+        self._prefill_safe_zone_ratio: float = 0.80
+        self._prefill_min_chunk_tokens: int = 32
+        # EWMA estimator of per-token chunk transient bytes, used by
+        # _adaptive_chunk_size in the caution zone. Owned per-scheduler.
+        _tracker_model_id = ""
+        if config is not None and config.model_name:
+            _tracker_model_id = os.path.basename(config.model_name.rstrip("/"))
+        self._prefill_transient_tracker = PrefillTransientTracker(
+            model_id=_tracker_model_id
+        )
 
         # SpecPrefill: draft model for attention-based sparse prefill
         self._specprefill_draft_model: Any | None = None
@@ -765,6 +838,9 @@ class Scheduler:
         # bulk memcpy (28GB+ per 32k request) off the inference thread so
         # response streaming isn't blocked by it.
         self._store_cache_executor: concurrent.futures.ThreadPoolExecutor | None = None
+        # Gate that caps in-flight store-cache submissions. Set only when
+        # tiered cache is enabled (alongside _store_cache_executor).
+        self._store_cache_gate: _StoreCacheGate | None = None
         # Pending (uid, request_id, future) entries waiting for async store
         # to finish before batch_generator.remove() can safely run. Drained
         # at the start of every step.
@@ -851,6 +927,11 @@ class Scheduler:
                 max_workers=1,
                 thread_name_prefix="omlx-store-cache",
             )
+            # Gate caps the post-completion store-cache pipeline so a burst
+            # of finishes cannot pile up unbounded KV caches in memory while
+            # the single writer drains. Cap starts at max_concurrent_requests
+            # and is shrunk by ProcessMemoryEnforcer under pressure (#1383).
+            self._store_cache_gate = _StoreCacheGate(cap=self.config.max_num_seqs)
         else:
             logger.info(
                 "oMLX cache disabled (mlx-lm BatchGenerator manages KV internally)"
@@ -1833,6 +1914,16 @@ class Scheduler:
                     n_to_process = min(n_to_process, delta)
                 n_to_process = max(1, n_to_process)
 
+            # Adaptive throttle: shrink chunk when entering the caution zone
+            # so the hard cap is honored before the chunk-end check. Raises
+            # RuntimeError if the min chunk would exceed the cap — the
+            # #1405 cleanup path catches it and emits an error to the client.
+            n_to_process = self._adaptive_chunk_size(
+                n_to_process,
+                request_id=request.request_id,
+                loop_label="external",
+            )
+
             model_kwargs: dict[str, Any] = {}
             if embeds_array is not None and embeds_array.shape[1] > 0:
                 model_kwargs["inputs_embeds"] = embeds_array[:, :n_to_process]
@@ -1841,8 +1932,17 @@ class Scheduler:
                         extra_kwargs, n_to_process
                     )
 
+            _throttle_pre = get_phys_footprint()
             self.model(input_arr[:, :n_to_process], cache=prompt_cache, **model_kwargs)
             mx.eval([c.state for c in prompt_cache])
+            _throttle_post = get_phys_footprint()
+            self._record_chunk_transient(
+                n_to_process,
+                _throttle_pre,
+                _throttle_post,
+                request_id=request.request_id,
+                loop_label="external",
+            )
 
             input_arr = input_arr[:, n_to_process:]
             if embeds_array is not None:
@@ -1875,6 +1975,24 @@ class Scheduler:
             if self._memory_limit_bytes > 0:
                 # Reuse the per-tick memory snapshot taken at step() start.
                 current = self._current_tick_memory_bytes()
+                _hard = self._memory_hard_limit_bytes
+                _soft = self._memory_limit_bytes
+                # Only log when crossing the soft watermark — that's the
+                # caution zone where adaptive throttle decisions matter.
+                # Skipped on healthy traffic to keep the log quiet.
+                if current > _soft:
+                    logger.debug(
+                        "[memcheck:external] rid=%s n=%d processed=%d "
+                        "current=%.3fGB soft=%.3fGB hard=%.3fGB %s",
+                        request.request_id,
+                        n_to_process,
+                        processed_tokens,
+                        current / 1024**3,
+                        _soft / 1024**3,
+                        _hard / 1024**3,
+                        "OVER_HARD" if _hard > 0 and current > _hard
+                        else "OVER_SOFT",
+                    )
                 if (
                     self._memory_hard_limit_bytes > 0
                     and current > self._memory_hard_limit_bytes
@@ -1882,17 +2000,17 @@ class Scheduler:
                     logger.warning(
                         f"Prefill force-stopped at {processed_tokens} "
                         f"tokens: memory {current / 1024**3:.1f}GB "
-                        f"exceeds hard limit "
+                        f"exceeds ceiling "
                         f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB"
                     )
                     raise RuntimeError("Memory limit exceeded during prefill")
                 elif current > self._memory_limit_bytes:
                     logger.warning(
-                        f"Prefill memory soft limit exceeded at "
+                        f"Prefill above max_bytes at "
                         f"{processed_tokens} tokens: "
                         f"{current / 1024**3:.1f}GB > "
                         f"{self._memory_limit_bytes / 1024**3:.1f}GB "
-                        f"(hard limit: "
+                        f"(ceiling: "
                         f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB)"
                     )
 
@@ -1930,6 +2048,132 @@ class Scheduler:
             self.model._language_model._rope_deltas = _saved_rope_deltas
 
         return prompt_cache, last_token
+
+    # ------------------------------------------------------------------
+    # Adaptive prefill throttle
+    # ------------------------------------------------------------------
+
+    # Discrete step sizes used by the watermark-based throttle. Each tier
+    # halves SDPA-fallback transient (∝ query_len × kv_len), so crossing
+    # one tier under memory pressure roughly doubles the available
+    # headroom for the next chunk's intermediates.
+    _PREFILL_STEP_TIERS: tuple[int, ...] = (1024, 512, 256, 128)
+
+    def _adaptive_chunk_size(
+        self,
+        requested: int,
+        *,
+        request_id: str,
+        loop_label: str,
+    ) -> int:
+        """Shrink the next prefill chunk by bucketing how far current
+        memory has crossed the soft watermark.
+
+        The approach is intentionally measurement-free and model-agnostic.
+        Once current memory passes the soft watermark
+        (``max_bytes * prefill_safe_zone_ratio``, default 0.80) the chunk
+        size drops in discrete tiers as we approach the hard cap. This is
+        the auto equivalent of PR #1397's manual ``prefill_step_size``
+        override — users do not pick a value, the scheduler picks one
+        only when memory pressure shows up.
+
+        Tiers (relative to soft → hard band):
+          - current < soft watermark        → full chunk (no throttle)
+          - first 25% of band               → 1024
+          - 25%–50%                          → 512
+          - 50%–75%                          → 256
+          - 75%+                             → 128 (floor at min_chunk)
+
+        The chunk-end memory check (``self._memory_hard_limit_bytes``
+        comparison in the prefill loops) remains as the safety net: if
+        memory still exceeds hard cap after this shrink, RuntimeError is
+        raised and the #1405 cleanup path emits ``finish_reason="error"``
+        to the client.
+
+        Args:
+            requested: The chunk size the caller would have used without
+                throttle (already clamped by boundary alignment).
+            request_id: For debug log correlation.
+            loop_label: "external" or "chunked_step", used only for debug
+                log identification.
+
+        Returns:
+            The chunk size to actually process (>= 1, <= requested).
+        """
+        soft_base = self._memory_limit_bytes
+        hard_cap = self._memory_hard_limit_bytes
+        if soft_base <= 0 or hard_cap <= 0 or requested <= 0:
+            return requested
+
+        current = max(mx.get_active_memory(), get_phys_footprint())
+        soft_watermark = int(soft_base * self._prefill_safe_zone_ratio)
+
+        if current < soft_watermark:
+            return requested
+
+        # Bucket by how far into the soft → hard band we are.
+        band = max(hard_cap - soft_watermark, 1)
+        over_ratio = max(0.0, min(1.0, (current - soft_watermark) / band))
+
+        if over_ratio < 0.25:
+            target = self._PREFILL_STEP_TIERS[0]    # 1024
+        elif over_ratio < 0.50:
+            target = self._PREFILL_STEP_TIERS[1]    # 512
+        elif over_ratio < 0.75:
+            target = self._PREFILL_STEP_TIERS[2]    # 256
+        else:
+            target = self._PREFILL_STEP_TIERS[3]    # 128
+
+        target = max(target, self._prefill_min_chunk_tokens)
+        if requested <= target:
+            return requested
+
+        logger.debug(
+            "[throttle:%s] shrink rid=%s chunk %d -> %d "
+            "(current=%.2fGB shrink_at=%.2fGB ceiling=%.2fGB band_ratio=%.2f)",
+            loop_label,
+            request_id,
+            requested,
+            target,
+            current / 1024**3,
+            soft_watermark / 1024**3,
+            hard_cap / 1024**3,
+            over_ratio,
+        )
+        return target
+
+    def _record_chunk_transient(
+        self,
+        n_tokens: int,
+        pre_bytes: int,
+        post_bytes: int,
+        *,
+        request_id: str,
+        loop_label: str,
+    ) -> None:
+        """Feed one chunk's measured transient into the EWMA tracker."""
+        delta = post_bytes - pre_bytes
+        if delta <= 0:
+            logger.debug(
+                "[throttle:%s] measure rid=%s n=%d delta=%dB (skipped: <=0)",
+                loop_label,
+                request_id,
+                n_tokens,
+                delta,
+            )
+            return
+        self._prefill_transient_tracker.update(n_tokens, delta)
+        logger.debug(
+            "[throttle:%s] measure rid=%s n=%d transient=%.2fMB "
+            "per_token=%.1fKB ewma=%.1fKB samples=%d",
+            loop_label,
+            request_id,
+            n_tokens,
+            delta / 1024**2,
+            (delta / max(n_tokens, 1)) / 1024,
+            self._prefill_transient_tracker.bytes_per_token / 1024,
+            self._prefill_transient_tracker.samples,
+        )
 
     # ------------------------------------------------------------------
     # Chunked prefill helpers (used when config.chunked_prefill=True)
@@ -2016,10 +2260,29 @@ class Scheduler:
                 n = min(n, delta)
             n = max(1, n)
 
+        # Adaptive throttle — see _adaptive_chunk_size docstring. Raises
+        # if even prefill_min_chunk_tokens would exceed the cap; #1405
+        # cleanup paths in _schedule_waiting / _advance_chunked_prefills
+        # convert that into a finish_reason="error" output for the client.
+        n = self._adaptive_chunk_size(
+            n,
+            request_id=state.request.request_id,
+            loop_label="chunked_step",
+        )
+
         chunk = state.tokens_remaining[:, :n]
         state.tokens_remaining = state.tokens_remaining[:, n:]
+        _throttle_pre = get_phys_footprint()
         self.model(chunk, cache=state.cache)
         mx.eval([c.state for c in state.cache])
+        _throttle_post = get_phys_footprint()
+        self._record_chunk_transient(
+            n,
+            _throttle_pre,
+            _throttle_post,
+            request_id=state.request.request_id,
+            loop_label="chunked_step",
+        )
         state.tokens_processed += n
 
         # Boundary snapshot
@@ -2056,6 +2319,23 @@ class Scheduler:
         if self._memory_limit_bytes > 0:
             # Reuse the per-tick memory snapshot taken at step() start.
             current = self._current_tick_memory_bytes()
+            _hard = self._memory_hard_limit_bytes
+            _soft = self._memory_limit_bytes
+            # Caution-zone-only memcheck log (see external loop counterpart).
+            if current > _soft:
+                logger.debug(
+                    "[memcheck:chunked_step] rid=%s n=%d processed=%d/%d "
+                    "current=%.3fGB soft=%.3fGB hard=%.3fGB %s",
+                    state.request.request_id,
+                    n,
+                    state.tokens_processed,
+                    state.total_length - 1,
+                    current / 1024**3,
+                    _soft / 1024**3,
+                    _hard / 1024**3,
+                    "OVER_HARD" if _hard > 0 and current > _hard
+                    else "OVER_SOFT",
+                )
             if (
                 self._memory_hard_limit_bytes > 0
                 and current > self._memory_hard_limit_bytes
@@ -2063,16 +2343,16 @@ class Scheduler:
                 raise RuntimeError(
                     f"Memory limit exceeded during chunked prefill at "
                     f"{state.tokens_processed}/{state.total_length - 1} tokens: "
-                    f"{current / 1024**3:.1f}GB exceeds hard limit "
+                    f"{current / 1024**3:.1f}GB exceeds ceiling "
                     f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB"
                 )
             elif current > self._memory_limit_bytes:
                 logger.warning(
-                    f"Chunked prefill memory soft limit exceeded at "
+                    f"Chunked prefill above max_bytes at "
                     f"{state.tokens_processed} tokens: "
                     f"{current / 1024**3:.1f}GB > "
                     f"{self._memory_limit_bytes / 1024**3:.1f}GB "
-                    f"(hard limit: "
+                    f"(ceiling: "
                     f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB)"
                 )
 
@@ -2191,6 +2471,10 @@ class Scheduler:
                 self._prefill_states.pop(rid, None)
                 self.requests.pop(rid, None)
                 get_prefill_tracker().remove(rid)
+                # Drop Metal cache pool buffers held by the aborted chunk's
+                # forward / mx.eval transients. Without this, enforcer keeps
+                # seeing the burst footprint until the next mx.clear_cache().
+                _sync_and_clear_cache()
                 # Surface the failure to the engine. Without this, the
                 # request is silently dropped and the client hangs.
                 rejected.append(
@@ -4333,11 +4617,14 @@ class Scheduler:
         if current + peak > self._memory_hard_limit_bytes:
             from .utils.hardware import format_bytes
 
+            usage_gb = current / (1024**3)
+            ceiling_gb = self._memory_hard_limit_bytes / (1024**3)
             return (
                 f"Prefill would require ~{format_bytes(current + peak)} peak "
                 f"(current {format_bytes(current)} + KV+SDPA {format_bytes(peak)}) "
-                f"but limit is {format_bytes(self._memory_hard_limit_bytes)}. "
-                f"Reduce context length or increase --max-process-memory."
+                f"but ceiling is {format_bytes(self._memory_hard_limit_bytes)} "
+                f"(usage {usage_gb:.1f} GB, ceiling {ceiling_gb:.1f} GB). "
+                f"Reduce context length or lower memory_guard_tier."
             )
         return None
 
@@ -4820,6 +5107,32 @@ class Scheduler:
                         done = self._step_prefill_chunk(state)
                     except _PrefillAbortedError:
                         raise
+                    except RuntimeError as e:
+                        # Hard memory limit hit on the first chunk.
+                        # _step_prefill_chunk updates the PrefillProgressTracker
+                        # before the limit check, so without this catch the
+                        # tracker entry leaks and stays in the dashboard
+                        # forever (#1405). Mirrors the cleanup in
+                        # _advance_chunked_prefills (d736bfd).
+                        logger.error(
+                            "Chunked prefill (first chunk) failed for %s: %s",
+                            request.request_id,
+                            e,
+                        )
+                        self.requests.pop(request.request_id, None)
+                        get_prefill_tracker().remove(request.request_id)
+                        # Drop Metal cache pool buffers held by the aborted
+                        # first chunk's forward / mx.eval transients.
+                        _sync_and_clear_cache()
+                        rejected_outputs.append(
+                            RequestOutput(
+                                request_id=request.request_id,
+                                finished=True,
+                                finish_reason="error",
+                                error=str(e),
+                            )
+                        )
+                        continue
 
                     if done:
                         self._emit_final_boundary_if_needed(state)
@@ -4839,12 +5152,38 @@ class Scheduler:
                 self.request_id_to_uid[request.request_id] = temp_uid
                 self.uid_to_request_id[temp_uid] = request.request_id
 
-                prefilled_cache, last_token = self._do_external_prefill(
-                    request,
-                    tokens_to_process,
-                    cache_to_use,
-                    vlm_embeds=vlm_embeds,
-                )
+                try:
+                    prefilled_cache, last_token = self._do_external_prefill(
+                        request,
+                        tokens_to_process,
+                        cache_to_use,
+                        vlm_embeds=vlm_embeds,
+                    )
+                except RuntimeError as e:
+                    # Hard memory limit hit during external prefill. Without
+                    # this catch, the exception bubbles up to step() and then
+                    # engine_core's fail_all_requests(), which pops
+                    # self.requests but cannot reach the PrefillProgressTracker
+                    # singleton, so the dashboard entry leaks across model
+                    # reload (#1405). Mirrors the cleanup in
+                    # _advance_chunked_prefills (d736bfd).
+                    logger.error("Prefill failed for %s: %s", request.request_id, e)
+                    self.uid_to_request_id.pop(temp_uid, None)
+                    self.request_id_to_uid.pop(request.request_id, None)
+                    self.requests.pop(request.request_id, None)
+                    get_prefill_tracker().remove(request.request_id)
+                    # Drop Metal cache pool buffers held by the aborted
+                    # chunk's forward / mx.eval transients.
+                    _sync_and_clear_cache()
+                    rejected_outputs.append(
+                        RequestOutput(
+                            request_id=request.request_id,
+                            finished=True,
+                            finish_reason="error",
+                            error=str(e),
+                        )
+                    )
+                    continue
 
                 # Clean up temp UID mapping
                 del self.uid_to_request_id[temp_uid]
@@ -5302,47 +5641,78 @@ class Scheduler:
                             # back-to-back requests raced — nanobot
                             # cold-chat e2e regressed 197s -> 348s.
                             if self._store_cache_executor is not None:
-                                store_future = None
-                                try:
-                                    _bt, store_future = (
-                                        self.block_aware_cache.submit_store_cache_async(
-                                            request_id,
-                                            token_sequence_to_store,
-                                            cache_to_store,
-                                            self._store_cache_executor,
-                                            model_cache_config=model_cache_config,
-                                            boundary_snapshots=intermediate_snapshots,
-                                            extra_keys=request.vlm_extra_keys_for_cache,
-                                            extra_key_token_start=(
-                                                request.vlm_extra_key_token_start_for_cache
-                                            ),
-                                            extra_key_ranges=(
-                                                request.vlm_extra_key_ranges_for_cache
-                                            ),
-                                        )
-                                    )
-                                except Exception as e:
-                                    logger.warning(
-                                        "submit_store_cache_async failed for %s: %s",
-                                        request_id, e,
-                                    )
-                                if store_future is not None:
-                                    self._inflight_store_futures[request_id] = store_future
-
-                                    def _cleanup_after_phase2(_fut, _rid=request_id):
-                                        try:
-                                            self.block_aware_cache.clear_request_entry(_rid)
-                                        except Exception as exc:
-                                            logger.warning(
-                                                "clear_request_entry for %s raised: %s",
-                                                _rid, exc,
+                                # Gate acquire blocks if too many KV caches are
+                                # already alive in the post-completion pipeline
+                                # (#1383). Falls back to a synchronous store only
+                                # when the gate is shut down (close). The async
+                                # store itself is the feature's two-phase
+                                # submit_store_cache_async (sync block register +
+                                # async SSD write) so the prefix-cache race fix
+                                # stays intact (bbba911).
+                                gate = self._store_cache_gate
+                                acquired = gate.acquire() if gate is not None else True
+                                if acquired:
+                                    store_future = None
+                                    try:
+                                        _bt, store_future = (
+                                            self.block_aware_cache.submit_store_cache_async(
+                                                request_id,
+                                                token_sequence_to_store,
+                                                cache_to_store,
+                                                self._store_cache_executor,
+                                                model_cache_config=model_cache_config,
+                                                boundary_snapshots=intermediate_snapshots,
+                                                extra_keys=request.vlm_extra_keys_for_cache,
+                                                extra_key_token_start=(
+                                                    request.vlm_extra_key_token_start_for_cache
+                                                ),
+                                                extra_key_ranges=(
+                                                    request.vlm_extra_key_ranges_for_cache
+                                                ),
                                             )
-                                    store_future.add_done_callback(_cleanup_after_phase2)
+                                        )
+                                    except Exception as e:
+                                        logger.warning(
+                                            "submit_store_cache_async failed for %s: %s",
+                                            request_id, e,
+                                        )
+                                    if store_future is not None:
+                                        self._inflight_store_futures[request_id] = store_future
+
+                                        def _cleanup_after_phase2(_fut, _rid=request_id, _g=gate):
+                                            try:
+                                                self.block_aware_cache.clear_request_entry(_rid)
+                                            except Exception as exc:
+                                                logger.warning(
+                                                    "clear_request_entry for %s raised: %s",
+                                                    _rid, exc,
+                                                )
+                                            finally:
+                                                if _g is not None:
+                                                    _g.release()
+                                        store_future.add_done_callback(_cleanup_after_phase2)
+                                    else:
+                                        # Phase 1 had nothing to write
+                                        # asynchronously (dedup hits / no SSD-
+                                        # eligible tensor data) — clean up now and
+                                        # release the gate slot we acquired.
+                                        self.block_aware_cache.clear_request_entry(request_id)
+                                        if gate is not None:
+                                            gate.release()
                                 else:
-                                    # Phase 1 had nothing to write
-                                    # asynchronously (dedup hits / no SSD-
-                                    # eligible tensor data) — clean up now.
-                                    self.block_aware_cache.clear_request_entry(request_id)
+                                    # Gate is shutting down — run synchronously
+                                    # so the cache write still lands on disk
+                                    # before the process exits.
+                                    self._async_store_cache_worker(
+                                        request_id,
+                                        token_sequence_to_store,
+                                        cache_to_store,
+                                        model_cache_config,
+                                        intermediate_snapshots,
+                                        request.vlm_extra_keys_for_cache,
+                                        request.vlm_extra_key_token_start_for_cache,
+                                        request.vlm_extra_key_ranges_for_cache,
+                                    )
                             else:
                                 # Executor unavailable — synchronous fallback.
                                 self._async_store_cache_worker(
@@ -5920,6 +6290,10 @@ class Scheduler:
         paged SSD cache files are NOT cleared to allow reuse on reload.
         """
         logger.info("Scheduler shutdown initiated...")
+        # Wake any step-thread caller currently blocked on the gate so the
+        # shutdown path can drain in-flight futures without deadlocking.
+        if self._store_cache_gate is not None:
+            self._store_cache_gate.shutdown()
         # Wait for any inflight async store_cache futures + drain pending
         # batch_generator removes so the writer thread / underlying paged SSD
         # cache see all blocks before close().
@@ -5937,10 +6311,37 @@ class Scheduler:
             except Exception as e:
                 logger.warning(f"Async store_cache shutdown error: {e}")
             self._store_cache_executor = None
+            self._store_cache_gate = None
         if self.paged_ssd_cache_manager is not None:
             self.paged_ssd_cache_manager.close()
             self.paged_ssd_cache_manager = None
         logger.info("Scheduler shutdown completed")
+
+    def adjust_store_cache_cap(self, pressure_level: str) -> None:
+        """Resize the store-cache gate based on memory pressure (#1383).
+
+        Called from ProcessMemoryEnforcer on every poll. The cap walks one
+        step per poll toward its target so transient spikes don't oscillate
+        the cap. Bounded by [1, max_num_seqs]:
+        - ok pressure: grow cap back toward max_num_seqs.
+        - soft/hard pressure: shrink cap so KV cache backlog fits the system.
+        """
+        gate = self._store_cache_gate
+        if gate is None:
+            return
+        current = gate.cap
+        if pressure_level == "ok":
+            new = min(self.config.max_num_seqs, current + 1)
+        else:
+            new = max(1, current - 1)
+        if new != current:
+            gate.set_cap(new)
+            logger.debug(
+                "store-cache queue cap: %d -> %d (pressure=%s)",
+                current,
+                new,
+                pressure_level,
+            )
 
     # =========================================================================
     # SSD Cache Methods

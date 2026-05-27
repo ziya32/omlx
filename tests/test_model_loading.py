@@ -155,7 +155,11 @@ class TestVlmMtpPreLoadDispatch:
     it relies on apply_mlx_vlm_mtp_patch having installed the mtp.*
     preservation first. If only the runtime patch runs, stock mlx-vlm
     sanitize strips every mtp.* key and the MTP head loads at random
-    init (PR #1320)."""
+    init (PR #1320).
+
+    MoE VLMs without declared MTP heads still need the sanitize replacement
+    so pre-converted switch_mlp weights load (issue #1261); runtime patch
+    must not run on that path."""
 
     def _stub_patches(self, monkeypatch):
         """Replace the patch modules with mocks that record call order.
@@ -196,7 +200,7 @@ class TestVlmMtpPreLoadDispatch:
         )
         settings = types.SimpleNamespace(mtp_enabled=True)
 
-        maybe_apply_pre_load_patches(path, model_settings=settings)
+        maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
 
         sanitize_mock.assert_called_once()
         runtime_mock.assert_called_once()
@@ -204,12 +208,71 @@ class TestVlmMtpPreLoadDispatch:
         # already installed by apply_mlx_vlm_mtp_patch.
         assert calls == ["sanitize", "runtime"]
 
-    def test_sanitize_patch_skipped_when_mtp_disabled(self, tmp_path, monkeypatch):
+    def test_vlm_patches_applied_when_mtp_disabled_for_vlm(self, tmp_path, monkeypatch):
+        # Issue #1404: persisted ``mtp.*`` weights must still get a binding
+        # site on the LanguageModel tree when entering through VLMBatchedEngine
+        # even with mtp_enabled=False. Otherwise mlx-vlm's strict load_weights
+        # fails with "parameters not in model" and the engine falls back to
+        # LLM, silently dropping vision.
         calls, sanitize_mock, runtime_mock = self._stub_patches(monkeypatch)
         path = _write_config(
             tmp_path,
             '{"model_type": "qwen3_5", "vision_config": {}, '
             '"text_config": {"mtp_num_hidden_layers": 1}}',
+        )
+        settings = types.SimpleNamespace(mtp_enabled=False)
+
+        maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
+
+        sanitize_mock.assert_called_once()
+        runtime_mock.assert_called_once()
+        assert calls == ["sanitize", "runtime"]
+
+    def test_vlm_patches_skipped_when_not_for_vlm(self, tmp_path, monkeypatch):
+        # BatchedEngine / DFlashEngine / LLM loader paths must NOT touch
+        # mlx-vlm classes even when the model declares MTP heads. for_vlm
+        # defaults to False so they pass through without invoking mlx-vlm
+        # patches.
+        calls, sanitize_mock, runtime_mock = self._stub_patches(monkeypatch)
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "qwen3_5", "vision_config": {}, '
+            '"text_config": {"mtp_num_hidden_layers": 1}}',
+        )
+        settings = types.SimpleNamespace(mtp_enabled=True)
+
+        maybe_apply_pre_load_patches(path, model_settings=settings)
+
+        sanitize_mock.assert_not_called()
+        runtime_mock.assert_not_called()
+        assert calls == []
+
+    def test_qwen36_moe_vlm_sanitize_when_no_mtp_heads(self, tmp_path, monkeypatch):
+        # mlx-lm Qwen3.6 MoE VLMs without MTP heads still need the mlx-vlm
+        # sanitize replacement so pre-converted switch_mlp weights load.
+        # Runtime MTP patch must NOT run — there is no mtp.* tree to bind.
+        calls, sanitize_mock, runtime_mock = self._stub_patches(monkeypatch)
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "qwen3_5_moe", "vision_config": {}, '
+            '"text_config": {"mtp_num_hidden_layers": 0}}',
+        )
+        settings = types.SimpleNamespace(mtp_enabled=False)
+
+        maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
+
+        sanitize_mock.assert_called_once()
+        runtime_mock.assert_not_called()
+        assert calls == ["sanitize"]
+
+    def test_qwen36_moe_vlm_sanitize_skipped_without_for_vlm(
+        self, tmp_path, monkeypatch
+    ):
+        calls, sanitize_mock, runtime_mock = self._stub_patches(monkeypatch)
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "qwen3_5_moe", "vision_config": {}, '
+            '"text_config": {"mtp_num_hidden_layers": 0}}',
         )
         settings = types.SimpleNamespace(mtp_enabled=False)
 

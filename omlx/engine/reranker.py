@@ -170,12 +170,7 @@ class RerankerEngine(BaseNonStreamingEngine):
 
             return output
         finally:
-            if self._end_activity(activity_id):
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(
-                    get_mlx_executor(),
-                    locked_sync_and_clear_cache,
-                )
+            await self._finish_activity(activity_id)
 
     def get_stats(self) -> Dict[str, Any]:
         """Get engine statistics."""
