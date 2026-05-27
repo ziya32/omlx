@@ -31,6 +31,22 @@ from omlx.exceptions import (
 # MockEngine
 # ---------------------------------------------------------------------------
 
+def _make_pool(ceiling: int | None = None, **kwargs):
+    """Create an EnginePool with a stubbed final-ceiling callback.
+
+    The pre-load admission ceiling now comes from the ProcessMemoryEnforcer
+    via the ``_get_final_ceiling`` callback (the static ``max_model_memory``
+    setting was dropped), so tests inject a fake callback returning ``ceiling``.
+    """
+    pool = EnginePool(**kwargs)
+    if ceiling is None or ceiling <= 0:
+        pool._get_final_ceiling = lambda: 0
+    else:
+        pool._get_final_ceiling = lambda c=int(ceiling): c
+    return pool
+
+
+
 class MockEngine:
     """Lightweight engine mock with controllable active-work simulation.
 
@@ -125,8 +141,8 @@ async def switching_pool(tmp_path):
     * drain_timeout=5 s, max_wait_timeout=10 s — short for fast tests.
     * Teardown asserts _timeout_counter == 0 (catches masked livelocks).
     """
-    pool = EnginePool(
-        max_model_memory=10_000,
+    pool = _make_pool(
+        ceiling=10_000,
         drain_timeout=5,
         max_wait_timeout=10,
     )
@@ -150,8 +166,8 @@ async def pool_expecting_timeouts(tmp_path):
     Uses very short timeouts so tests complete quickly.
     Does NOT assert ``_timeout_counter == 0`` on teardown.
     """
-    pool = EnginePool(
-        max_model_memory=10_000,
+    pool = _make_pool(
+        ceiling=10_000,
         drain_timeout=2,
         max_wait_timeout=3,
     )
@@ -729,8 +745,8 @@ class TestImplicitQueue:
 
     async def test_wait_timeout_returns_error(self, tmp_path):
         """ModelLoadingError after max_wait_timeout if model never available."""
-        pool = EnginePool(
-            max_model_memory=10_000,
+        pool = _make_pool(
+            ceiling=10_000,
             drain_timeout=5,
             max_wait_timeout=2,  # Short wait timeout
         )
@@ -1052,8 +1068,8 @@ class TestMemoryAccounting:
 
     async def test_prepare_memory_raises_when_all_pinned(self, tmp_path):
         """_prepare_memory_for raises ModelTooLargeError when all memory is pinned."""
-        pool = EnginePool(
-            max_model_memory=8000,
+        pool = _make_pool(
+            ceiling=8000,
             drain_timeout=5,
             max_wait_timeout=5,
         )
@@ -1069,8 +1085,8 @@ class TestMemoryAccounting:
         # Let's create a tighter scenario:
         await pool.shutdown()
 
-        pool2 = EnginePool(
-            max_model_memory=5000,
+        pool2 = _make_pool(
+            ceiling=5000,
             drain_timeout=5,
             max_wait_timeout=3,
         )
@@ -1205,8 +1221,8 @@ class TestInvariants:
 
     async def test_inv4_get_engine_bounded(self, tmp_path):
         """INV-4: get_engine has bounded wait time (max_wait_timeout)."""
-        pool = EnginePool(
-            max_model_memory=10_000,
+        pool = _make_pool(
+            ceiling=10_000,
             drain_timeout=2,
             max_wait_timeout=2,  # Very short timeout
         )
@@ -1257,8 +1273,8 @@ class TestInvariants:
         ``wait_for(engine.stop(), timeout=30)`` and force-cleans on
         timeout — and is observable via ``entry.unload_complete``.
         """
-        pool = EnginePool(
-            max_model_memory=10_000,
+        pool = _make_pool(
+            ceiling=10_000,
             drain_timeout=5,
             max_wait_timeout=10,
         )
@@ -1325,8 +1341,8 @@ class TestInvariants:
 
         When all memory is pinned and nothing can drain, it raises.
         """
-        pool = EnginePool(
-            max_model_memory=5000,
+        pool = _make_pool(
+            ceiling=5000,
             drain_timeout=5,
             max_wait_timeout=5,
         )
@@ -1377,8 +1393,8 @@ class TestLivelockDetection:
     ):
         """get_engine wait timeout is detected and logged."""
         # max_wait_timeout < drain_timeout so the wait times out first
-        pool = EnginePool(
-            max_model_memory=10_000,
+        pool = _make_pool(
+            ceiling=10_000,
             drain_timeout=5,
             max_wait_timeout=2,
         )
@@ -1441,8 +1457,8 @@ class TestRegression:
 
     async def test_existing_pinned_models_never_evicted(self, tmp_path):
         """Pinned models are never selected as eviction victims."""
-        pool = EnginePool(
-            max_model_memory=10_000,
+        pool = _make_pool(
+            ceiling=10_000,
             drain_timeout=5,
             max_wait_timeout=10,
         )
@@ -1464,8 +1480,8 @@ class TestRegression:
 
     async def test_existing_model_discovery_preserves_loaded(self, tmp_path):
         """Re-discovery preserves engines that are already loaded."""
-        pool = EnginePool(
-            max_model_memory=10_000,
+        pool = _make_pool(
+            ceiling=10_000,
             drain_timeout=5,
             max_wait_timeout=10,
         )
@@ -1693,8 +1709,8 @@ class TestTTLDrainInteraction:
 
         Verifies that check_ttl_expirations respects in-flight work.
         """
-        pool = EnginePool(
-            max_model_memory=10_000,
+        pool = _make_pool(
+            ceiling=10_000,
             drain_timeout=5,
             max_wait_timeout=10,
         )

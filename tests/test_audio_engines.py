@@ -161,9 +161,8 @@ class TestSTTEngineLifecycle:
 
         mock_stt.load.assert_called_once()
 
-    @patch("omlx.engine.stt.locked_sync_and_clear_cache")
-    @patch("omlx.engine.stt.gc")
-    async def test_stop_clears_model(self, mock_gc, mock_clear):
+    @patch("omlx.engine.stt.locked_free_and_clear")
+    async def test_stop_clears_model(self, mock_free):
         from omlx.engine.stt import STTEngine
         engine = STTEngine(model_name="whisper-tiny")
         engine._model = MagicMock()
@@ -171,9 +170,9 @@ class TestSTTEngineLifecycle:
         await engine.stop()
 
         assert engine._model is None
-        mock_gc.collect.assert_called_once()
-        # The Metal cache clear is dispatched through the locked helper on the executor.
-        mock_clear.assert_called_once()
+        # stop() drops the model ref + gc + synchronize + clear_cache via the
+        # locked free helper, dispatched on the MLX executor (#85).
+        mock_free.assert_called_once()
 
     async def test_stop_when_not_started_is_noop(self):
         from omlx.engine.stt import STTEngine
@@ -517,9 +516,8 @@ class TestTTSEngineLifecycle:
 
         mock_load_model.assert_called_once()
 
-    @patch("omlx.engine.tts.locked_sync_and_clear_cache")
-    @patch("omlx.engine.tts.gc")
-    async def test_stop_clears_model(self, mock_gc, mock_clear):
+    @patch("omlx.engine.tts.locked_free_and_clear")
+    async def test_stop_clears_model(self, mock_free):
         from omlx.engine.tts import TTSEngine
         engine = TTSEngine(model_name="qwen3-tts")
         engine._model = MagicMock()
@@ -527,9 +525,9 @@ class TestTTSEngineLifecycle:
         await engine.stop()
 
         assert engine._model is None
-        mock_gc.collect.assert_called_once()
-        # The Metal cache clear is dispatched through the locked helper on the executor.
-        mock_clear.assert_called_once()
+        # stop() drops the model ref + gc + synchronize + clear_cache via the
+        # locked free helper, dispatched on the MLX executor (#85).
+        mock_free.assert_called_once()
 
     async def test_stop_when_not_started_is_noop(self):
         from omlx.engine.tts import TTSEngine

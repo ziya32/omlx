@@ -248,7 +248,7 @@ class TestEnginePoolErrors:
             asyncio.run(pool.get_engine("model-a"))
 
         assert exc_info.value.model_id == "model-a"
-        assert exc_info.value.max_memory == 100
+        assert exc_info.value.ceiling == 100
 
 
 class TestEnginePoolStatus:

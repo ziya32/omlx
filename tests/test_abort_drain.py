@@ -22,6 +22,22 @@ from omlx.engine_pool import EngineEntry, EnginePool, EngineState
 # Fix 1: Post-decode abort discards output
 # ---------------------------------------------------------------------------
 
+def _make_pool(ceiling: int | None = None, **kwargs):
+    """Create an EnginePool with a stubbed final-ceiling callback.
+
+    The admission ceiling now comes from the ProcessMemoryEnforcer via the
+    ``_get_final_ceiling`` callback (the static ``max_model_memory`` setting
+    was dropped), so tests inject a fake callback returning ``ceiling``.
+    """
+    pool = EnginePool(**kwargs)
+    if ceiling is None or ceiling <= 0:
+        pool._get_final_ceiling = lambda: 0
+    else:
+        pool._get_final_ceiling = lambda c=int(ceiling): c
+    return pool
+
+
+
 class TestPostDecodeAbort:
     """Fix 1: abort check after batch_generator.next() discards output."""
 
@@ -117,7 +133,7 @@ class TestStepInFlightBlocksDrain:
         """Mock engine with _step_in_flight = True. Run _drain_monitor for 2
         iterations. Verify model is NOT unloaded. Set flag to False. Verify
         model IS unloaded on next iteration."""
-        pool = EnginePool(max_model_memory=10_000_000_000)
+        pool = _make_pool(ceiling=10_000_000_000)
 
         # Create a mock engine entry
         inner_core = MagicMock()
@@ -296,7 +312,7 @@ class TestTwoPhaseUnload:
         """Set a model to UNLOADING state. Call _prepare_memory_for() for a
         different model. Assert it returns an event to wait on. Complete
         cleanup, set UNLOADED. Assert memory check passes."""
-        pool = EnginePool(max_model_memory=4_000_000_000)
+        pool = _make_pool(ceiling=4_000_000_000)
 
         unload_event = asyncio.Event()
 
@@ -340,7 +356,7 @@ class TestTwoPhaseUnload:
     async def test_mx_synchronize_before_unloaded(self):
         """Verify state is UNLOADING during cleanup and UNLOADED only after
         synchronize returns."""
-        pool = EnginePool(max_model_memory=10_000_000_000)
+        pool = _make_pool(ceiling=10_000_000_000)
 
         mock_engine = MagicMock()
         mock_engine.stop = AsyncMock()
@@ -394,7 +410,7 @@ class TestTwoPhaseUnload:
     @pytest.mark.asyncio
     async def test_committed_memory_includes_unloading(self):
         """Verify _committed_memory counts UNLOADING models."""
-        pool = EnginePool(max_model_memory=10_000_000_000)
+        pool = _make_pool(ceiling=10_000_000_000)
 
         entry = EngineEntry(
             model_id="test-model",

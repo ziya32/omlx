@@ -120,15 +120,14 @@ class TestTTSThreadSafety:
 
         clear_cache_thread = None
 
-        def _track_clear_cache():
+        def _track_clear_cache(*args, **kwargs):
             nonlocal clear_cache_thread
             clear_cache_thread = threading.current_thread().name
 
         engine = TTSEngine(model_name="test-tts")
         engine._model = MagicMock()
 
-        with patch("omlx.engine.tts.locked_sync_and_clear_cache", side_effect=_track_clear_cache), \
-             patch("omlx.engine.tts.gc"):
+        with patch("omlx.engine.tts.locked_free_and_clear", side_effect=_track_clear_cache):
             await engine.stop()
 
         executor_thread = _get_executor_thread_name()
@@ -209,15 +208,14 @@ class TestSTTThreadSafety:
 
         clear_cache_thread = None
 
-        def _track_clear_cache():
+        def _track_clear_cache(*args, **kwargs):
             nonlocal clear_cache_thread
             clear_cache_thread = threading.current_thread().name
 
         engine = STTEngine(model_name="whisper-tiny")
         engine._model = MagicMock()
 
-        with patch("omlx.engine.stt.locked_sync_and_clear_cache", side_effect=_track_clear_cache), \
-             patch("omlx.engine.stt.gc"):
+        with patch("omlx.engine.stt.locked_free_and_clear", side_effect=_track_clear_cache):
             await engine.stop()
 
         executor_thread = _get_executor_thread_name()
@@ -264,15 +262,14 @@ class TestEmbeddingThreadSafety:
 
         clear_cache_thread = None
 
-        def _track_clear_cache():
+        def _track_clear_cache(*args, **kwargs):
             nonlocal clear_cache_thread
             clear_cache_thread = threading.current_thread().name
 
         engine = EmbeddingEngine(model_name="test-embed")
         engine._model = MagicMock()
 
-        with patch("omlx.engine.embedding.locked_sync_and_clear_cache", side_effect=_track_clear_cache), \
-             patch("omlx.engine.embedding.gc"):
+        with patch("omlx.engine.embedding.locked_free_and_clear", side_effect=_track_clear_cache):
             await engine.stop()
 
         executor_thread = _get_executor_thread_name()

@@ -9,6 +9,22 @@ from unittest.mock import MagicMock
 from omlx.engine_pool import EngineEntry, EnginePool, EngineState
 
 
+def _make_pool(ceiling: int | None = None, **kwargs):
+    """Create an EnginePool with a stubbed final-ceiling callback.
+
+    The admission ceiling now comes from the ProcessMemoryEnforcer via the
+    ``_get_final_ceiling`` callback (the static ``max_model_memory`` setting
+    was dropped), so tests inject a fake callback returning ``ceiling``.
+    """
+    pool = EnginePool(**kwargs)
+    if ceiling is None or ceiling <= 0:
+        pool._get_final_ceiling = lambda: 0
+    else:
+        pool._get_final_ceiling = lambda c=int(ceiling): c
+    return pool
+
+
+
 def _make_entry(
     model_id: str = "test-vlm",
     model_path: str = "/tmp/test-vlm",
@@ -34,9 +50,9 @@ def _make_pool_with_enforcer(
     max_bytes: int,
     entries: dict[str, EngineEntry] | None = None,
 ) -> EnginePool:
-    pool = EnginePool(max_model_memory=max_bytes)
+    pool = _make_pool(ceiling=max_bytes)
     enforcer = MagicMock()
-    enforcer.max_bytes = max_bytes
+    enforcer.get_final_ceiling.return_value = max_bytes
     pool._process_memory_enforcer = enforcer
     if entries:
         pool._entries = entries
@@ -142,7 +158,7 @@ class TestComputeVisionLimits:
         assert limits["memory_headroom_bytes"] == expected_headroom
 
     def test_no_enforcer_returns_empty(self):
-        pool = EnginePool(max_model_memory=None)
+        pool = _make_pool(ceiling=None)
         pool._process_memory_enforcer = None
         entry = _make_entry()
         assert pool.compute_vision_limits(entry) == {}

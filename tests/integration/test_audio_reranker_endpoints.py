@@ -30,6 +30,24 @@ from omlx.models.reranker import RerankOutput
 # ──────────────────────────────────────────────────────────────────────
 
 
+def _make_pool(ceiling: int | None = None, **kwargs):
+    """Create an EnginePool with a stubbed final-ceiling callback.
+
+    The admission ceiling now comes from the ProcessMemoryEnforcer via the
+    ``_get_final_ceiling`` callback (the static ``max_model_memory`` setting
+    was dropped), so tests inject a fake callback returning ``ceiling``.
+    """
+    from omlx.engine_pool import EnginePool
+
+    pool = EnginePool(**kwargs)
+    if ceiling is None or ceiling <= 0:
+        pool._get_final_ceiling = lambda: 0
+    else:
+        pool._get_final_ceiling = lambda c=int(ceiling): c
+    return pool
+
+
+
 class MockSTTEngine(STTEngine):
     """Mock STT engine that returns canned transcription."""
 
@@ -964,7 +982,7 @@ class TestModelDiscoveryIntegration:
 
         assert detect_model_type(model_dir) == "audio_stt"
 
-        pool = EnginePool(max_model_memory=None)
+        pool = _make_pool(ceiling=None)
         pool.discover_models(str(tmp_path))
         entry = pool.get_entry("whisper-base")
         assert entry is not None
@@ -986,7 +1004,7 @@ class TestModelDiscoveryIntegration:
 
         assert detect_model_type(model_dir) == "audio_tts"
 
-        pool = EnginePool(max_model_memory=None)
+        pool = _make_pool(ceiling=None)
         pool.discover_models(str(tmp_path))
         entry = pool.get_entry("qwen3-tts")
         assert entry is not None
@@ -1008,7 +1026,7 @@ class TestModelDiscoveryIntegration:
 
         assert detect_model_type(model_dir) == "reranker"
 
-        pool = EnginePool(max_model_memory=None)
+        pool = _make_pool(ceiling=None)
         pool.discover_models(str(tmp_path))
         entry = pool.get_entry("Qwen3-Reranker-0.6B")
         assert entry.model_type == "reranker"
@@ -1032,7 +1050,7 @@ class TestModelDiscoveryIntegration:
         # Without override, it's detected as LLM (no "reranker" in name)
         assert detect_model_type(model_dir) == "llm"
 
-        pool = EnginePool(max_model_memory=None)
+        pool = _make_pool(ceiling=None)
         pool.discover_models(str(tmp_path))
         entry = pool.get_entry("Qwen3-Custom-0.6B")
         assert entry.model_type == "llm"
@@ -1055,7 +1073,7 @@ class TestModelDiscoveryIntegration:
         """Verify all model type -> engine type mappings exist."""
         from omlx.engine_pool import EnginePool
 
-        pool = EnginePool(max_model_memory=None)
+        pool = _make_pool(ceiling=None)
         expected = {
             "llm": "batched",
             "vlm": "vlm",

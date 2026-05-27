@@ -21,6 +21,22 @@ from omlx.engine_pool import EngineEntry, EnginePool, EngineState
 # ---------------------------------------------------------------------------
 
 
+def _make_pool(ceiling: int | None = None, **kwargs):
+    """Create an EnginePool with a stubbed final-ceiling callback.
+
+    The admission ceiling now comes from the ProcessMemoryEnforcer via the
+    ``_get_final_ceiling`` callback (the static ``max_model_memory`` setting
+    was dropped), so tests inject a fake callback returning ``ceiling``.
+    """
+    pool = EnginePool(**kwargs)
+    if ceiling is None or ceiling <= 0:
+        pool._get_final_ceiling = lambda: 0
+    else:
+        pool._get_final_ceiling = lambda c=int(ceiling): c
+    return pool
+
+
+
 @pytest.fixture
 def small_mock_model_dir(tmp_path):
     """Create a mock model directory with two small models."""
@@ -40,7 +56,7 @@ def small_mock_model_dir(tmp_path):
 @pytest.fixture
 def pool_ab(small_mock_model_dir):
     """EnginePool with model-a and model-b discovered (nothing loaded)."""
-    pool = EnginePool(max_model_memory=10 * 1024**3)
+    pool = _make_pool(ceiling=10 * 1024**3)
     pool.discover_models(str(small_mock_model_dir))
     return pool
 
@@ -200,7 +216,7 @@ class TestExclusiveIdleWait:
         # entry_b is UNLOADED but we want to "load" it — need a process
         # memory enforcer that says memory is too tight.
         enforcer = MagicMock()
-        enforcer.max_bytes = 500  # artificially small
+        enforcer.get_final_ceiling.return_value = 500  # artificially small
         pool._process_memory_enforcer = enforcer
 
         # Mock mx.get_active_memory to report memory that exceeds the limit
@@ -239,7 +255,7 @@ class TestExclusiveIdleWait:
         # NOT fire — if the early gate returned entry_a.exclusive_idle, that
         # is proof the executor-contention hook (Step 9b) ran, not Step 9.
         enforcer = MagicMock()
-        enforcer.max_bytes = 10 * 1024**4  # 10 TiB — effectively unlimited
+        enforcer.get_final_ceiling.return_value = 10 * 1024**4  # 10 TiB — effectively unlimited
         pool._process_memory_enforcer = enforcer
 
         with patch("omlx.engine_pool.mx") as mock_mx:
@@ -272,7 +288,7 @@ class TestExclusiveIdleWait:
         entry_a.exclusive_idle = None  # idle → no event
 
         enforcer = MagicMock()
-        enforcer.max_bytes = 10 * 1024**4
+        enforcer.get_final_ceiling.return_value = 10 * 1024**4
         pool._process_memory_enforcer = enforcer
 
         with patch("omlx.engine_pool.mx") as mock_mx:
@@ -412,7 +428,7 @@ class TestRefreshVisionLimits:
 
         # Set up process memory enforcer
         enforcer = MagicMock()
-        enforcer.max_bytes = 10 * 1024**3  # 10GB
+        enforcer.get_final_ceiling.return_value = 10 * 1024**3  # 10GB
         pool._process_memory_enforcer = enforcer
 
         # committed_memory = entry_a.estimated_size (1024 bytes — tiny)
@@ -422,7 +438,7 @@ class TestRefreshVisionLimits:
             pool._refresh_vision_limits(entry_a)
 
         committed = pool._committed_memory()
-        expected_headroom = enforcer.max_bytes - committed
+        expected_headroom = enforcer.get_final_ceiling.return_value - committed
         expected_pixels = int(
             expected_headroom * pool._VISION_SAFETY_FACTOR
             / pool._VISION_BYTES_PER_PIXEL
@@ -444,7 +460,7 @@ class TestRefreshVisionLimits:
         _activate_entry(entry_a, pinned=True, exclusive=True, engine=mock_engine)
 
         enforcer = MagicMock()
-        enforcer.max_bytes = 10 * 1024**3
+        enforcer.get_final_ceiling.return_value = 10 * 1024**3
         pool._process_memory_enforcer = enforcer
 
         async with pool._tracked_lock("test"):
@@ -690,7 +706,7 @@ class TestClearForExclusiveMixedIdleBusy:
         (model_c / "config.json").write_text(json.dumps({"model_type": "llama"}))
         (model_c / "model.safetensors").write_bytes(b"0" * 512)
 
-        pool = EnginePool(max_model_memory=10 * 1024**3)
+        pool = _make_pool(ceiling=10 * 1024**3)
         pool.discover_models(str(small_mock_model_dir))
 
         entry_a = pool.get_entry("model-a")
@@ -737,7 +753,7 @@ class TestWakeAndLoad:
 
         # Set up process memory enforcer with tight limits
         enforcer = MagicMock()
-        enforcer.max_bytes = 500  # artificially small
+        enforcer.get_final_ceiling.return_value = 500  # artificially small
         pool._process_memory_enforcer = enforcer
 
         with patch("omlx.engine_pool.mx") as mock_mx:
@@ -785,7 +801,7 @@ class TestTimeoutErrorType:
         # Set up process memory enforcer with tight limits so
         # _check_process_memory returns the exclusive_idle event
         enforcer = MagicMock()
-        enforcer.max_bytes = 500
+        enforcer.get_final_ceiling.return_value = 500
         pool._process_memory_enforcer = enforcer
 
         with patch("omlx.engine_pool.mx") as mock_mx:

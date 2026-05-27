@@ -313,7 +313,7 @@ class TestAudioPreLoadEviction:
         # (real phys_footprint is ~100 MB and would dominate).
         monkeypatch.setattr(
             "omlx.engine_pool.get_phys_footprint",
-            lambda: pool._current_model_memory,
+            lambda: pool.current_model_memory,
         )
         monkeypatch.setattr(
             "omlx.engine_pool.mx.get_active_memory", lambda: 0
