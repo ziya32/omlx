@@ -247,9 +247,13 @@ async def server_app(model_dir, check_models):
         original_api_key = _server_state.api_key
         init_server(
             model_dirs=str(model_dir),
-            max_model_memory=max_mem,
             api_key=TEST_API_KEY,
         )
+        # v0.3.12 dropped the max_model_memory setting; the pool now reads its
+        # pre-load admission ceiling from the _get_final_ceiling callback. Stub
+        # it to the test's fixed ceiling (this fixture starts no enforcer, same
+        # as the pre-v0.3.12 max_model_memory= path).
+        _server_state.engine_pool._get_final_ceiling = lambda mm=max_mem: mm
 
         _server_state.engine_pool.apply_settings_overrides(settings_mgr)
 

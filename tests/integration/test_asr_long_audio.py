@@ -141,7 +141,10 @@ async def server_app(model_ids):
         )
 
         original_api_key = _server_state.api_key
-        init_server(model_dirs=str(MODEL_DIR), max_model_memory=max_mem)
+        init_server(model_dirs=str(MODEL_DIR))
+        # v0.3.12 dropped max_model_memory; the pool reads its pre-load
+        # admission ceiling from the _get_final_ceiling callback now.
+        _server_state.engine_pool._get_final_ceiling = lambda mm=max_mem: mm
         _server_state.api_key = TEST_API_KEY
         _server_state.engine_pool.apply_settings_overrides(settings_mgr)
 

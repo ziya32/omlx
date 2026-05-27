@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import os
+import json
 import signal
 import socket
 import string
@@ -142,10 +143,22 @@ async def test_tts_audio_not_garbled_under_model_eviction():
     wavs: list[bytes] = []
 
     with tempfile.TemporaryDirectory() as base_path:
+        # v0.3.12 dropped the --max-model-memory serve flag (the static
+        # max_*_memory settings were replaced by memory_guard_tier). Force a
+        # low admission ceiling — so the idle embedding model is evicted when
+        # the TTS model loads — via the tier model's "custom" ceiling, written
+        # into the server's settings.json (loaded from --base-path).
+        from omlx.config import parse_size
+        _ceiling_gb = parse_size(MAX_MODEL_MEMORY) / (1024 ** 3)
+        Path(base_path, "settings.json").write_text(json.dumps({
+            "memory": {
+                "memory_guard_tier": "custom",
+                "memory_guard_custom_ceiling_gb": _ceiling_gb,
+            }
+        }))
         proc = subprocess.Popen(
             [sys.executable, "-m", "omlx", "serve",
              "--model-dir", str(MODEL_DIR),
-             "--max-model-memory", MAX_MODEL_MEMORY,
              "--port", str(port), "--base-path", base_path],
             stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT,
         )
