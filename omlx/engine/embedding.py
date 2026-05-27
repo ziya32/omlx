@@ -12,7 +12,7 @@ import logging
 from typing import Any, Dict, List, Optional, Union
 
 from ..engine_core import get_mlx_executor
-from ..mx_buffer_lock import locked_free_and_clear, locked_sync_and_clear_cache, run_locked
+from ..mx_buffer_lock import locked_free_and_clear, run_locked
 from ..models.embedding import EmbeddingOutput, MLXEmbeddingModel
 from .base import BaseNonStreamingEngine
 

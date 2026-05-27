@@ -17,7 +17,7 @@ from typing import Any, Dict, List
 import mlx.core as mx
 
 from ..engine_core import get_mlx_executor
-from ..mx_buffer_lock import locked_free_and_clear, locked_sync_and_clear_cache, run_locked
+from ..mx_buffer_lock import locked_free_and_clear, run_locked
 from ..exceptions import AudioError, InvalidAudioFormatError
 from .base import BaseNonStreamingEngine
 

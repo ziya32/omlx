@@ -26,8 +26,13 @@ _THINKING_PATTERN = re.compile(r'<think>(.*?)</think>', re.DOTALL)
 _THINKING_TAIL_PATTERN = re.compile(r'^(.*?)</think>', re.DOTALL)
 
 
-def extract_thinking(text: str) -> Tuple[str, str]:
+def extract_thinking(text: str, start_in_thinking: bool = False) -> Tuple[str, str]:
     """Extract thinking and content from complete text.
+
+    Native reasoning (``start_in_thinking=True``): when the prompt pre-opens
+    a ``<think>`` block (Qwen 3.6+ templates), tag-free generation is
+    reasoning, not content. With the default ``start_in_thinking=False``,
+    tag-free text is always classified as content (#1348).
 
     Handles:
     - Normal: ``<think>reasoning</think>answer`` → ``("reasoning", "answer")``
@@ -85,6 +90,13 @@ def extract_thinking(text: str) -> Tuple[str, str]:
         before = text[:idx]
         after = text[idx + _OPEN_LEN:]
         return ("", (before + after).strip())
+
+    # Native-reasoning fallback: the prompt pre-opened <think> and the
+    # generation contains no tags at all — treat the whole output as
+    # thinking. Only fires when start_in_thinking=True; otherwise tag-free
+    # text falls through to content (#1348).
+    if start_in_thinking and '<think>' not in text and '</think>' not in text:
+        return (text.strip(), "")
 
     return ("", text)
 

@@ -164,7 +164,6 @@ from .exceptions import (
     RequestAbortedError,
     SchedulerQueueFullError,
 )
-from .model_discovery import format_size
 from .server_metrics import get_server_metrics, reset_server_metrics
 
 logging.basicConfig(level=logging.INFO)

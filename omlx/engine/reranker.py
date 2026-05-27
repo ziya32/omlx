@@ -13,7 +13,7 @@ import logging
 from typing import Any, Dict
 
 from ..engine_core import get_mlx_executor
-from ..mx_buffer_lock import locked_free_and_clear, locked_sync_and_clear_cache, run_locked
+from ..mx_buffer_lock import locked_free_and_clear, run_locked
 from ..models.reranker import MLXRerankerModel, RerankOutput
 from .base import BaseNonStreamingEngine
 

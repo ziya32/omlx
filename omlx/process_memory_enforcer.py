@@ -730,10 +730,13 @@ class ProcessMemoryEnforcer:
                 f"ceiling={_format_gb(ceiling)})"
             )
 
+        # Walk each scheduler's store-cache cap one step toward its
+        # pressure-driven target every tick (#1383) — it converges ±1 per
+        # poll regardless of level (recover toward max_num_seqs on ok,
+        # shrink toward 1 on soft/hard).
+        self._walk_store_cache_caps()
+
         if new_level == "ok":
-            # Still walk the store-cache cap so it can recover toward
-            # max_num_seqs while pressure stays low (#1383).
-            self._walk_store_cache_caps()
             return
 
         # Eviction is gated on the absolute ceiling (``get_final_ceiling()``

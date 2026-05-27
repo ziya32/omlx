@@ -338,7 +338,7 @@ class EnginePool:
         memory because unpinned models are evicted when the VLM loads.
         """
         enforcer = self._process_memory_enforcer
-        max_bytes = getattr(enforcer, "max_bytes", 0) if enforcer else 0
+        max_bytes = enforcer.get_final_ceiling() if enforcer else 0
         if not max_bytes:
             return {}
 
@@ -1197,7 +1197,7 @@ class EnginePool:
             return
 
         enforcer = self._process_memory_enforcer
-        max_bytes = getattr(enforcer, 'max_bytes', 0) if enforcer else 0
+        max_bytes = enforcer.get_final_ceiling() if enforcer else 0
         if not max_bytes:
             return
 
@@ -1914,7 +1914,7 @@ class EnginePool:
                         ),
                         scheduler_config=self._scheduler_config,
                         process_memory_max_bytes=(
-                            getattr(enforcer, "max_bytes", 0) if enforcer else 0
+                            enforcer.get_final_ceiling() if enforcer else 0
                         ),
                     )
                     logger.info(
@@ -1957,7 +1957,7 @@ class EnginePool:
                     scheduler_config=self._scheduler_config,
                     model_settings=model_settings,
                     process_memory_max_bytes=(
-                        getattr(enforcer, "max_bytes", 0) if enforcer else 0
+                        enforcer.get_final_ceiling() if enforcer else 0
                     ),
                 )
             elif entry.engine_type == "audio_stt":
@@ -2009,7 +2009,7 @@ class EnginePool:
                         scheduler_config=self._scheduler_config,
                         model_settings=model_settings,
                         process_memory_max_bytes=(
-                            getattr(enforcer, "max_bytes", 0) if enforcer else 0
+                            enforcer.get_final_ceiling() if enforcer else 0
                         ),
                     )
                 else:
@@ -2058,7 +2058,7 @@ class EnginePool:
                     scheduler_config=self._scheduler_config,
                     model_settings=model_settings,
                     process_memory_max_bytes=(
-                        getattr(enforcer, "max_bytes", 0) if enforcer else 0
+                        enforcer.get_final_ceiling() if enforcer else 0
                     ),
                 )
                 try:

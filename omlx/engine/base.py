@@ -11,7 +11,6 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Dict, List, Optional
 
-import mlx.core as mx
 
 from omlx.engine_core import get_mlx_executor
 from omlx.mx_buffer_lock import locked_sync_and_clear_cache

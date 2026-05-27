@@ -20,7 +20,7 @@ import mlx.core as mx
 import numpy as np
 
 from ..engine_core import get_mlx_executor
-from ..mx_buffer_lock import gtrace, locked_free_and_clear, locked_sync_and_clear_cache, run_locked
+from ..mx_buffer_lock import gtrace, locked_free_and_clear, run_locked
 from ..exceptions import AudioError, VoiceCloningError
 from .audio_utils import DEFAULT_SAMPLE_RATE as _DEFAULT_SAMPLE_RATE
 from .audio_utils import audio_to_wav_bytes as _audio_to_wav_bytes

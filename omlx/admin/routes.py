@@ -2818,7 +2818,6 @@ async def update_global_settings(
         HTTPException: 401 if not authenticated, 503 if server not initialized,
                       400 if validation fails.
     """
-    from ..config import parse_size
 
     global_settings = _get_global_settings()
 
