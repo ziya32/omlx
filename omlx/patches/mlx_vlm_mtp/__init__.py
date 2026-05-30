@@ -22,6 +22,33 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Process-wide flag: does the checkpoint about to load actually ship
+# ``mtp.*`` weight tensors? Set per-load by
+# ``omlx.utils.model_loading.maybe_apply_pre_load_patches`` (VLM path) just
+# before ``mlx_vlm.utils.load`` runs; read by the runtime MTP ``__init__``
+# patches to decide whether to attach ``MTPModule``.
+#
+# A checkpoint can declare ``mtp_num_hidden_layers > 0`` in config yet ship
+# no ``mtp.*`` tensors (e.g. quantized before MTP-preserving sanitize landed,
+# so stock mlx-vlm ``sanitize`` stripped them). Attaching the head for such a
+# checkpoint makes strict ``load_weights`` fail with "Missing N parameters:
+# language_model.mtp.*", and VLMBatchedEngine silently falls back to a
+# text-only LLM — dropping vision. Defaults False so the head is never
+# attached without a positive signal that its weights exist.
+_MTP_WEIGHTS_PRESENT = False
+
+
+def set_mtp_weights_present(present: bool) -> None:
+    """Record whether the checkpoint being loaded ships ``mtp.*`` weights."""
+    global _MTP_WEIGHTS_PRESENT
+    _MTP_WEIGHTS_PRESENT = bool(present)
+
+
+def mtp_weights_present() -> bool:
+    """True iff the last ``set_mtp_weights_present`` call saw mtp.* weights."""
+    return _MTP_WEIGHTS_PRESENT
+
+
 def apply_mlx_vlm_mtp_patch() -> bool:
     """Apply the mlx-vlm MTP sanitize monkey-patches.
 

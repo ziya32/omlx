@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for omlx.utils.model_loading.maybe_load_custom_quantization."""
 
+import json
 import sys
 import types
 from unittest.mock import MagicMock
@@ -9,6 +10,7 @@ import pytest
 
 from omlx.utils import model_loading
 from omlx.utils.model_loading import (
+    _has_mtp_weights,
     maybe_apply_pre_load_patches,
     maybe_load_custom_quantization,
 )
@@ -16,6 +18,14 @@ from omlx.utils.model_loading import (
 
 def _write_config(tmp_path, body: str) -> str:
     (tmp_path / "config.json").write_text(body)
+    return str(tmp_path)
+
+
+def _write_index(tmp_path, keys) -> str:
+    """Write a minimal safetensors index mapping *keys* to one shard."""
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {k: "model-00001-of-00001.safetensors" for k in keys}})
+    )
     return str(tmp_path)
 
 
@@ -184,9 +194,14 @@ class TestVlmMtpPreLoadDispatch:
             MagicMock(
                 apply_mlx_vlm_mtp_patch=sanitize_mock,
                 apply_mlx_vlm_mtp_runtime_patch=runtime_mock,
+                set_mtp_weights_present=MagicMock(),
             ),
         )
         return calls, sanitize_mock, runtime_mock
+
+    @staticmethod
+    def _set_present_mock():
+        return sys.modules["omlx.patches.mlx_vlm_mtp"].set_mtp_weights_present
 
     def test_sanitize_patch_runs_before_runtime_for_vlm_mtp(
         self, tmp_path, monkeypatch
@@ -281,3 +296,152 @@ class TestVlmMtpPreLoadDispatch:
         sanitize_mock.assert_not_called()
         runtime_mock.assert_not_called()
         assert calls == []
+
+    def test_weights_present_flag_true_when_mtp_weights_in_checkpoint(
+        self, tmp_path, monkeypatch
+    ):
+        # Config declares MTP heads AND the checkpoint ships mtp.* weights →
+        # the runtime patch is told to attach the head.
+        self._stub_patches(monkeypatch)
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "qwen3_5_moe", "vision_config": {}, '
+            '"text_config": {"mtp_num_hidden_layers": 1}}',
+        )
+        _write_index(
+            tmp_path,
+            [
+                "language_model.mtp.fc.weight",
+                "language_model.model.layers.0.self_attn.q_proj.weight",
+            ],
+        )
+        settings = types.SimpleNamespace(mtp_enabled=False)
+
+        maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
+
+        self._set_present_mock().assert_called_once_with(True)
+
+    def test_weights_present_flag_false_when_mtp_weights_stripped(
+        self, tmp_path, monkeypatch
+    ):
+        # Regression for the Qwen3.6-35B-A3B-emee8bit fallback: config
+        # advertises mtp_num_hidden_layers=1 but the checkpoint has zero
+        # mtp.* tensors (stripped at quant time). The head must NOT be
+        # attached — otherwise strict load_weights fails ("Missing N
+        # parameters: language_model.mtp.*") and VLMBatchedEngine silently
+        # downgrades to a text-only LLM, dropping vision.
+        self._stub_patches(monkeypatch)
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "qwen3_5_moe", "vision_config": {}, '
+            '"text_config": {"mtp_num_hidden_layers": 1}}',
+        )
+        _write_index(
+            tmp_path, ["language_model.model.layers.0.self_attn.q_proj.weight"]
+        )
+        settings = types.SimpleNamespace(mtp_enabled=False)
+
+        maybe_apply_pre_load_patches(path, model_settings=settings, for_vlm=True)
+
+        self._set_present_mock().assert_called_once_with(False)
+
+    def test_warns_when_mtp_enabled_but_weights_absent(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        self._stub_patches(monkeypatch)
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "qwen3_5_moe", "vision_config": {}, '
+            '"text_config": {"mtp_num_hidden_layers": 1}}',
+        )
+        _write_index(
+            tmp_path, ["language_model.model.layers.0.self_attn.q_proj.weight"]
+        )
+        settings = types.SimpleNamespace(mtp_enabled=True)
+
+        with caplog.at_level("WARNING"):
+            maybe_apply_pre_load_patches(
+                path, model_settings=settings, for_vlm=True
+            )
+
+        self._set_present_mock().assert_called_once_with(False)
+        assert any(
+            "ships no mtp.* weights" in r.getMessage() for r in caplog.records
+        )
+
+    def test_no_warning_when_mtp_disabled_and_weights_absent(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        # Common case for stripped checkpoints (mtp off, no weights): silent,
+        # head simply not attached, vision preserved.
+        self._stub_patches(monkeypatch)
+        path = _write_config(
+            tmp_path,
+            '{"model_type": "qwen3_5_moe", "vision_config": {}, '
+            '"text_config": {"mtp_num_hidden_layers": 1}}',
+        )
+        _write_index(
+            tmp_path, ["language_model.model.layers.0.self_attn.q_proj.weight"]
+        )
+        settings = types.SimpleNamespace(mtp_enabled=False)
+
+        with caplog.at_level("WARNING"):
+            maybe_apply_pre_load_patches(
+                path, model_settings=settings, for_vlm=True
+            )
+
+        assert not any(
+            "ships no mtp.* weights" in r.getMessage() for r in caplog.records
+        )
+
+
+class TestHasMtpWeights:
+    """_has_mtp_weights inspects only safetensors key names to decide whether
+    a checkpoint actually ships mtp.* tensors (no tensor data is loaded)."""
+
+    def test_index_with_mtp_key_returns_true(self, tmp_path):
+        _write_index(
+            tmp_path,
+            ["language_model.mtp.fc.weight", "language_model.model.norm.weight"],
+        )
+        assert _has_mtp_weights(str(tmp_path)) is True
+
+    def test_index_without_mtp_key_returns_false(self, tmp_path):
+        _write_index(
+            tmp_path,
+            [
+                "language_model.model.layers.0.self_attn.q_proj.weight",
+                "vision_tower.blocks.0.attn.proj.weight",
+            ],
+        )
+        assert _has_mtp_weights(str(tmp_path)) is False
+
+    def test_substring_mtp_is_not_a_false_positive(self, tmp_path):
+        # 'mtp' only counts as a full dot-separated path segment.
+        _write_index(tmp_path, ["model.something_mtp_extra.weight"])
+        assert _has_mtp_weights(str(tmp_path)) is False
+
+    def test_non_directory_path_returns_true(self):
+        # Can't introspect → preserve prior unconditional-attach behavior.
+        assert _has_mtp_weights("/no/such/path/here") is True
+
+    def test_dir_without_index_or_shards_returns_true(self, tmp_path):
+        assert _has_mtp_weights(str(tmp_path)) is True
+
+    def test_shard_scan_fallback_detects_mtp(self, tmp_path):
+        np = pytest.importorskip("numpy")
+        st = pytest.importorskip("safetensors.numpy")
+        st.save_file(
+            {"language_model.mtp.norm.weight": np.zeros((2,), dtype=np.float32)},
+            str(tmp_path / "model.safetensors"),
+        )
+        assert _has_mtp_weights(str(tmp_path)) is True
+
+    def test_shard_scan_fallback_without_mtp_returns_false(self, tmp_path):
+        np = pytest.importorskip("numpy")
+        st = pytest.importorskip("safetensors.numpy")
+        st.save_file(
+            {"language_model.model.norm.weight": np.zeros((2,), dtype=np.float32)},
+            str(tmp_path / "model.safetensors"),
+        )
+        assert _has_mtp_weights(str(tmp_path)) is False

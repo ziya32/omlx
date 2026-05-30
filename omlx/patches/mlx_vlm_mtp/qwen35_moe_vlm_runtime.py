@@ -205,13 +205,20 @@ def _patch_vlm_language_model(q35moe_lang: Any) -> None:
 
     def __init__(self, args, config=None):
         original_init(self, args, config)
-        # Always attach MTPModule when the config declares MTP heads, so
-        # mlx-vlm's load_weights (which skips Model.sanitize for is_mlx_format
-        # checkpoints) can place the persisted mtp.* tensors. MTP speculative
+        # Attach MTPModule only when the config declares MTP heads AND the
+        # checkpoint actually ships mtp.* weights. The head exists purely to
+        # give persisted mtp.* tensors a binding site (mlx-vlm skips
+        # Model.sanitize for is_mlx_format checkpoints). If the config
+        # advertises MTP but the weights were stripped at quant time,
+        # attaching the head makes strict load_weights fail ("Missing N
+        # parameters: language_model.mtp.*") and VLMBatchedEngine silently
+        # falls back to a text-only LLM, dropping vision. MTP speculative
         # decode invocation is gated downstream by
         # ``mlx_lm_mtp.batch_generator._is_mtp_eligible`` via ``is_mtp_active``.
+        from omlx.patches.mlx_vlm_mtp import mtp_weights_present
+
         n_mtp = int(getattr(args, "mtp_num_hidden_layers", 0) or 0)
-        if n_mtp > 0:
+        if n_mtp > 0 and mtp_weights_present():
             self.mtp = q35moe_lang.MTPModule(args)
 
     def __call__(self, inputs, inputs_embeds=None, mask=None, cache=None, **kwargs):

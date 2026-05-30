@@ -186,10 +186,30 @@ def maybe_apply_pre_load_patches(
                 from ..patches.mlx_vlm_mtp import (
                     apply_mlx_vlm_mtp_patch,
                     apply_mlx_vlm_mtp_runtime_patch,
+                    set_mtp_weights_present,
                 )
             except Exception:
                 pass
             else:
+                # The runtime patch attaches MTPModule only when the
+                # checkpoint actually ships ``mtp.*`` weights. Record that
+                # signal now (before mlx_vlm.utils.load constructs the model
+                # and the patched __init__ reads it). A checkpoint can
+                # advertise ``mtp_num_hidden_layers > 0`` in config yet have
+                # had its mtp.* weights stripped at quant time; attaching the
+                # head then fails strict load_weights and the VLM silently
+                # degrades to a text-only LLM, dropping vision.
+                weights_present = _has_mtp_weights(model_name)
+                set_mtp_weights_present(weights_present)
+                if mtp_enabled and not weights_present:
+                    logger.warning(
+                        "mtp_enabled=True for %s but the checkpoint ships no "
+                        "mtp.* weights; MTP head not attached. Text+vision "
+                        "load normally and MTP decode stays inactive. "
+                        "Re-quantize with MTP-preserving sanitize to enable "
+                        "MTP.",
+                        model_name,
+                    )
                 # Sanitize-preservation patch MUST run too: the stock
                 # mlx-vlm Model.sanitize strips every ``mtp.*`` key, so
                 # without this the MTPModule loads at random init (0%
@@ -218,8 +238,8 @@ def maybe_apply_pre_load_patches(
                     else:
                         logger.debug(
                             "mlx-vlm runtime MTP patch applied for %s "
-                            "(mtp_enabled=False; head attached for weight "
-                            "load only)",
+                            "(mtp_enabled=False; head attached only when the "
+                            "checkpoint ships mtp.* weights)",
                             model_name,
                         )
     elif model_settings is not None and getattr(model_settings, "mtp_enabled", False):
@@ -292,6 +312,50 @@ def _has_mtp_heads(config: dict) -> bool:
     if int(text_cfg.get("num_nextn_predict_layers", 0) or 0) > 0:
         return True
     return False
+
+
+def _has_mtp_weights(model_path: str) -> bool:
+    """True iff the checkpoint actually ships ``mtp.*`` weight tensors.
+
+    A checkpoint can declare ``mtp_num_hidden_layers > 0`` in ``config.json``
+    yet contain no ``mtp.*`` tensors — e.g. quantized before MTP-preserving
+    sanitize landed, so stock mlx-vlm ``sanitize`` stripped them. Attaching
+    the VLM MTPModule for such a checkpoint makes strict ``load_weights`` fail
+    ("Missing N parameters: language_model.mtp.*") and VLMBatchedEngine
+    silently downgrades to a text-only LLM, dropping vision.
+
+    Reads only safetensors *key names* (index JSON when present, else shard
+    headers) — no tensor data is loaded. Returns ``True`` when the path can't
+    be introspected (non-dir / unreadable / shardless), preserving the prior
+    unconditional-attach behavior rather than suppressing a head the
+    checkpoint may genuinely need.
+    """
+
+    def _is_mtp_key(key: str) -> bool:
+        return "mtp" in key.split(".")
+
+    try:
+        p = Path(model_path)
+        if not p.is_dir():
+            return True
+        index = p / "model.safetensors.index.json"
+        if index.is_file():
+            with open(index) as f:
+                weight_map = json.load(f).get("weight_map", {})
+            return any(_is_mtp_key(k) for k in weight_map)
+        import safetensors
+
+        saw_shard = False
+        for sf in p.glob("*.safetensors"):
+            saw_shard = True
+            with safetensors.safe_open(str(sf), framework="np") as f:
+                if any(_is_mtp_key(k) for k in f.keys()):
+                    return True
+        # Shards present but none carried mtp keys → definitively absent.
+        # No shards at all → can't tell; preserve prior behavior.
+        return False if saw_shard else True
+    except Exception:
+        return True
 
 
 def _is_mtp_compatible(config: dict, model_type: str | None) -> bool:

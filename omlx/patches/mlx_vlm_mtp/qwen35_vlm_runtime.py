@@ -192,18 +192,21 @@ def _patch_vlm_language_model(q35_lang: Any) -> None:
 
     def __init__(self, args, config=None):
         original_init(self, args, config)
-        # Always attach MTPModule when the config declares MTP heads, so
-        # mlx-vlm's load_weights (which skips Model.sanitize for is_mlx_format
-        # checkpoints) can place the persisted mtp.* tensors. Whether MTP
-        # speculative decode is actually invoked at inference time is gated
-        # downstream by ``mlx_lm_mtp.batch_generator._is_mtp_eligible``,
-        # which checks the process-wide ``is_mtp_active`` flag.
-        # Without this unconditional attach, mtp_enabled=False would fail
-        # VLM load with "Received N parameters not in model" and the engine
-        # pool would permanently downgrade the entry to BatchedEngine —
-        # losing vision support.
+        # Attach MTPModule only when the config declares MTP heads AND the
+        # checkpoint actually ships mtp.* weights. The head gives persisted
+        # mtp.* tensors a binding site (mlx-vlm skips Model.sanitize for
+        # is_mlx_format checkpoints). With mtp.* weights present this also
+        # avoids the "Received N parameters not in model" strict-load failure
+        # that previously forced a permanent downgrade to BatchedEngine
+        # (losing vision). But if the config advertises MTP while the weights
+        # were stripped at quant time, attaching the head instead fails with
+        # "Missing N parameters" — the same vision loss in reverse — so gate
+        # on weight presence. MTP decode invocation is gated downstream by
+        # ``mlx_lm_mtp.batch_generator._is_mtp_eligible`` via ``is_mtp_active``.
+        from omlx.patches.mlx_vlm_mtp import mtp_weights_present
+
         n_mtp = int(getattr(args, "mtp_num_hidden_layers", 0) or 0)
-        if n_mtp > 0:
+        if n_mtp > 0 and mtp_weights_present():
             self.mtp = q35_lang.MTPModule(args)
 
     def __call__(self, inputs, inputs_embeds=None, mask=None, cache=None, **kwargs):
