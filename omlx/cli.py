@@ -535,6 +535,120 @@ def diagnose_command(args) -> int:
     return 1
 
 
+def quant_command(args) -> int:
+    """Run oQ quantization from the CLI (the non-UI equivalent of the admin
+    Quantize tab).
+
+    Streams tensor-by-tensor (~3-4GB RAM regardless of model size). Mirrors
+    OQManager.start_quantization: validate level/dtype, resolve the output
+    name, refuse to clobber, then quantize with console progress.
+    """
+    import logging
+    import shutil
+    from pathlib import Path
+
+    from .oq import (
+        OQ_DTYPES,
+        OQ_LEVELS,
+        quantize_oq_streaming,
+        resolve_output_name,
+    )
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+
+    source = Path(args.model).expanduser()
+    if not source.is_dir() or not (source / "config.json").exists():
+        print(f"Error: model not found (no config.json): {source}", file=sys.stderr)
+        return 1
+    if args.oq_level not in OQ_LEVELS:
+        print(
+            f"Error: invalid --oq-level {args.oq_level:g}; "
+            f"choose one of {sorted(OQ_LEVELS)}",
+            file=sys.stderr,
+        )
+        return 1
+    if args.dtype not in OQ_DTYPES:
+        print(
+            f"Error: invalid --dtype {args.dtype!r}; choose one of {OQ_DTYPES}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if args.output:
+        output_path = Path(args.output).expanduser()
+    else:
+        out_dir = (
+            Path(args.output_dir).expanduser() if args.output_dir else source.parent
+        )
+        output_path = out_dir / resolve_output_name(
+            source.name, args.oq_level, args.dtype, preserve_mtp=args.preserve_mtp
+        )
+    if output_path.exists():
+        print(f"Error: output already exists: {output_path}", file=sys.stderr)
+        return 1
+
+    src_bytes = sum(f.stat().st_size for f in source.glob("*.safetensors")) or sum(
+        f.stat().st_size for f in source.glob("*.bin")
+    )
+    print(f"oQ quantize  {source.name}  ->  oQ{args.oq_level:g} ({args.dtype})")
+    print(f"  source : {source}  ({src_bytes / 1024**3:.1f} GB)")
+    print(f"  output : {output_path}")
+    opts = [f"group_size={args.group_size}"]
+    if args.text_only:
+        opts.append("text-only")
+    if args.preserve_mtp:
+        opts.append("preserve-mtp")
+    if not args.auto_proxy_sensitivity:
+        opts.append("no-auto-proxy-sensitivity")
+    if args.sensitivity_model:
+        opts.append(f"sensitivity={args.sensitivity_model}")
+    if args.target_bpw is not None:
+        opts.append(f"target-bpw={args.target_bpw:g}")
+    if args.hard_cap_bpw is not None:
+        opts.append(f"hard-cap-bpw={args.hard_cap_bpw:g}")
+    print(f"  options: {', '.join(opts)}\n")
+
+    seen = {"key": None}
+
+    def _progress(phase: str, pct: float) -> None:
+        # Print on phase change or each 10% within a phase (keeps logs readable).
+        key = (phase, int(pct // 10))
+        if key != seen["key"]:
+            seen["key"] = key
+            print(f"  [{pct:5.1f}%] {phase}", flush=True)
+
+    try:
+        quantize_oq_streaming(
+            str(source),
+            str(output_path),
+            args.oq_level,
+            args.group_size,
+            _progress,
+            args.text_only,
+            args.target_bpw,
+            args.hard_cap_bpw,
+            args.sensitivity_model,
+            args.dtype,
+            args.preserve_mtp,
+            args.auto_proxy_sensitivity,
+        )
+    except KeyboardInterrupt:
+        print("\nInterrupted — removing partial output.", file=sys.stderr)
+        if output_path.exists():
+            shutil.rmtree(output_path, ignore_errors=True)
+        return 130
+    except Exception as e:
+        print(f"\nError: quantization failed: {e}", file=sys.stderr)
+        return 1
+
+    out_bytes = sum(f.stat().st_size for f in output_path.glob("*.safetensors"))
+    print(f"\nDone: {output_path}  ({out_bytes / 1024**3:.2f} GB)")
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="omlx: Production-ready LLM server for Apple Silicon",
@@ -771,6 +885,69 @@ Example directory structure:
         help="What to diagnose. 'menubar' checks Tahoe ControlCenter visibility.",
     )
 
+    # Quant command (oQ quantization — the non-UI path)
+    quant_parser = subparsers.add_parser(
+        "quant",
+        help="Quantize a local model with oQ (CLI equivalent of the admin Quantize tab)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="""
+Quantize a local model with oQ, streaming tensor-by-tensor (~3-4GB RAM
+regardless of model size).
+
+Examples:
+  omlx quant /models/Qwen3.5-27B --oq-level 4
+  omlx quant /models/Qwen3.6-35B-A3B --oq-level 8 --preserve-mtp
+  omlx quant /models/Qwen3-VL-8B --oq-level 6 --text-only --dtype float16
+        """,
+    )
+    quant_parser.add_argument(
+        "model", type=str, help="Path to the source model directory"
+    )
+    quant_parser.add_argument(
+        "-l", "--oq-level", type=float, required=True,
+        help="oQ level: one of 2, 3, 3.5, 4, 5, 6, 8",
+    )
+    quant_parser.add_argument(
+        "-o", "--output", type=str, default=None,
+        help="Explicit output directory (overrides --output-dir + the auto name)",
+    )
+    quant_parser.add_argument(
+        "--output-dir", type=str, default=None,
+        help="Directory for the auto-named output (default: the source's parent dir)",
+    )
+    quant_parser.add_argument(
+        "--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16"],
+        help="FP dtype for non-quantized weights + quant scales/biases (default: bfloat16)",
+    )
+    quant_parser.add_argument(
+        "--group-size", type=int, default=64, help="Quantization group size (default: 64)",
+    )
+    quant_parser.add_argument(
+        "--text-only", action="store_true",
+        help="Skip vision/audio encoder weights (VLM models)",
+    )
+    quant_parser.add_argument(
+        "--preserve-mtp", action="store_true",
+        help="Keep mtp.* tensors + config fields so the output supports MTP speculative decode",
+    )
+    quant_parser.add_argument(
+        "--target-bpw", type=float, default=None,
+        help="Advanced: target effective bits-per-weight",
+    )
+    quant_parser.add_argument(
+        "--hard-cap-bpw", type=float, default=None,
+        help="Advanced: hard cap on effective bits-per-weight",
+    )
+    quant_parser.add_argument(
+        "--sensitivity-model", type=str, default="",
+        help="Advanced: path to a model for sensitivity-guided bit allocation",
+    )
+    quant_parser.add_argument(
+        "--no-auto-proxy-sensitivity", dest="auto_proxy_sensitivity",
+        action="store_false", default=True,
+        help="Disable automatic proxy sensitivity estimation",
+    )
+
     # Use parse_known_args so `omlx launch <tool> -- ...` can forward unknown
     # tokens (e.g. `-r`, `--resume <id>`) to the underlying tool binary.
     # Non-launch commands keep the previous strictness by rejecting unknowns.
@@ -785,6 +962,8 @@ Example directory structure:
             serve_command(args)
         elif args.command == "diagnose":
             sys.exit(diagnose_command(args))
+        elif args.command == "quant":
+            sys.exit(quant_command(args))
         else:
             parser.print_help()
             sys.exit(1)
