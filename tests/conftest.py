@@ -20,7 +20,7 @@ try:
     import mlx.core as mx
 
     _total_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-    mx.metal.set_memory_limit(int(_total_bytes * 0.75))
+    mx.set_memory_limit(int(_total_bytes * 0.75))
 except Exception:
     pass
 
