@@ -280,9 +280,16 @@ class BatchedEngine(BaseEngine):
         )
 
         # Apply post-load transforms (e.g., IndexCache for DSA models)
-        from ..utils.model_loading import apply_post_load_transforms
+        from ..utils.model_loading import (
+            apply_post_load_transforms,
+            maybe_attach_global_scales,
+        )
 
         self._model = apply_post_load_transforms(self._model, self._model_settings)
+        # NVFP4-transcoded checkpoints: attach per-tensor/per-expert global
+        # output-scales (no-op for any other model). Mirrors the VLM path so a
+        # text-only / force_lm load of a transcoded model isn't silently un-scaled.
+        maybe_attach_global_scales(self._model, self._model_name)
 
         # TurboQuant KV cache: patch attention and set kv_bits on scheduler
         if self._model_settings is not None:

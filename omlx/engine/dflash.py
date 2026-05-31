@@ -393,6 +393,10 @@ class DFlashEngine(BaseEngine):
         result = await loop.run_in_executor(get_mlx_executor(), lambda: run_locked(_load_models))
         self._target_model, self._tokenizer_obj, target_meta, self._draft_model = result
 
+        # NVFP4-transcoded target: attach global output-scales (no-op otherwise).
+        from ..utils.model_loading import maybe_attach_global_scales
+        maybe_attach_global_scales(self._target_model, self._model_name)
+
         # Deep-copy tokenizer for executor-thread usage (dflash generation).
         # The original self._tokenizer_obj stays for event-loop operations
         # (encode, apply_chat_template, count_chat_tokens).

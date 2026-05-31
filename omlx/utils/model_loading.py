@@ -110,6 +110,20 @@ def maybe_apply_pre_load_patches(
 
     _patch_mlx_lm_load_config()
 
+    # NVFP4-transcoded checkpoints carry a global output-scale side-car. Patch
+    # the quantized forwards now (idempotent; the wrappers are gated on a
+    # per-module attr, so this is a no-op for every other checkpoint). Done in
+    # the shared pre-load hook -- which every engine calls -- so an LLM / dflash
+    # / force_lm load of a transcoded model patches the classes too, not just
+    # the VLM path. The scales themselves are bound post-load by
+    # maybe_attach_global_scales().
+    try:
+        if (Path(model_name) / "omlx_meta" / "global_scales.safetensors").exists():
+            from ..patches.global_scale_runtime import apply as _gs_apply
+            _gs_apply()
+    except Exception as e:
+        logger.debug("global-scale pre-load apply skipped for %s: %s", model_name, e)
+
     config_path = Path(model_name) / "config.json"
     if not config_path.exists():
         return
@@ -386,6 +400,38 @@ def load_text_model(
     from mlx_lm import load
 
     return load(model_name, tokenizer_config=tokenizer_config)
+
+
+def maybe_attach_global_scales(model: Any, model_name: str) -> int:
+    """Attach NVFP4 global output-scales after load (shared post-load hook).
+
+    No-op unless the model dir ships ``omlx_meta/global_scales.safetensors``
+    (i.e. a checkpoint produced by ``omlx transcode-nvfp4``). Called by every
+    generation engine -- LLM ``BatchedEngine``, ``VLMBatchedEngine``, dflash --
+    so the per-tensor / per-expert global output-scales are applied regardless
+    of which engine loads the model. Previously this lived only in the VLM
+    path, so a text-only / ``force_lm`` load of a transcoded VLM was silently
+    un-scaled (garbage output, no error).
+
+    Returns the number of modules scaled.
+    """
+    try:
+        if not (Path(model_name) / "omlx_meta" / "global_scales.safetensors").exists():
+            return 0
+        from ..patches.global_scale_runtime import (
+            apply as _gs_apply,
+            attach_global_scales,
+        )
+        _gs_apply()   # ensure the class patch is live even if pre-load was bypassed
+        n = attach_global_scales(model, model_name)
+        if n:
+            logger.info(
+                "NVFP4 global output-scales attached: %d modules (%s)", n, model_name
+            )
+        return n
+    except Exception as e:
+        logger.debug("global-scale attach skipped for %s: %s", model_name, e)
+        return 0
 
 
 def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:

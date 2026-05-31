@@ -124,9 +124,7 @@ def attach_global_scales(model, model_dir) -> int:
 
     p = Path(model_dir) / "omlx_meta" / "global_scales.safetensors"
     if not p.exists():
-        p = Path(model_dir) / "global_scales.safetensors"   # legacy top-level
-    if not p.exists():
-        return 0
+        return 0   # not a transcoded NVFP4 checkpoint -- no-op
     gmap = mx.load(str(p))
     n = 0
     for path, module in tree_flatten(model.leaf_modules(), is_leaf=nn.Module.is_module):

@@ -109,6 +109,11 @@ class MLXLanguageModel:
                     tokenizer_config=tokenizer_config,
                 )
 
+            # NVFP4-transcoded checkpoints: attach global output-scales (no-op
+            # for any other model). Shared hook with the batched / VLM engines.
+            from ..utils.model_loading import maybe_attach_global_scales
+            maybe_attach_global_scales(self.model, self.model_name)
+
             self._loaded = True
             logger.info(f"Model loaded successfully: {self.model_name}")
 

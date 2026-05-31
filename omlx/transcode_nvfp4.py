@@ -259,6 +259,16 @@ def transcode(src: str, dst: str, limit_layers: int | None = None,
     import mlx.core as mx
     mx.set_default_device(mx.cpu)   # CPU-only: don't contend with a running `omlx serve`
 
+    if limit_layers is not None:
+        import sys
+        print(
+            f"WARNING: --limit-layers {limit_layers} writes a LOGIC-TEST artifact -- "
+            f"config.json still declares the full layer count, so the output is NOT "
+            f"loadable (especially with --keep-mtp, whose head expects every backbone "
+            f"layer). Use it only to exercise the re-pack logic, not to produce a model.",
+            file=sys.stderr,
+        )
+
     idx = _index(src)
     nvfp4, fp8, passthrough = classify(idx)
     experts, standalone = group_experts(nvfp4)
@@ -441,31 +451,83 @@ def transcode(src: str, dst: str, limit_layers: int | None = None,
 
 
 def _verify_written(dst: str, src: str, n=4) -> bool:
-    """Reload a few WRITTEN tensors and confirm dequant(view) * global == modelopt ref."""
+    """Reload WRITTEN tensors and confirm ``dequant(written) * global == ref``.
+
+    Checks every written quant format survives ``mx.save_safetensors`` ->
+    ``mx.load``, not just mxfp8:
+      * mxfp8 (attention / linear_attn),
+      * nvfp4 standalone (shared_expert / lm_head),
+      * nvfp4 stacked experts (expert 0 of the first ``n`` switch_mlp groups --
+        covers the [E, out, in] stacking + the per-expert global vector).
+    """
     import mlx.core as mx
     sidx = _index(src)
     didx = _index(dst)
     gmap = mx.load(str(Path(dst) / "omlx_meta" / "global_scales.safetensors"))
-    snv, sfp, _ = classify(sidx)
+    nvfp4, fp8, _ = classify(sidx)
+    experts, standalone = group_experts(nvfp4)
     ok = True
+
+    def _nvfp4_src_ref(b):
+        """modelopt source dequant for nvfp4 base ``b``: codes * block * global."""
+        out, in2 = sidx[b + ".weight"][1]["shape"]; IN = in2 * 2
+        W = np.frombuffer(_raw(sidx[b + ".weight"]), np.uint8).reshape(out, in2)
+        S = np.frombuffer(_raw(sidx[b + ".weight_scale"]), np.uint8).reshape(out, IN // 16)
+        g2 = _f32(_raw(sidx[b + ".weight_scale_2"], 4))[0]
+        c = np.empty((out, IN), np.uint8); c[:, 0::2] = W & 0xF; c[:, 1::2] = (W >> 4) & 0xF
+        return (_E2M1_LUT[c] * np.repeat(_E4M3_LUT[S], 16, axis=1) * g2).astype(np.float32)
+
+    # 1) mxfp8 (attention / linear_attn)
     checked = 0
-    for b in sorted(sfp):
+    for b in sorted(fp8):
         rb = _remap(b)
         if rb + ".weight" not in didx:
             continue
         o, i = sidx[b + ".weight"][1]["shape"]
         Wsrc = np.frombuffer(_raw(sidx[b + ".weight"]), np.uint8).reshape(o, i)
         ps = _f32(_raw(sidx[b + ".weight_scale"], 4))[0]
-        ref = _E4M3_LUT[Wsrc] * ps
+        ref = (_E4M3_LUT[Wsrc] * ps).astype(np.float32)
         wq = np.frombuffer(_raw(didx[rb + ".weight"]), np.uint32).reshape(o, i // 4)
         sc = np.frombuffer(_raw(didx[rb + ".scales"]), np.uint8).reshape(o, i // 32)
         deq = np.array(mx.dequantize(mx.array(wq), mx.array(sc), group_size=32, bits=8, mode="mxfp8").astype(mx.float32))
         g = float(np.array(gmap[rb]).reshape(-1)[0])
-        r = np.array_equal(deq * g, ref.astype(np.float32))
-        ok &= r; checked += 1
-        print(f"  [written mxfp8] {rb.split('.')[-1]:10s} bit-exact={r}")
+        r = np.array_equal(deq * g, ref); ok &= r; checked += 1
+        print(f"  [written mxfp8]         {rb.split('.')[-1]:12s} bit-exact={r}")
         if checked >= n:
             break
+
+    # 2) nvfp4 standalone (shared_expert / lm_head)
+    checked = 0
+    for b in sorted(standalone):
+        rb = _remap(b)
+        if rb + ".weight" not in didx:
+            continue
+        ref = _nvfp4_src_ref(b)
+        wq = np.frombuffer(_raw(didx[rb + ".weight"]), np.uint32).reshape(didx[rb + ".weight"][1]["shape"])
+        sc = np.frombuffer(_raw(didx[rb + ".scales"]), np.uint8).reshape(didx[rb + ".scales"][1]["shape"])
+        deq = np.array(mx.dequantize(mx.array(wq), mx.array(sc), group_size=16, bits=4, mode="nvfp4").astype(mx.float32))
+        g = float(np.array(gmap[rb]).reshape(-1)[0])
+        r = np.array_equal(deq * g, ref); ok &= r; checked += 1
+        print(f"  [written nvfp4]         {rb.split('.')[-1]:12s} bit-exact={r}")
+        if checked >= n:
+            break
+
+    # 3) nvfp4 stacked experts (expert 0 of the first n switch_mlp groups)
+    checked = 0
+    for (head, proj), emap in sorted(experts.items()):
+        rb = _remap(f"{head}.mlp.switch_mlp.{proj}")
+        if rb + ".weight" not in didx:
+            continue
+        ref0 = _nvfp4_src_ref(emap[0])                 # source expert 0
+        wq = np.frombuffer(_raw(didx[rb + ".weight"]), np.uint32).reshape(didx[rb + ".weight"][1]["shape"])[0]
+        sc = np.frombuffer(_raw(didx[rb + ".scales"]), np.uint8).reshape(didx[rb + ".scales"][1]["shape"])[0]
+        deq = np.array(mx.dequantize(mx.array(wq), mx.array(sc), group_size=16, bits=4, mode="nvfp4").astype(mx.float32))
+        g = float(np.array(gmap[rb]).reshape(-1)[0])   # per-expert vector -> expert 0
+        r = np.array_equal(deq * g, ref0); ok &= r; checked += 1
+        print(f"  [written nvfp4 expert0] {proj:12s} bit-exact={r}")
+        if checked >= n:
+            break
+
     return ok
 
 

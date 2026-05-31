@@ -1035,6 +1035,10 @@ nvfp4/mxfp8 layout, bit-for-bit. Per-tensor FP32 global scales are emitted to
 omlx_meta/global_scales.safetensors and applied at load as a post-matmul output
 scale; the result loads + runs in `omlx serve` at the same ~4-bit size.
 
+omlx cannot load modelopt NVFP4 checkpoints directly (the loader has no
+`quant_method: modelopt` branch) -- you MUST transcode with this command first,
+then serve the transcoded output directory.
+
 Examples:
   omlx transcode-nvfp4 ~/tmp/Qwen3.6-35B-A3B-NVFP4 ~/tmp/Qwen3.6-35B-A3B-NVFP4-mlx
   omlx transcode-nvfp4 ~/tmp/Qwen3.6-35B-A3B-NVFP4 --verify-only
