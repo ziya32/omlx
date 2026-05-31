@@ -245,7 +245,17 @@ def _passthrough_transform(rk, t):
 # ---------------------------------------------------------------------------
 
 def transcode(src: str, dst: str, limit_layers: int | None = None,
-              keep_mtp: bool = False) -> None:
+              keep_mtp: bool = False, mtp_quant: str = "mxfp8") -> None:
+    """Transcode modelopt NVFP4/FP8 -> MLX.
+
+    ``mtp_quant`` controls how the (bf16, un-quantized-by-modelopt) MTP head is
+    written when ``keep_mtp``: ``"mxfp8"`` (default) / ``"nvfp4"`` quantize its
+    Linears so the draft-head forward is 2-4x cheaper (it dominates MTP cost
+    otherwise -- the head is a *draft*, verified by the backbone, so the small
+    quant error only trades a little accept rate for speed); ``"bf16"`` keeps it
+    lossless. ``mx.quantize`` is self-contained (no global scale), so quantized
+    MTP weights need no output-scale wrapper.
+    """
     import mlx.core as mx
     mx.set_default_device(mx.cpu)   # CPU-only: don't contend with a running `omlx serve`
 
@@ -287,6 +297,33 @@ def transcode(src: str, dst: str, limit_layers: int | None = None,
         out_tensors = {}
         mx.synchronize(); mx.clear_cache()
 
+    # MTP-head Linears to quantize (draft head). switch_mlp is handled at its
+    # fused-split site; router gate / shared_expert_gate / norms stay bf16.
+    _MTP_LINEAR_SFX = (
+        "self_attn.q_proj.weight", "self_attn.k_proj.weight",
+        "self_attn.v_proj.weight", "self_attn.o_proj.weight",
+        "shared_expert.gate_proj.weight", "shared_expert.up_proj.weight",
+        "shared_expert.down_proj.weight", "mtp.fc.weight",
+    )
+    _mtp_cfg = dict(_NVFP4) if mtp_quant == "nvfp4" else dict(_MXFP8)
+
+    def _emit_mtp_linear(base, w):
+        """Write one MTP Linear at ``base`` (no trailing ``.weight``).
+
+        bf16 passthrough, or ``mx.quantize`` to mxfp8/nvfp4 (self-contained --
+        no global scale, so no wrapper entry) + a per-path quant_cfg override.
+        """
+        if mtp_quant == "bf16":
+            out_tensors[base + ".weight"] = w
+            return
+        packed, scales = mx.quantize(
+            w, group_size=_mtp_cfg["group_size"],
+            bits=_mtp_cfg["bits"], mode=_mtp_cfg["mode"],
+        )
+        out_tensors[base + ".weight"] = packed
+        out_tensors[base + ".scales"] = scales
+        quant_cfg[base] = dict(_mtp_cfg)
+
     t0 = time.monotonic()
     # 1) passthrough (bf16)
     for k in sorted(passthrough):
@@ -297,21 +334,25 @@ def transcode(src: str, dst: str, limit_layers: int | None = None,
         if "position_ids" in k:
             continue   # buffer, dropped by vision sanitize
         rk = _remap(k)
+        is_mtp = rk.startswith("language_model.mtp.")
         # MTP MoE experts ship fused + stacked (bf16): experts.gate_up_proj
         # [E, 2*moe_inter, hidden] and experts.down_proj [E, hidden, moe_inter].
         # mlx-vlm's SwitchGLU wants switch_mlp.{gate,up,down}_proj; mlx-vlm
         # skips Model.sanitize for format=mlx, so split/rename here (mirrors
-        # qwen35_moe_vlm_runtime._unfuse_layer_experts).
-        if rk.endswith(".mlp.experts.gate_up_proj"):
+        # qwen35_moe_vlm_runtime._unfuse_layer_experts), then quantize per
+        # ``mtp_quant`` (the 256-expert switch_mlp dominates draft-head cost).
+        if is_mtp and rk.endswith(".mlp.experts.gate_up_proj"):
             base = rk[: -len("experts.gate_up_proj")] + "switch_mlp"
             gate_w, up_w = mx.split(_bf16(k), 2, axis=-2)
-            out_tensors[base + ".gate_proj.weight"] = gate_w
-            out_tensors[base + ".up_proj.weight"] = up_w
+            _emit_mtp_linear(base + ".gate_proj", gate_w)
+            _emit_mtp_linear(base + ".up_proj", up_w)
             flush(); continue
-        if rk.endswith(".mlp.experts.down_proj"):
+        if is_mtp and rk.endswith(".mlp.experts.down_proj"):
             base = rk[: -len("experts.down_proj")] + "switch_mlp"
-            out_tensors[base + ".down_proj.weight"] = _bf16(k)
+            _emit_mtp_linear(base + ".down_proj", _bf16(k))
             flush(); continue
+        if is_mtp and mtp_quant != "bf16" and rk.endswith(_MTP_LINEAR_SFX):
+            _emit_mtp_linear(rk[: -len(".weight")], _bf16(k)); flush(); continue
         out_tensors[rk] = _passthrough_transform(rk, _bf16(k)); flush()
     # 2) fp8 attention -> mxfp8
     for b in sorted(fp8):
@@ -435,6 +476,9 @@ def main():
     ap.add_argument("--verify-only", action="store_true")
     ap.add_argument("--limit-layers", type=int, default=None, help="only transcode layers < N (logic test)")
     ap.add_argument("--keep-mtp", action="store_true", help="keep the MTP head (default: drop it)")
+    ap.add_argument("--mtp-quant", choices=["mxfp8", "nvfp4", "bf16"], default="mxfp8",
+                    help="how to write the MTP head with --keep-mtp (default: mxfp8; "
+                         "draft head -> quantizing it is the MTP speedup)")
     args = ap.parse_args()
 
     idx = _index(args.src)
@@ -451,7 +495,8 @@ def main():
         return
 
     print(f"\ntranscoding -> {args.dst}")
-    transcode(args.src, args.dst, limit_layers=args.limit_layers, keep_mtp=args.keep_mtp)
+    transcode(args.src, args.dst, limit_layers=args.limit_layers,
+              keep_mtp=args.keep_mtp, mtp_quant=args.mtp_quant)
     print("\nverifying WRITTEN checkpoint round-trips...")
     print("  ALL WRITTEN BIT-EXACT:", _verify_written(args.dst, args.src))
 

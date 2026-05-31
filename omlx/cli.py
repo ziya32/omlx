@@ -706,6 +706,7 @@ def transcode_nvfp4_command(args) -> int:
         transcode(
             str(source), str(output_path),
             limit_layers=args.limit_layers, keep_mtp=args.keep_mtp,
+            mtp_quant=args.mtp_quant,
         )
     except KeyboardInterrupt:
         import shutil
@@ -1053,7 +1054,13 @@ Examples:
     )
     transcode_parser.add_argument(
         "--keep-mtp", action="store_true",
-        help="Keep the MTP head (bf16) for speculative decode (default: drop it)",
+        help="Keep the MTP head for speculative decode (default: drop it)",
+    )
+    transcode_parser.add_argument(
+        "--mtp-quant", choices=["mxfp8", "nvfp4", "bf16"], default="mxfp8",
+        help="How to write the MTP head with --keep-mtp (default: mxfp8). The "
+             "head is a draft (verified by the backbone), so quantizing it is "
+             "the MTP speedup; bf16 is lossless but ~2-4x slower to draft.",
     )
     transcode_parser.add_argument(
         "--limit-layers", type=int, default=None,
