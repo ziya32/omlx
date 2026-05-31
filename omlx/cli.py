@@ -649,6 +649,81 @@ def quant_command(args) -> int:
     return 0
 
 
+def transcode_nvfp4_command(args) -> int:
+    """Loss-free transcode of an NVIDIA modelopt NVFP4/FP8 checkpoint to MLX.
+
+    Re-packs (does not re-quantize) NVFP4 (E2M1 + E4M3 block scale) and FP8
+    (E4M3) tensors into MLX ``nvfp4`` / ``mxfp8`` layout bit-for-bit, emitting
+    the per-tensor FP32 global scales to ``omlx_meta/global_scales.safetensors``
+    (applied at load as a post-matmul output scale). The output loads + runs
+    in ``omlx serve`` directly.
+    """
+    import logging
+    from pathlib import Path
+
+    from .transcode_nvfp4 import (
+        classify,
+        group_experts,
+        transcode,
+        _index,
+        _verify_sample,
+        _verify_written,
+    )
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+
+    source = Path(args.src).expanduser()
+    if not source.is_dir() or not (source / "config.json").exists():
+        print(f"Error: model not found (no config.json): {source}", file=sys.stderr)
+        return 1
+
+    idx = _index(str(source))
+    nvfp4, fp8, passthrough = classify(idx)
+    experts, standalone = group_experts(nvfp4)
+    print(f"source tensors: {len(idx)}")
+    print(f"  nvfp4 bases: {len(nvfp4)} -> {len(experts)} switch_mlp groups "
+          f"+ {len(standalone)} standalone")
+    print(f"  fp8 bases:   {len(fp8)} | passthrough: {len(passthrough)}")
+
+    print("\nverifying re-pack is bit-exact (sample)...")
+    if not _verify_sample(idx, nvfp4, fp8):
+        print("Error: re-pack verification FAILED", file=sys.stderr)
+        return 1
+
+    if args.verify_only or not args.dst:
+        return 0
+
+    output_path = Path(args.dst).expanduser()
+    if output_path.exists():
+        print(f"Error: output already exists: {output_path}", file=sys.stderr)
+        return 1
+
+    print(f"\ntranscoding -> {output_path}  (keep_mtp={args.keep_mtp})")
+    try:
+        transcode(
+            str(source), str(output_path),
+            limit_layers=args.limit_layers, keep_mtp=args.keep_mtp,
+        )
+    except KeyboardInterrupt:
+        import shutil
+        print("\nInterrupted — removing partial output.", file=sys.stderr)
+        shutil.rmtree(output_path, ignore_errors=True)
+        return 130
+    except Exception as e:
+        print(f"\nError: transcode failed: {e}", file=sys.stderr)
+        return 1
+
+    print("\nverifying WRITTEN checkpoint round-trips...")
+    ok = _verify_written(str(output_path), str(source))
+    print("  ALL WRITTEN BIT-EXACT:", ok)
+    out_bytes = sum(f.stat().st_size for f in output_path.glob("*.safetensors"))
+    print(f"\nDone: {output_path}  ({out_bytes / 1024**3:.2f} GB)")
+    return 0 if ok else 1
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="omlx: Production-ready LLM server for Apple Silicon",
@@ -948,6 +1023,43 @@ Examples:
         help="Disable automatic proxy sensitivity estimation",
     )
 
+    # Transcode command (NVIDIA modelopt NVFP4/FP8 -> MLX, lossless re-pack)
+    transcode_parser = subparsers.add_parser(
+        "transcode-nvfp4",
+        help="Loss-free transcode of an NVIDIA modelopt NVFP4/FP8 checkpoint to MLX",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="""
+Re-pack (NOT re-quantize) an NVIDIA modelopt NVFP4/FP8 checkpoint into MLX
+nvfp4/mxfp8 layout, bit-for-bit. Per-tensor FP32 global scales are emitted to
+omlx_meta/global_scales.safetensors and applied at load as a post-matmul output
+scale; the result loads + runs in `omlx serve` at the same ~4-bit size.
+
+Examples:
+  omlx transcode-nvfp4 ~/tmp/Qwen3.6-35B-A3B-NVFP4 ~/tmp/Qwen3.6-35B-A3B-NVFP4-mlx
+  omlx transcode-nvfp4 ~/tmp/Qwen3.6-35B-A3B-NVFP4 --verify-only
+  omlx transcode-nvfp4 SRC DST --keep-mtp
+        """,
+    )
+    transcode_parser.add_argument(
+        "src", type=str, help="Source modelopt NVFP4 checkpoint directory"
+    )
+    transcode_parser.add_argument(
+        "dst", type=str, nargs="?", default=None,
+        help="Output MLX checkpoint directory (omit with --verify-only)",
+    )
+    transcode_parser.add_argument(
+        "--verify-only", action="store_true",
+        help="Only verify the re-pack is bit-exact; write nothing",
+    )
+    transcode_parser.add_argument(
+        "--keep-mtp", action="store_true",
+        help="Keep the MTP head (bf16) for speculative decode (default: drop it)",
+    )
+    transcode_parser.add_argument(
+        "--limit-layers", type=int, default=None,
+        help="Only transcode layers < N (quick logic test)",
+    )
+
     # Use parse_known_args so `omlx launch <tool> -- ...` can forward unknown
     # tokens (e.g. `-r`, `--resume <id>`) to the underlying tool binary.
     # Non-launch commands keep the previous strictness by rejecting unknowns.
@@ -964,6 +1076,8 @@ Examples:
             sys.exit(diagnose_command(args))
         elif args.command == "quant":
             sys.exit(quant_command(args))
+        elif args.command == "transcode-nvfp4":
+            sys.exit(transcode_nvfp4_command(args))
         else:
             parser.print_help()
             sys.exit(1)

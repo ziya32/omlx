@@ -1034,9 +1034,27 @@ class VLMBatchedEngine(BaseEngine):
                 if custom_loaded is not None:
                     return custom_loaded
 
-                return vlm_load(
+                model, processor = vlm_load(
                     self._model_name, trust_remote_code=self._trust_remote_code
                 )
+                # NVFP4-transcoded checkpoints carry a per-Linear/per-expert
+                # global output-scale side-car (omlx_meta/global_scales.safetensors)
+                # that MLX's quantized_matmul/gather_qmm can't fold in. Patch the
+                # quantized forwards + attach the scales. No-op for any other
+                # checkpoint (gated on the side-car + on the per-module attr).
+                try:
+                    from ..patches import global_scale_runtime as _gsr
+                    side_car = (Path(self._model_name) / "omlx_meta"
+                                / "global_scales.safetensors")
+                    if side_car.exists():
+                        _gsr.apply()
+                        n = _gsr.attach_global_scales(model, self._model_name)
+                        logger.info(
+                            "NVFP4 global output-scales attached: %d modules", n
+                        )
+                except Exception as e:
+                    logger.debug("global-scale attach skipped: %s", e)
+                return model, processor
 
         loop = asyncio.get_running_loop()
         self._vlm_model, self._processor = await loop.run_in_executor(
