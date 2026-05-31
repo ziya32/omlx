@@ -78,6 +78,20 @@ class QuantPlan:
 
 
 
+def _is_qwen35_family(config: dict) -> bool:
+    """True for the Qwen3.5 / Qwen3.6 (incl. -moe) hybrid family.
+
+    These checkpoints ship an FP8 ``modules_to_not_convert`` recipe that keeps
+    the gated-delta SSM projections (``linear_attn`` in_proj / conv1d), the MoE
+    ``shared_expert_gate``, and the head / embeddings in full precision. oQ
+    mirrors that recipe for this family only, leaving every other architecture
+    on its default (more aggressive) quantization profile.
+    """
+    mt = config.get("model_type") or ""
+    tmt = (config.get("text_config") or {}).get("model_type") or ""
+    return any(s.startswith(("qwen3_5", "qwen3_6")) for s in (mt, tmt) if s)
+
+
 def universal_quant_predicate(
     path: str, module, config: dict, oq_level: int = 4
 ) -> Union[bool, dict]:
@@ -107,6 +121,22 @@ def universal_quant_predicate(
     non_quantizable = config.get("_oq_non_quantizable", set())
     if path in non_quantizable:
         return False
+
+    # Mirror the Qwen3.5/3.6 hybrid family's shipped FP8 modules_to_not_convert
+    # recipe: keep the gated-delta SSM projections (linear_attn in_proj/conv1d),
+    # the MoE shared_expert_gate, and the head/embeddings in full precision.
+    # Scoped to this family so no other architecture's profile changes. Runs
+    # only at quantization time — existing checkpoints load by their own stored
+    # per-tensor config and are unaffected.
+    if _is_qwen35_family(config):
+        if "linear_attn" in path_l and ("in_proj" in path_l or "conv1d" in path_l):
+            return False
+        if "shared_expert_gate" in path and "gate_proj" not in path:
+            return False
+        if any(t in path for t in ("lm_head", "output.weight")):
+            return False
+        if any(t in path for t in ("embed_tokens", "word_embeddings")):
+            return False
 
     tc = config.get("text_config", {})
     num_layers = config.get("num_hidden_layers") or tc.get("num_hidden_layers", 32)
@@ -1456,11 +1486,6 @@ def estimate_bpw_and_size(
     source_total = sum(
         sf.stat().st_size for sf in source.glob("*.safetensors")
     )
-    num_shards = len(list(source.glob("*.safetensors")))
-    max_shard_size = max(
-        (sf.stat().st_size for sf in source.glob("*.safetensors")),
-        default=0,
-    )
 
     streaming_peak = int(source_total * 1.5) + 5 * 1024**3
 
@@ -2412,7 +2437,6 @@ def quantize_oq_streaming(
     cb("loading", 20.0)
 
     tensor_names = list(all_weights.keys())
-    total_tensors = len(tensor_names)
     out_shard_data = {}
     out_shard_idx = 0
     weight_map = {}
