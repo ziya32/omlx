@@ -630,6 +630,35 @@ def _restore_or_trim_caches(prompt_cache: List[Any]) -> bool:
     return True
 
 
+def _eval_cache_state(prompt_cache: List[Any]) -> None:
+    """Force-materialize per-layer cache state to bound the Metal command buffer.
+
+    Called right after an MTP rollback so the ``gated_delta_update`` replay
+    forms its own command buffer instead of staying lazy and chaining into the
+    NEXT cycle's backbone forward. For a checkpoint carrying an output-scale
+    wrapper (transcoded NVFP4, ``omlx.patches.global_scale_runtime``), that
+    combined ``rollback + wrapper-laden forward`` buffer overflows the GPU
+    command-buffer limit -> GPU Hang (kIOGPUCommandBufferCallbackErrorHang).
+    The hang is sampling-rate-dependent: a low accept rate (temperature > 0)
+    rejects early and trips it on the first reject, while a high-accept greedy
+    run can slip past. Affine/non-wrapped checkpoints are unaffected.
+    """
+    import mlx.core as mx
+
+    arrays: list = []
+    for c in prompt_cache:
+        try:
+            st = c.state
+        except Exception:
+            continue
+        if isinstance(st, mx.array):
+            arrays.append(st)
+        elif isinstance(st, (tuple, list)):
+            arrays.extend(a for a in st if isinstance(a, mx.array))
+    if arrays:
+        mx.eval(*arrays)
+
+
 def _rollback_after_reject(
     model: Any,
     prompt_cache: List[Any],
@@ -662,6 +691,11 @@ def _rollback_after_reject(
         model.rollback_speculative_cache(
             prompt_cache, gdn_states, accepted, block_size
         )
+        # Bound the command buffer: materialize the rolled-back cache now so the
+        # replay does not chain into the next backbone forward (see
+        # _eval_cache_state). Without this, a wrapper-carrying checkpoint
+        # GPU-hangs on the cycle following a reject.
+        _eval_cache_state(prompt_cache)
         return True
     return _restore_or_trim_caches(prompt_cache)
 
@@ -689,7 +723,23 @@ def _call_backbone(
     kwargs = {"cache": cache, "return_hidden": True}
     if n_confirmed:
         kwargs["n_confirmed"] = n_confirmed
-    result = model(inputs, **kwargs)
+    # Bound the command buffer *within* this forward for output-scale-wrapped
+    # checkpoints (transcoded NVFP4): toggle the wrappers' per-multiply eval so
+    # the S=2 capture forward is chunked per quantized layer instead of fused
+    # into one buffer that overflows the GPU watchdog -> GPU Hang. No-op for
+    # ordinary checkpoints (no wrappers / flag unread). MTP-only path; normal
+    # decode never calls _call_backbone, so its single fused forward is intact.
+    try:
+        from omlx.patches.global_scale_runtime import set_force_eval
+    except Exception:
+        set_force_eval = None
+    if set_force_eval is not None:
+        set_force_eval(True)
+    try:
+        result = model(inputs, **kwargs)
+    finally:
+        if set_force_eval is not None:
+            set_force_eval(False)
     if isinstance(result, tuple):
         if len(result) == 3:
             return result
@@ -932,7 +982,23 @@ def _run_verify_cycle(gen_batch: Any, state: _MtpState) -> None:
         )
         verify_logits = logits[:, 0, :]
         bonus_logits = logits[:, 1, :]
-    mx.eval(logits)
+    # Flush the ENTIRE backbone capture forward (logits + hidden + the
+    # per-layer ``gdn_sink`` states), not just ``logits``. ``gdn_states``
+    # branches off this forward and is consumed later only on a draft
+    # rejection, by ``rollback_speculative_cache``. If left deferred, that
+    # rollback forces the whole S=2 capture graph *plus* the
+    # ``gated_delta_update`` replay into a single Metal command buffer; for a
+    # checkpoint carrying an output-scale wrapper (transcoded NVFP4, see
+    # ``omlx.patches.global_scale_runtime``) the extra per-quantized-layer ops
+    # push that buffer past the GPU command-buffer limit -> GPU Hang
+    # (kIOGPUCommandBufferCallbackErrorHang) a few cycles in (first rejection).
+    # Materializing the capture here keeps the rollback in its own bounded
+    # buffer. Affine/non-wrapped checkpoints are unaffected (smaller graph).
+    _bb = [logits, hidden]
+    if gdn_states:
+        for _s in gdn_states:
+            _bb.extend(a for a in _s if isinstance(a, mx.array))
+    mx.eval(*_bb)
     state.stats.backbone_ms += (time.perf_counter() - t0) * 1000
 
     t0 = time.perf_counter()

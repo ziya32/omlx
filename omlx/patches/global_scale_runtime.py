@@ -33,6 +33,27 @@ logger = logging.getLogger(__name__)
 
 _APPLIED = False
 
+# When set (by the MTP verify cycle, via set_force_eval), the output-scale
+# wrappers force an ``mx.eval`` after each multiply. This bounds the Metal
+# command buffer *within* the MTP speculative-verify backbone forward: that
+# forward runs S=2 with gdn_sink capture, and its op count grows with the KV
+# length; combined with the per-quantized-layer wrapper ops it eventually
+# overflows the GPU command-buffer limit -> GPU Hang
+# (kIOGPUCommandBufferCallbackErrorHang). Off by default so ordinary decode
+# (one bounded forward per step) keeps a single fused buffer with no eval
+# barrier. Only the MTP backbone forward toggles it on.
+_force_eval_buffers = False
+
+
+def set_force_eval(enabled: bool) -> None:
+    """Toggle per-multiply ``mx.eval`` in the output-scale wrappers.
+
+    The MTP verify cycle wraps its backbone forward with this so the wrapper
+    breaks the command buffer per layer; everything else leaves it off.
+    """
+    global _force_eval_buffers
+    _force_eval_buffers = bool(enabled)
+
 
 def apply() -> bool:
     """Monkey-patch the quantized forwards to honor ``_omlx_global_scale``. Idempotent."""
@@ -40,6 +61,7 @@ def apply() -> bool:
     if _APPLIED:
         return True
 
+    import mlx.core as mx
     import mlx.nn as nn
 
     # 1) QuantizedLinear -- scalar output scale
@@ -50,7 +72,12 @@ def apply() -> bool:
         def _ql_call(self, x):
             y = _orig(self, x)
             g = getattr(self, "_omlx_global_scale", None)
-            return y * g if g is not None else y
+            if g is None:
+                return y
+            out = y * g
+            if _force_eval_buffers:
+                mx.async_eval(out)
+            return out
 
         QL.__call__ = _ql_call
         QL._omlx_gscale_patched = True
@@ -68,11 +95,14 @@ def apply() -> bool:
         def _qsl_call(self, x, indices, sorted_indices=False):
             y = _orig_s(self, x, indices, sorted_indices=sorted_indices)
             g = getattr(self, "_omlx_global_scale", None)
-            if g is not None:
-                gi = g[indices]
-                gi = gi.reshape(gi.shape + (1,) * (y.ndim - gi.ndim))
-                y = y * gi
-            return y
+            if g is None:
+                return y
+            gi = g[indices]
+            gi = gi.reshape(gi.shape + (1,) * (y.ndim - gi.ndim))
+            out = y * gi
+            if _force_eval_buffers:
+                mx.async_eval(out)
+            return out
 
         QSL.__call__ = _qsl_call
         QSL._omlx_gscale_patched = True
