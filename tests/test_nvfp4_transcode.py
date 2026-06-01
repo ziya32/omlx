@@ -338,6 +338,11 @@ def test_transcoded_model_loads_and_generates():
         pytest.skip("set OMLX_NVFP4_TEST_MODEL to a transcoded NVFP4 checkpoint dir")
     model_dir = os.path.expanduser(model_dir)
 
+    # Real-model load+infer needs the GPU (the module pins CPU for the fast unit
+    # tests; mlx-vlm's generate reads Metal-only device_info). This test runs
+    # last, so flipping the default device here doesn't affect the others.
+    mx.set_default_device(mx.gpu)
+
     from omlx.utils.model_loading import (
         maybe_apply_pre_load_patches,
         maybe_attach_global_scales,
