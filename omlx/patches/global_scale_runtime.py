@@ -33,27 +33,6 @@ logger = logging.getLogger(__name__)
 
 _APPLIED = False
 
-# When set (by the MTP verify cycle, via set_force_eval), the output-scale
-# wrappers force an ``mx.eval`` after each multiply. This bounds the Metal
-# command buffer *within* the MTP speculative-verify backbone forward: that
-# forward runs S=2 with gdn_sink capture, and its op count grows with the KV
-# length; combined with the per-quantized-layer wrapper ops it eventually
-# overflows the GPU command-buffer limit -> GPU Hang
-# (kIOGPUCommandBufferCallbackErrorHang). Off by default so ordinary decode
-# (one bounded forward per step) keeps a single fused buffer with no eval
-# barrier. Only the MTP backbone forward toggles it on.
-_force_eval_buffers = False
-
-
-def set_force_eval(enabled: bool) -> None:
-    """Toggle per-multiply ``mx.eval`` in the output-scale wrappers.
-
-    The MTP verify cycle wraps its backbone forward with this so the wrapper
-    breaks the command buffer per layer; everything else leaves it off.
-    """
-    global _force_eval_buffers
-    _force_eval_buffers = bool(enabled)
-
 
 def apply() -> bool:
     """Monkey-patch the quantized forwards to honor ``_omlx_global_scale``. Idempotent."""
@@ -75,8 +54,18 @@ def apply() -> bool:
             if g is None:
                 return y
             out = y * g
-            if _force_eval_buffers:
-                mx.async_eval(out)
+            # Bound the Metal command buffer on MULTI-TOKEN forwards (prefill,
+            # MTP verify). The wrapper's extra per-layer ops let a big forward
+            # accumulate into one command buffer that trips the GPU watchdog ->
+            # kIOGPUCommandBufferCallbackErrorHang -> mlx::gpu::check_error throws
+            # on the Metal completion thread -> abort() crashes the whole server
+            # (uncatchable in Python). A *blocking* eval forces each layer's
+            # buffer to complete before the next, capping its size (async_eval
+            # only submits, so buffers pile up and still hang). Single-token
+            # decode (x is one vector) skips it and stays fast. No-op for
+            # non-transcoded models (gated on the global-scale attr above).
+            if x.size > x.shape[-1]:
+                mx.eval(out)
             return out
 
         QL.__call__ = _ql_call
@@ -100,8 +89,8 @@ def apply() -> bool:
             gi = g[indices]
             gi = gi.reshape(gi.shape + (1,) * (y.ndim - gi.ndim))
             out = y * gi
-            if _force_eval_buffers:
-                mx.async_eval(out)
+            if x.size > x.shape[-1]:   # multi-token forward -> cap the buffer (see _ql_call)
+                mx.eval(out)
             return out
 
         QSL.__call__ = _qsl_call

@@ -723,23 +723,10 @@ def _call_backbone(
     kwargs = {"cache": cache, "return_hidden": True}
     if n_confirmed:
         kwargs["n_confirmed"] = n_confirmed
-    # Bound the command buffer *within* this forward for output-scale-wrapped
-    # checkpoints (transcoded NVFP4): toggle the wrappers' per-multiply eval so
-    # the S=2 capture forward is chunked per quantized layer instead of fused
-    # into one buffer that overflows the GPU watchdog -> GPU Hang. No-op for
-    # ordinary checkpoints (no wrappers / flag unread). MTP-only path; normal
-    # decode never calls _call_backbone, so its single fused forward is intact.
-    try:
-        from omlx.patches.global_scale_runtime import set_force_eval
-    except Exception:
-        set_force_eval = None
-    if set_force_eval is not None:
-        set_force_eval(True)
-    try:
-        result = model(inputs, **kwargs)
-    finally:
-        if set_force_eval is not None:
-            set_force_eval(False)
+    # The output-scale wrapper (transcoded NVFP4) self-bounds the command buffer
+    # on multi-token forwards (the S=2 verify here qualifies), so no MTP-specific
+    # toggling is needed -- see omlx.patches.global_scale_runtime.
+    result = model(inputs, **kwargs)
     if isinstance(result, tuple):
         if len(result) == 3:
             return result
