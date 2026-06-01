@@ -372,3 +372,101 @@ def test_transcoded_model_loads_and_generates():
     res = generate(model, processor, prompt, max_tokens=16, verbose=False)
     text = getattr(res, "text", res)
     assert isinstance(text, str) and text.strip(), "expected non-empty generation"
+
+
+# ---------------------------------------------------------------------------
+# Live omlx-server chat (regression guard for the global-scale-wrapper GPU Hang
+# that crashed the whole server process on a large prefill). Starts a real
+# `omlx serve` subprocess, chats via the HTTP API -- including a large prompt --
+# and asserts the server stays up. Gated on OMLX_NVFP4_TEST_MODEL + slow/integration.
+#   OMLX_NVFP4_TEST_MODEL=~/tmp/Qwen3.6-35B-A3B-NVFP4-mtp \
+#     pytest -m "slow and integration" tests/test_nvfp4_transcode.py
+# ---------------------------------------------------------------------------
+
+@pytest.mark.slow
+@pytest.mark.integration
+def test_live_server_chat_large_prompt_no_crash(tmp_path):
+    import socket
+    import subprocess
+    import sys
+    import time
+    import urllib.request
+
+    src = os.environ.get("OMLX_NVFP4_TEST_MODEL", "")
+    if not src or not os.path.isdir(os.path.expanduser(src)):
+        pytest.skip("set OMLX_NVFP4_TEST_MODEL to a transcoded NVFP4 checkpoint dir")
+    src = os.path.expanduser(src.rstrip("/"))
+    model_id = os.path.basename(src)
+
+    # isolated base_path: a models dir holding a symlink to the checkpoint
+    base = tmp_path / "omlx_home"
+    models = base / "models"
+    models.mkdir(parents=True)
+    (models / model_id).symlink_to(src)
+    (base / "settings.json").write_text(json.dumps({
+        "version": "1.0",
+        "server": {"host": "127.0.0.1", "port": 0, "log_level": "warning"},
+        "model": {"model_dirs": [str(models)], "model_dir": str(models)},
+        "auth": {"skip_api_key_verification": True},
+        "discovery": {"enabled": False},
+    }))
+
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    base_url = f"http://127.0.0.1:{port}"
+
+    serve_out = open(base / "serve.out", "w")
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "omlx.cli", "serve",
+         "--base-path", str(base), "--port", str(port), "--log-level", "warning"],
+        stdout=serve_out, stderr=subprocess.STDOUT,
+    )
+
+    def chat(prompt, max_tokens):
+        body = json.dumps({
+            "model": model_id,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens, "temperature": 0.0,
+        }).encode()
+        req = urllib.request.Request(
+            f"{base_url}/v1/chat/completions", data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=300) as r:
+            return json.loads(r.read())
+
+    try:
+        # wait for the server to accept connections (model loads lazily on first chat)
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            if proc.poll() is not None:
+                pytest.fail(f"server exited during startup (code {proc.returncode})")
+            try:
+                urllib.request.urlopen(f"{base_url}/v1/models", timeout=3).read()
+                break
+            except Exception:
+                time.sleep(2)
+        else:
+            pytest.fail("server did not become ready within 120s")
+
+        # 1) small prompt: triggers the load, returns a valid completion
+        d = chat("Name the capital of France.", 16)
+        assert d["choices"][0]["message"]["content"].strip()
+
+        # 2) LARGE prompt: the regression case. Without the command-buffer cap
+        #    this prefill GPU-hangs and aborts the server process.
+        big = "Summarize this:\n" + ("The quick brown fox jumps over the lazy dog near the riverbank. " * 800) + "\nSummarize it."
+        d = chat(big, 64)
+        assert d["choices"][0]["message"]["content"].strip()
+
+        # server must still be alive (no GPU-hang abort)
+        assert proc.poll() is None, "server process crashed during chat"
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=30)
+        except Exception:
+            proc.kill()
+        serve_out.close()
