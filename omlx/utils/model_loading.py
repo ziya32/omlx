@@ -504,6 +504,20 @@ def maybe_load_custom_quantization(
     if not quant_method:
         return None
 
+    if quant_method.lower() == "modelopt":
+        # NVIDIA modelopt NVFP4/FP8 isn't an MLX-loadable format (its weights
+        # are E2M1 nibbles + separate weight_scale / weight_scale_2 / input_scale
+        # tensors, and the vision model_type carries a "_vision" suffix). Loading
+        # it directly fails deep in mlx-vlm / mlx-lm with a confusing "Unsupported
+        # model type" / "parameters not in model". Fail fast with the fix instead.
+        raise ValueError(
+            f"{model_name} is an NVIDIA modelopt checkpoint "
+            f"(quant_method=modelopt, quant_algo={quant_config.get('quant_algo', '?')}). "
+            f"omlx cannot load modelopt NVFP4/FP8 directly -- re-pack it to MLX first:\n"
+            f"    omlx transcode-nvfp4 '{model_name}' <output_dir> --keep-mtp\n"
+            f"then load <output_dir> (the transcoded copy) instead."
+        )
+
     if quant_method.lower() == "paroquant":
         try:
             from paroquant.inference.backends.mlx.load import load as paro_load
