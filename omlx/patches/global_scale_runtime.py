@@ -42,6 +42,15 @@ _APPLIED = False
 # token decode skips both. The S=2 verify has n_tokens=2, comfortably below this.
 _BLOCKING_EVAL_TOKENS = 8
 
+# Single-token decode accumulates deferred wrapper work that GPU-hangs the server
+# after ~100 forwards (cumulative across requests, even with per-step sampling).
+# A small periodic *blocking* eval drains it. It fires once every N wrapped layers
+# -- i.e. roughly every few decoded tokens (a decode forward touches a few hundred
+# wrapped layers) -- so the per-token cost is negligible while the accumulation
+# stays bounded well below the hang threshold.
+_DECODE_FLUSH_EVERY = 1024
+_decode_flush_counter = 0
+
 
 def apply() -> bool:
     """Monkey-patch the quantized forwards to honor ``_omlx_global_scale``. Idempotent."""
@@ -72,6 +81,11 @@ def apply() -> bool:
                 mx.eval(out)
             elif n_tokens > 1:
                 mx.async_eval(out)
+            else:
+                global _decode_flush_counter
+                _decode_flush_counter += 1
+                if _decode_flush_counter % _DECODE_FLUSH_EVERY == 0:
+                    mx.eval(out)   # periodic decode drain (see _DECODE_FLUSH_EVERY)
             return out
 
         QL.__call__ = _ql_call
@@ -100,6 +114,11 @@ def apply() -> bool:
                 mx.eval(out)
             elif n_tokens > 1:
                 mx.async_eval(out)
+            else:
+                global _decode_flush_counter
+                _decode_flush_counter += 1
+                if _decode_flush_counter % _DECODE_FLUSH_EVERY == 0:
+                    mx.eval(out)
             return out
 
         QSL.__call__ = _qsl_call
