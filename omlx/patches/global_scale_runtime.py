@@ -33,6 +33,15 @@ logger = logging.getLogger(__name__)
 
 _APPLIED = False
 
+# Multi-token forwards past this many tokens use a *blocking* ``mx.eval`` to cap
+# the Metal command buffer (a large prefill otherwise builds one buffer big
+# enough to trip the GPU watchdog -> hang -> abort -> server crash; async_eval
+# only submits, so big buffers still pile up on the completion queue and hang).
+# Smaller multi-token forwards -- chiefly the S=2 MTP verify -- are safely bounded
+# by the much cheaper non-blocking ``async_eval``, which keeps MTP fast. Single-
+# token decode skips both. The S=2 verify has n_tokens=2, comfortably below this.
+_BLOCKING_EVAL_TOKENS = 8
+
 
 def apply() -> bool:
     """Monkey-patch the quantized forwards to honor ``_omlx_global_scale``. Idempotent."""
@@ -54,18 +63,15 @@ def apply() -> bool:
             if g is None:
                 return y
             out = y * g
-            # Bound the Metal command buffer on MULTI-TOKEN forwards (prefill,
-            # MTP verify). The wrapper's extra per-layer ops let a big forward
-            # accumulate into one command buffer that trips the GPU watchdog ->
-            # kIOGPUCommandBufferCallbackErrorHang -> mlx::gpu::check_error throws
-            # on the Metal completion thread -> abort() crashes the whole server
-            # (uncatchable in Python). A *blocking* eval forces each layer's
-            # buffer to complete before the next, capping its size (async_eval
-            # only submits, so buffers pile up and still hang). Single-token
-            # decode (x is one vector) skips it and stays fast. No-op for
-            # non-transcoded models (gated on the global-scale attr above).
-            if x.size > x.shape[-1]:
+            # Cap the Metal command buffer (see _BLOCKING_EVAL_TOKENS): blocking
+            # eval for large forwards (prefill), cheap async for the small MTP
+            # verify, nothing for single-token decode. Gated on the global-scale
+            # attr above, so non-transcoded models never reach here.
+            n_tokens = x.size // x.shape[-1]
+            if n_tokens > _BLOCKING_EVAL_TOKENS:
                 mx.eval(out)
+            elif n_tokens > 1:
+                mx.async_eval(out)
             return out
 
         QL.__call__ = _ql_call
@@ -89,8 +95,11 @@ def apply() -> bool:
             gi = g[indices]
             gi = gi.reshape(gi.shape + (1,) * (y.ndim - gi.ndim))
             out = y * gi
-            if x.size > x.shape[-1]:   # multi-token forward -> cap the buffer (see _ql_call)
+            n_tokens = x.size // x.shape[-1]   # cap the buffer (see _ql_call)
+            if n_tokens > _BLOCKING_EVAL_TOKENS:
                 mx.eval(out)
+            elif n_tokens > 1:
+                mx.async_eval(out)
             return out
 
         QSL.__call__ = _qsl_call
