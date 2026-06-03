@@ -87,13 +87,17 @@ _ACTIVE_GRACE_SEC: float = 3.0
 # slop/fragmentation, the reservation-vs-max(active,phys) drift, and small
 # un-reserved temporaries. Overridable for calibration. 2 GiB on a 64 GB box
 # leaves the budget ~2 GiB below get_effective_metal_cap_bytes().
-# Headroom below the hard Metal wall reserved for inference working sets. Sized
-# so a non-streaming op's reservation FORCES eviction of a coexisting non-pinned
-# model rather than decoding on top of it (the 2-TTS OOM, 2026-06-02): leaves
-# room for the decode transient (~3.76 GB) plus the estimate-vs-actual
-# (phys_footprint / fragmentation) drift. The reservation accounting keeps the
-# actual peak under the wall even when two decode transients stack (MLX cache=0).
-_INFERENCE_MARGIN_BYTES: int = 4 * 1024**3
+# Headroom below the hard Metal wall reserved for inference working sets, so a
+# non-streaming op's reservation FORCES eviction of a coexisting non-pinned model
+# rather than decoding on top of it (the 2-TTS OOM, 2026-06-02). RAM-PROPORTIONAL
+# (a fraction of the wall, clamped): ~4 GiB on a 64 GB Mac's ~52 GiB wall (the
+# validated value), but it does not starve a 16-32 GB box (where a fixed 4 GiB
+# would be 17-33% of the wall) nor bloat a 128-256 GB one. It covers the
+# estimate-vs-actual (phys_footprint / fragmentation) drift + allocator slop; the
+# decode transient itself is reserved separately, so the margin need not cover it.
+_INFERENCE_MARGIN_FRACTION: float = 0.08        # ~4 GiB at a 64 GB Mac's ~52 GiB wall
+_INFERENCE_MARGIN_MIN_BYTES: int = 2 * 1024**3  # floor: enough for drift on small boxes
+_INFERENCE_MARGIN_MAX_BYTES: int = 8 * 1024**3  # cap: a transient does not grow with RAM
 
 
 class EngineState(Enum):
@@ -299,19 +303,34 @@ class EnginePool:
         """Resident weights (existing) + in-flight inference transients."""
         return self._committed_memory() + self._inflight_reservations
 
+    def _inference_margin_bytes(self, cap: int) -> int:
+        """RAM-proportional headroom below the Metal wall (see module constants).
+
+        ``clamp(cap * fraction, min, max)`` — scales with the wall so it is the
+        validated ~4 GiB on a 64 GB Mac, ~2 GiB (floor) on a 16-32 GB box, and
+        ~8 GiB (cap) on a 128-256 GB one.
+        """
+        return max(
+            _INFERENCE_MARGIN_MIN_BYTES,
+            min(_INFERENCE_MARGIN_MAX_BYTES, int(cap * _INFERENCE_MARGIN_FRACTION)),
+        )
+
     def _wall_budget(self) -> int:
         """Inference budget = Metal wall − margin. 0 ⇒ no real cap ⇒ no-op.
 
         References the per-process Metal wall
         (``get_effective_metal_cap_bytes()``) — the value above which Metal
         rejects/panics — NOT the adaptive ceiling (which adapts up toward
-        the wall and would re-introduce coexistence thrash). Returns 0 when
-        the cap accessor returns 0 (non-Apple / older macOS), which makes
+        the wall and would re-introduce coexistence thrash). The margin is
+        RAM-proportional (``_inference_margin_bytes``). Returns 0 when the cap
+        accessor returns 0 (non-Apple / older macOS), making
         ``reserve_inference`` a strict no-op.
         """
         from .process_memory_enforcer import get_effective_metal_cap_bytes
         cap = get_effective_metal_cap_bytes()
-        return max(0, cap - _INFERENCE_MARGIN_BYTES) if cap > 0 else 0
+        if cap <= 0:
+            return 0
+        return max(0, cap - self._inference_margin_bytes(cap))
 
     def _scheduler_inflight_bytes(self) -> int:
         """Live LLM/VLM scheduler generation transient (§3e); 0 if unwired.

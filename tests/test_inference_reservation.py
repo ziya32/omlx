@@ -23,7 +23,6 @@ import pytest
 from omlx.engine.base import BaseNonStreamingEngine
 from omlx.engine.tts import TTSEngine
 from omlx.engine_pool import (
-    _INFERENCE_MARGIN_BYTES,
     EngineEntry,
     EnginePool,
     EngineState,
@@ -130,7 +129,16 @@ class TestReservationAccounting:
     def test_wall_budget_subtracts_margin(self, monkeypatch):
         pool = _make_pool()
         _patch_cap(monkeypatch, 50 * GiB)
-        assert pool._wall_budget() == 50 * GiB - _INFERENCE_MARGIN_BYTES
+        assert pool._wall_budget() == 50 * GiB - pool._inference_margin_bytes(50 * GiB)
+
+    def test_margin_scales_with_wall(self):
+        pool = _make_pool()
+        # 64 GB Mac (~52 GiB wall): the validated ~4 GiB (0.08 * 52 ≈ 4.16).
+        assert pool._inference_margin_bytes(52 * GiB) == int(52 * GiB * 0.08)
+        # Small 16-32 GB box: clamped to the 2 GiB floor (0.08 * 24 = 1.9 < 2).
+        assert pool._inference_margin_bytes(24 * GiB) == 2 * GiB
+        # Large 128-256 GB box: clamped to the 8 GiB cap (0.08 * 192 = 15.4 > 8).
+        assert pool._inference_margin_bytes(192 * GiB) == 8 * GiB
 
     def test_wall_budget_zero_when_no_cap(self, monkeypatch):
         pool = _make_pool()
@@ -144,7 +152,7 @@ class TestReservationAccounting:
         pool._inflight_reservations = 2 * GiB
         # free = (cap - margin) - committed(40) - reservations(2)
         assert pool._reservable_free() == (
-            50 * GiB - _INFERENCE_MARGIN_BYTES - 40 * GiB - 2 * GiB
+            50 * GiB - pool._inference_margin_bytes(50 * GiB) - 40 * GiB - 2 * GiB
         )
 
     @pytest.mark.asyncio
