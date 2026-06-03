@@ -16,6 +16,7 @@ Supported model families (mlx-audio >=0.4.0):
 """
 
 import asyncio
+import contextlib
 import logging
 import os
 import tempfile
@@ -396,20 +397,34 @@ class STSEngine(BaseNonStreamingEngine):
             metadata={"file_size_bytes": file_size, "family": family},
         )
         try:
-            loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(get_mlx_executor(), _process_sync)
-            # Discard result if the enforcer aborted us while the MLX
-            # kernel was running on the executor thread.
-            self._raise_if_aborted()
+            # Reserve the forward-pass transient against the Metal wall (§3d).
+            # No-op without a Metal cap / pool; guarded + released every path.
+            async with contextlib.AsyncExitStack() as _reserve_stack:
+                if self._pool is not None:
+                    await _reserve_stack.enter_async_context(
+                        self._pool.reserve_inference(
+                            self.model_name,
+                            self.estimate_working_set_bytes(),
+                        )
+                    )
+                loop = asyncio.get_running_loop()
+                result = await loop.run_in_executor(get_mlx_executor(), _process_sync)
+                # Discard result if the enforcer aborted us while the MLX
+                # kernel was running on the executor thread.
+                self._raise_if_aborted()
 
-            elapsed = time.monotonic() - t0
-            logger.info(
-                "STS process done: model=%s, %.2fs, %d bytes output",
-                self._model_name, elapsed, len(result),
-            )
-            return result
+                elapsed = time.monotonic() - t0
+                logger.info(
+                    "STS process done: model=%s, %.2fs, %d bytes output",
+                    self._model_name, elapsed, len(result),
+                )
+                return result
         finally:
             await self._finish_activity(activity_id)
+
+    def estimate_working_set_bytes(self, **call_kwargs: Any) -> int:
+        """Single-forward STS transient ≈ 0.08 × weights (§4)."""
+        return self._estimate_forward_working_set_bytes()
 
     def get_stats(self) -> Dict[str, Any]:
         """Get engine statistics."""

@@ -82,6 +82,19 @@ ENFORCER_ABORT_RETRY_BACKOFF = 2.0
 # pressure.
 _ACTIVE_GRACE_SEC: float = 3.0
 
+# Safety margin subtracted from the Metal wall when budgeting in-flight
+# non-streaming inference transients (reserve_inference). Covers allocator
+# slop/fragmentation, the reservation-vs-max(active,phys) drift, and small
+# un-reserved temporaries. Overridable for calibration. 2 GiB on a 64 GB box
+# leaves the budget ~2 GiB below get_effective_metal_cap_bytes().
+# Headroom below the hard Metal wall reserved for inference working sets. Sized
+# so a non-streaming op's reservation FORCES eviction of a coexisting non-pinned
+# model rather than decoding on top of it (the 2-TTS OOM, 2026-06-02): leaves
+# room for the decode transient (~3.76 GB) plus the estimate-vs-actual
+# (phys_footprint / fragmentation) drift. The reservation accounting keeps the
+# actual peak under the wall even when two decode transients stack (MLX cache=0).
+_INFERENCE_MARGIN_BYTES: int = 4 * 1024**3
+
 
 class EngineState(Enum):
     """Lifecycle state for a model engine."""
@@ -196,6 +209,16 @@ class EnginePool:
         self._timeout_counter: int = 0
         # Track deferred engine cleanup tasks so shutdown can wait for them
         self._cleanup_tasks: list[asyncio.Task] = []
+        # In-flight non-streaming inference working-set reservation (bytes).
+        # Joined into the SAME committed total load admission reads
+        # (_committed_plus_reservations), so model loads and non-streaming
+        # inference size themselves against each other symmetrically under
+        # this one lock. Incremented at admission by reserve_inference(),
+        # subtracted in its finally; read by the scheduler's predictive
+        # generation guard via a synchronous callback (§3e). Read/written
+        # only under self._lock; the scheduler read is a lock-free atomic
+        # int load (GIL-safe).
+        self._inflight_reservations: int = 0
 
     # -------------------------------------------------------------------------
     # State transition helpers
@@ -264,6 +287,57 @@ class EnginePool:
                 EngineState.ACTIVE, EngineState.DRAINING,
                 EngineState.LOADING, EngineState.UNLOADING,
             )
+        )
+
+    # -- In-flight inference reservation accounting (§3a) ------------------
+    # One number, one lock: resident model weights (_committed_memory) plus
+    # the working-set transient of in-flight non-streaming inference
+    # (_inflight_reservations). Load admission and inference admission both
+    # size against this total, so each sees the other's commitment.
+
+    def _committed_plus_reservations(self) -> int:
+        """Resident weights (existing) + in-flight inference transients."""
+        return self._committed_memory() + self._inflight_reservations
+
+    def _wall_budget(self) -> int:
+        """Inference budget = Metal wall − margin. 0 ⇒ no real cap ⇒ no-op.
+
+        References the per-process Metal wall
+        (``get_effective_metal_cap_bytes()``) — the value above which Metal
+        rejects/panics — NOT the adaptive ceiling (which adapts up toward
+        the wall and would re-introduce coexistence thrash). Returns 0 when
+        the cap accessor returns 0 (non-Apple / older macOS), which makes
+        ``reserve_inference`` a strict no-op.
+        """
+        from .process_memory_enforcer import get_effective_metal_cap_bytes
+        cap = get_effective_metal_cap_bytes()
+        return max(0, cap - _INFERENCE_MARGIN_BYTES) if cap > 0 else 0
+
+    def _scheduler_inflight_bytes(self) -> int:
+        """Live LLM/VLM scheduler generation transient (§3e); 0 if unwired.
+
+        Read through the existing ``_process_memory_enforcer`` reference,
+        which already resolves every scheduler. A TTS decode admitting while
+        a batched prefill is live sees that transient and evicts/waits
+        instead of stacking over the wall.
+        """
+        enf = self._process_memory_enforcer
+        if enf is None:
+            return 0
+        getter = getattr(enf, "get_scheduler_inflight_bytes", None)
+        if getter is None:
+            return 0
+        try:
+            return int(getter())
+        except Exception:  # noqa: BLE001
+            return 0
+
+    def _reservable_free(self) -> int:
+        """Room for a NEW in-flight transient under the wall budget."""
+        return (
+            self._wall_budget()
+            - self._committed_plus_reservations()
+            - self._scheduler_inflight_bytes()
         )
 
     def _current_ceiling(self) -> int:
@@ -1339,7 +1413,11 @@ class EnginePool:
         if entry.model_type not in ("audio_stt", "audio_tts", "audio_sts", "embedding", "reranker"):
             required += int(entry.estimated_size * 0.25)  # KV headroom
 
-        while self._committed_memory() + required > ceiling:
+        # Reservation-aware (§3b): size against committed weights PLUS
+        # in-flight inference transients so a load that would collide with an
+        # outstanding non-streaming decode evicts/waits instead of committing
+        # weights over the wall (closes the load↔inference race).
+        while self._committed_plus_reservations() + required > ceiling:
             victim_id = self._find_drain_or_evict_candidate()
             if victim_id is None:
                 # Can't evict anything. Find a draining model to wait on.
@@ -1360,11 +1438,15 @@ class EnginePool:
                 # Nothing draining, loading, or unloading.
                 # Try without KV headroom as a last resort
                 required_no_headroom = entry.estimated_size
-                if self._committed_memory() + required_no_headroom <= ceiling:
+                if (
+                    self._committed_plus_reservations() + required_no_headroom
+                    <= ceiling
+                ):
                     logger.info(
                         f"Loading {entry.model_id} without KV headroom "
                         f"(need {format_size(required)}, "
-                        f"available {format_size(ceiling - self._committed_memory())})"
+                        f"available "
+                        f"{format_size(ceiling - self._committed_plus_reservations())})"
                     )
                     break  # Proceed without headroom
 
@@ -1419,7 +1501,15 @@ class EnginePool:
             # consistent. psutil/active-memory underreports IOAccelerator-
             # backed Metal on Apple Silicon UMA (95 GB gap on 31B+32k).
             current_active = max(mx.get_active_memory(), get_phys_footprint())
-            projected = current_active + entry.estimated_size
+            # Reservation-aware (§3b): add outstanding inference transients so
+            # a load racing a non-streaming decode evicts/waits. current_active
+            # = max(active, phys) may already include a *materialized*
+            # transient, so this can double-count — deliberately conservative
+            # (errs toward evicting a racing load, never toward OOM).
+            projected = (
+                current_active + entry.estimated_size
+                + self._inflight_reservations
+            )
             if projected <= enforcer.get_final_ceiling():
                 return None
 
@@ -1471,7 +1561,12 @@ class EnginePool:
             # All cleanup done. Re-check actual Metal memory — Metal's
             # allocator may not have reclaimed pages even after clear_cache.
             current_active = max(mx.get_active_memory(), get_phys_footprint())
-            projected = current_active + entry.estimated_size
+            # Reservation-aware (§3b): same conservative term as the initial
+            # projection above so both reads agree under a live decode.
+            projected = (
+                current_active + entry.estimated_size
+                + self._inflight_reservations
+            )
             if projected <= enforcer.get_final_ceiling():
                 logger.info(
                     f"Process memory after cleanup: "
@@ -1505,7 +1600,9 @@ class EnginePool:
             # Projected memory still too high. Check if committed model
             # weights alone fit and the overshoot is modest (within 25%
             # headroom). Metal may reuse freed pages during the load.
-            committed = self._committed_memory()
+            # Reservation-aware (§3b): include outstanding inference
+            # transients so a load can't slip in under a live decode.
+            committed = self._committed_plus_reservations()
             headroom = int(enforcer.get_final_ceiling() * 0.25)
             if (
                 committed + entry.estimated_size <= enforcer.get_final_ceiling()
@@ -1660,10 +1757,18 @@ class EnginePool:
     # Victim selection
     # -------------------------------------------------------------------------
 
-    def _find_drain_or_evict_candidate(self) -> str | None:
+    def _find_drain_or_evict_candidate(
+        self, exclude_model_id: str | None = None
+    ) -> str | None:
         """
         Find the least recently used non-pinned loaded model suitable for
         eviction or draining. Skips models already in DRAINING or UNLOADING state.
+
+        ``exclude_model_id`` is skipped during candidate selection (used by
+        inference admission to exclude the op's OWN engine). It must be excluded
+        HERE, not dropped from the single returned result, or a caller whose own
+        engine is the LRU gets ``None`` and misses other evictable models (the
+        2026-06-02 best-effort-OOM bug).
 
         Prefers idle models over models with active requests or active
         use-count (request handlers that have acquired the engine via
@@ -1689,6 +1794,8 @@ class EnginePool:
         now = time.time()
         candidates = []
         for mid, e in self._entries.items():
+            if mid == exclude_model_id:
+                continue  # never evict the caller's own engine
             if e.engine is None or e.is_pinned:
                 continue
             if e.state in (
@@ -1710,6 +1817,201 @@ class EnginePool:
             return None
         candidates.sort()  # (False, old_time) sorts before (True, old_time)
         return candidates[0][2]
+
+    # -- In-flight inference admission (§3a / §3c) -------------------------
+
+    def _pick_inference_victim(self, model_id: str) -> str | None:
+        """LRU non-pinned victim to evict for an inference reservation.
+
+        Delegates to ``_find_drain_or_evict_candidate`` with the op's OWN model
+        EXCLUDED from selection (it already skips ``is_pinned`` + lifecycle).
+        Excluding here (not dropping the single returned result) is essential:
+        the op holds its ``acquire_engine`` lease, so its engine is often the
+        LRU; a drop-after-pick would then return None and miss other evictable
+        models, sending the op to best-effort → Metal OOM (2026-06-02). Called
+        under self._lock.
+        """
+        return self._find_drain_or_evict_candidate(exclude_model_id=model_id)
+
+    def _victim_busy(self, model_id: str) -> bool:
+        """Whether an eviction victim has in-flight work (drain, don't kill).
+
+        Mirrors the busy check inlined in ``_prepare_memory_for``. Called
+        under self._lock.
+        """
+        victim = self._entries.get(model_id)
+        if victim is None or victim.engine is None:
+            return False
+        return victim.engine.has_active_requests() or victim.active_uses > 0
+
+    def _pending_reclaim_event(
+        self, exclude_model_id: str | None = None
+    ) -> asyncio.Event | None:
+        """First in-flight reclaim event to await: UNLOADING, DRAINING, then a
+        LOADING non-pinned model (wait for the load, then a re-loop evicts it).
+
+        Used by ``reserve_inference`` when nothing non-pinned can be picked
+        as a fresh victim but a reclaim (or a load that will become evictable)
+        is already underway — wait for it
+        (the freed weights drop out of ``_committed_memory`` once cleanup
+        completes) rather than admitting best-effort over the wall. Mirrors
+        the UNLOADING/DRAINING wait fall-throughs in ``_prepare_memory_for``.
+        Called under self._lock.
+
+        ``exclude_model_id`` is skipped: a non-streaming op must NEVER wait on
+        the reclaim of its OWN engine. It holds that engine's ``active_uses``
+        lease, so the drain/unload cannot complete until the op finishes —
+        waiting on it here would deadlock the op against its own completion
+        (the 2026-06-02 exclusive-headroom-drain livelock).
+        """
+        for mid, e in self._entries.items():
+            if mid == exclude_model_id:
+                continue
+            if e.state == EngineState.UNLOADING and e.unload_complete is not None:
+                return e.unload_complete
+        for mid, e in self._entries.items():
+            if mid == exclude_model_id:
+                continue
+            if e.state == EngineState.DRAINING and e.drain_complete is not None:
+                return e.drain_complete
+        # A non-pinned model still LOADING is not evictable YET, but it will be
+        # once loaded — wait for it, then a re-loop evicts it. Without this, a
+        # concurrent load (e.g. an Embedding request) that commits memory an
+        # in-flight TTS decode cannot reclaim sends the op to best-effort →
+        # Metal OOM (the 2026-06-02 single-shot crash). Skip pinned (never an
+        # eviction victim) and self.
+        for mid, e in self._entries.items():
+            if mid == exclude_model_id or e.is_pinned:
+                continue
+            if e.state == EngineState.LOADING and e.ready_event is not None:
+                return e.ready_event
+        return None
+
+    def _resolve_reservation_key(self, model_id: str) -> str:
+        """Map a non-streaming engine's identifier to the ``_entries`` key.
+
+        Engines self-reserve with ``model_name`` — the full model PATH — but
+        ``_entries`` is keyed by the short ``model_id``. Return the matching key
+        (by ``model_path``) so ``reserve_inference``'s own-engine guard,
+        self-skip, and reclaim-exclusion resolve the right entry; without this
+        they silently no-op on a path/key mismatch and the op waits on its OWN
+        drain (the 2026-06-02 livelock). Falls back to the input unchanged
+        (already a key, or unknown). O(n) over a handful of loaded models.
+        """
+        if model_id in self._entries:
+            return model_id
+        for mid, e in self._entries.items():
+            if e.model_path == model_id:
+                return mid
+        return model_id
+
+    @asynccontextmanager
+    async def reserve_inference(self, model_id: str, est_bytes: int):
+        """Reserve working-set headroom for an in-flight non-streaming op.
+
+        Folds the op's estimated transient into ``_inflight_reservations``
+        (the same number load admission reads, §3b) under ``self._lock``,
+        budgeted against the Metal wall minus margin (``_wall_budget``). An
+        op that fits proceeds immediately; an op that would breach the wall
+        waits for an in-flight release or evicts a non-pinned, non-self
+        victim — reusing the pinned-safe ``_find_drain_or_evict_candidate``
+        / ``_unload_engine`` / ``_start_drain`` machinery.
+
+        Strict no-op (no lock, no state) when there is no Metal cap
+        (``_wall_budget() == 0``) or the op declares no transient
+        (``est_bytes <= 0``) — §5.
+
+        Args:
+            model_id: The model whose engine is performing the op. Never
+                evicted (self-exclusion) so a long decode can't evict itself.
+            est_bytes: Estimated peak working-set transient for the op
+                (``estimate_working_set_bytes``). 0 ⇒ no-op.
+
+        Release is guaranteed on every exit path (normal return, exception,
+        cancellation) via the ``finally`` — a crashed/aborted op cannot leak
+        a reservation and wedge admission.
+        """
+        budget = self._wall_budget()
+        if est_bytes <= 0 or budget <= 0:
+            # Non-Apple / no cap / no estimate: strict no-op (§5).
+            yield
+            return
+        # Engines self-reserve with their model_name (a full PATH); _entries is
+        # keyed by the short model_id. Resolve to the real key so the guard /
+        # self-skip / reclaim-exclusion below match the right entry — otherwise
+        # they silently no-op and the op can wait on its OWN drain (2026-06-02).
+        model_id = self._resolve_reservation_key(model_id)
+        reserved = False
+        try:
+            while True:
+                async with self._tracked_lock("reserve_inference"):
+                    if est_bytes <= self._reservable_free():
+                        # FITS: take the reservation and proceed immediately.
+                        self._inflight_reservations += est_bytes
+                        reserved = True
+                        break
+                    victim = self._pick_inference_victim(model_id)  # pinned-/self-safe
+                    if victim is not None:
+                        if self._victim_busy(victim):
+                            self._start_drain(victim)
+                            ev = self._entries[victim].drain_complete
+                        else:
+                            # Phase-1 unload: flips engine=None + schedules the
+                            # DEFERRED cleanup; weights stay counted until the
+                            # unload_complete event fires (so we await it below,
+                            # outside the lock, before re-checking — we do NOT
+                            # admit best-effort while the victim is still
+                            # committed). Mirrors _prepare_memory_for.
+                            await self._unload_engine(
+                                victim, reason="evict_for_inference"
+                            )
+                            ev = self._entries[victim].unload_complete
+                    else:
+                        ev = self._pending_reclaim_event(model_id)
+                        if ev is None:
+                            # Only pinned models + self remain and nothing is
+                            # freeing: last-resort best-effort. Log loudly; the
+                            # config's single op + pinned weights already
+                            # exceed the wall (a model too large to serve
+                            # safely). Never reached on an evictable config.
+                            self._inflight_reservations += est_bytes
+                            reserved = True
+                            logger.warning(
+                                "reserve_inference: %s over budget, nothing "
+                                "reclaimable; best-effort (Metal may OOM)",
+                                model_id,
+                            )
+                            break
+                # ---- outside the lock: await the reclaim, then re-loop ----
+                # We only ever wait on ANOTHER model's reclaim — the victim we
+                # just evicted, or a reclaim already underway. We NEVER wait on
+                # our OWN engine's reclaim (``_pending_reclaim_event`` excludes
+                # ``model_id``): doing so would deadlock the op against its own
+                # active_uses lease (the 2026-06-02 livelock). Another model's
+                # reclaim completes independently of this op, so this cannot
+                # deadlock; ``_max_wait_timeout`` is the backstop for a wedged
+                # one. We do NOT proceed early just because our own engine is
+                # draining — that would skip making room and decode over the
+                # wall (the 2-TTS OOM); we make room first, then run.
+                try:
+                    await asyncio.wait_for(
+                        ev.wait(), timeout=self._max_wait_timeout
+                    )
+                except asyncio.TimeoutError:
+                    # Reclaim wedged — don't fail a healthy request; best-effort.
+                    async with self._tracked_lock("reserve_inference"):
+                        self._inflight_reservations += est_bytes
+                        reserved = True
+                    break
+                # Re-acquire, recompute _reservable_free: the victim may now be
+                # fully UNLOADED (weights dropped from _committed_memory).
+            yield
+        finally:
+            if reserved:
+                async with self._tracked_lock("reserve_inference"):
+                    self._inflight_reservations = max(
+                        0, self._inflight_reservations - est_bytes
+                    )
 
     def is_engine_actively_held(self, entry: EngineEntry) -> bool:
         """Strict check: handler currently holds a lease OR scheduler is running.
@@ -2138,6 +2440,11 @@ class EnginePool:
 
         entry.engine = engine
         entry.last_access = time.time()
+        # Back-reference so non-streaming engines can self-reserve working set
+        # against this pool inside their heavy methods (§3d). Engines guard
+        # every use (``if self._pool is not None``) so non-pooled / unit-test
+        # use of an engine never touches the pool.
+        engine._pool = self
 
         # Propagate memory limit to new engine's scheduler
         if self._process_memory_enforcer is not None:
@@ -2339,6 +2646,9 @@ class EnginePool:
         return {
             "lock_held": self._lock.locked(),
             "committed_memory_gb": round(self._committed_memory() / 1e9, 2),
+            "inflight_reservations_gb": round(
+                self._inflight_reservations / 1e9, 2
+            ),
             "max_model_memory_gb": (
                 round(self._current_ceiling() / 1e9, 2)
                 if self._current_ceiling()

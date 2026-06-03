@@ -790,6 +790,12 @@ class Scheduler:
         # propagates the soft limit. Used by the predictive generation
         # memory guard to estimate per-request peak cost.
         self._model_size_bytes: int = 0
+        # Cross-visibility callback (§3e): returns the EnginePool's in-flight
+        # non-streaming inference reservation bytes (a synchronous, lock-free
+        # atomic int read). Wired by ProcessMemoryEnforcer._propagate_memory_limit
+        # once the enforcer is running. None until then ⇒ the predictive
+        # generation guard adds 0, byte-identical to today's behavior.
+        self._get_inflight_reservations: Any | None = None
         # Throttle (monotonic timestamp) for the predictive memory guard's
         # defer log line. The scheduler tick is ~200ms — without this the
         # log would emit dozens of duplicate lines per second under pressure.
@@ -4714,8 +4720,26 @@ class Scheduler:
                         )
                     except Exception:
                         cached_overhead = 0
+                # Cross-visibility (§3e): count outstanding non-streaming
+                # inference reservations (TTS/STT/... working-set transients
+                # held by the EnginePool) in the projected peak, so the
+                # scheduler defers piling on prefills that would co-spike over
+                # the wall alongside a live decode. A synchronous, lock-free
+                # int read; 0 when nothing is reserved (or unwired) ⇒ the path
+                # is byte-identical to today. Conservative: `current` may
+                # already include a materialized transient, so this can
+                # double-count — errs toward throttle, never toward OOM.
+                inflight_reservations = 0
+                if self._get_inflight_reservations is not None:
+                    try:
+                        inflight_reservations = int(
+                            self._get_inflight_reservations() or 0
+                        )
+                    except Exception:
+                        inflight_reservations = 0
                 if (
                     current + concurrent_cost + cached_overhead
+                    + inflight_reservations
                     > self._memory_limit_bytes
                 ):
                     now = time.monotonic()
@@ -4725,12 +4749,14 @@ class Scheduler:
                             "Generation memory guard: deferring scheduling "
                             "(active=%.1fGB + concurrent_cost=%.1fGB "
                             "(%d×%.2fGB) + cached_overhead=%.2fGB "
+                            "+ inflight_resv=%.2fGB "
                             "> soft=%.1fGB), %d running",
                             current / 1024**3,
                             concurrent_cost / 1024**3,
                             n_running + 1,
                             per_request_estimate / 1024**3,
                             cached_overhead / 1024**3,
+                            inflight_reservations / 1024**3,
                             self._memory_limit_bytes / 1024**3,
                             n_running,
                         )

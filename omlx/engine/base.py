@@ -312,6 +312,61 @@ class BaseNonStreamingEngine(ABC):
         # running loop in Python 3.10+.
         self._aborted = asyncio.Event()
         self._activities: Dict[str, Dict[str, Any]] = {}
+        # Back-reference to the owning EnginePool, set at load
+        # (``engine._pool = self``). None for non-pooled / unit-test use;
+        # every use is guarded ``if self._pool is not None`` so the heavy
+        # methods' working-set reservation (§3d) is a no-op without a pool.
+        self._pool: Any | None = None
+
+    def estimate_working_set_bytes(self, **call_kwargs: Any) -> int:
+        """Estimate this op's peak GPU working-set transient, in bytes.
+
+        Default 0 ⇒ no reservation (strict no-op admission). Engines whose
+        heavy method materializes a sizeable transient (notably non-streaming
+        TTS, which decodes the whole waveform in one ``mx.eval``) override
+        this so :meth:`EnginePool.reserve_inference` can budget the op
+        against the Metal wall before it runs. ``call_kwargs`` carries the
+        heavy method's params (e.g. ``text``, ``max_tokens``) so the estimate
+        can scale with the request.
+        """
+        return 0
+
+    # Per-op transient as a fraction of resident model weights, reused by the
+    # single-forward/encoder engines (STT/STS/embedding/reranker). Mirrors the
+    # scheduler's validated predictive-guard precedent (0.08 × weights) — large
+    # enough to stop a co-spike, too small to evict on the healthy path (§4).
+    _WORKING_SET_WEIGHT_FRACTION: float = 0.08
+
+    def _resident_weight_bytes(self) -> int:
+        """Resident weight size (bytes) of this engine's model, or 0.
+
+        Read from the owning pool's entry for ``self.model_name``. 0 when
+        there is no pool (unit-test / non-pooled) or the entry is unknown —
+        callers then reserve 0 (strict no-op).
+        """
+        pool = self._pool
+        if pool is None:
+            return 0
+        try:
+            entry = pool._entries.get(self.model_name)
+        except (AttributeError, TypeError):
+            return 0
+        if entry is None:
+            return 0
+        return int(getattr(entry, "estimated_size", 0) or 0)
+
+    def _estimate_forward_working_set_bytes(self) -> int:
+        """``ceil(0.08 × weights)`` transient for a single-forward/encoder op.
+
+        Shared default for STT/STS/embedding/reranker. ~0.5 GiB for a 4B —
+        enough to bound a multi-modal co-spike, small enough not to evict on
+        the healthy path (§4). Returns 0 with no pool ⇒ strict no-op.
+        """
+        import math
+        weights = self._resident_weight_bytes()
+        if weights <= 0:
+            return 0
+        return math.ceil(weights * self._WORKING_SET_WEIGHT_FRACTION)
 
     def has_active_requests(self) -> bool:
         """Check if the engine has active in-flight requests."""

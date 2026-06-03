@@ -605,6 +605,56 @@ class ProcessMemoryEnforcer:
                 if bg is not None and hasattr(bg, "_memory_limit_bytes"):
                     bg._memory_limit_bytes = soft_limit
                     bg._memory_hard_limit_bytes = ceiling
+                # Scheduler cross-visibility (§3e): give the predictive
+                # generation guard a synchronous, lock-free reader of the
+                # pool's in-flight non-streaming reservation so it defers
+                # piling on concurrent prefills while a TTS decode is reserved.
+                # Schedulers are created lazily at model load, so the callback
+                # is (re)applied here — the one place that resolves every live
+                # scheduler each tick. The read is a plain atomic int load
+                # (GIL-safe). Direction is one-way (the guard only throttles
+                # NEW prefills), so there is no deadlock with reserve_inference.
+                scheduler._get_inflight_reservations = (
+                    self._engine_pool_inflight_reservations
+                )
+
+    def _engine_pool_inflight_reservations(self) -> int:
+        """Lock-free read of the pool's in-flight inference reservation bytes.
+
+        Bound and handed to each scheduler in ``_propagate_memory_limit`` as
+        ``scheduler._get_inflight_reservations`` (§3e). 0 before the counter
+        attribute exists (older pool) so the scheduler path is unchanged.
+        """
+        return int(getattr(self._engine_pool, "_inflight_reservations", 0) or 0)
+
+    def get_scheduler_inflight_bytes(self) -> int:
+        """Σ live LLM/VLM generation transient over all schedulers (§3e).
+
+        ``0.08 × _model_size_bytes × n_running`` per scheduler — the same
+        per-request peak the predictive generation guard uses
+        (``scheduler.py``), times the number of running sequences. The pool
+        reads this through its ``_process_memory_enforcer`` reference inside
+        ``_reservable_free`` so a non-streaming op admitting while a batched
+        prefill is live sees that transient and evicts/waits instead of
+        stacking over the wall. Lock-free: ``_model_size_bytes`` and
+        ``len(running)`` are plain reads (GIL-safe).
+        """
+        total = 0
+        for entry in self._engine_pool._entries.values():
+            scheduler = self._resolve_scheduler(entry)
+            if scheduler is None:
+                continue
+            model_bytes = int(getattr(scheduler, "_model_size_bytes", 0) or 0)
+            if model_bytes <= 0:
+                continue
+            try:
+                n_running = scheduler.get_num_running()
+            except Exception:  # noqa: BLE001
+                n_running = len(getattr(scheduler, "running", ()) or ())
+            if n_running <= 0:
+                continue
+            total += int(model_bytes * 0.08) * n_running
+        return total
 
     def _walk_store_cache_caps(self) -> None:
         """Walk each scheduler's store-cache gate one step per poll (#1383).

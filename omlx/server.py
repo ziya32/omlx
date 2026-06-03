@@ -345,8 +345,15 @@ async def lifespan(app: FastAPI):
             prefill_min_chunk_tokens=memory_settings.prefill_min_chunk_tokens,
         )
         _server_state.process_memory_enforcer = enforcer
+        # Engine pool consults the enforcer for the pre-load ceiling AND, via
+        # this same reference, the live LLM/VLM scheduler in-flight generation
+        # transient (enforcer.get_scheduler_inflight_bytes) inside its
+        # inference-admission _reservable_free() (§3e, pool→scheduler
+        # direction). The reverse direction (scheduler→pool: the predictive
+        # generation guard reading pool._inflight_reservations) is wired per
+        # scheduler by enforcer._propagate_memory_limit, since schedulers are
+        # created lazily at model load — both lock-free atomic int reads.
         _server_state.engine_pool._process_memory_enforcer = enforcer
-        # Engine pool consults the enforcer for the pre-load ceiling.
         _server_state.engine_pool._get_final_ceiling = enforcer.get_final_ceiling
         enforcer.start()
 
