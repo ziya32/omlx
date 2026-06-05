@@ -1278,6 +1278,30 @@ class EnginePool:
         # All non-pinned models cleared (or never existed)
         return None
 
+    def _grace_recheck_event(self, delay: float = 0.05) -> asyncio.Event:
+        """A one-shot event set after *delay* seconds.
+
+        Returned by the exclusive-defer when the exclusive model is at
+        ``active_uses == 0`` but was accessed within ``_ACTIVE_GRACE_SEC`` — i.e. a
+        request is routed to it and is mid ``get_engine``→``acquire_engine`` (the
+        brief active_uses=0 dip). The non-pinned load awaits this, then re-enters
+        ``get_engine`` and re-checks: by then the routed request has acquired (→ the
+        ``active_uses>0`` defer waits on the real ``exclusive_idle``) or the exclusive
+        model is truly idle (grace expired → the load proceeds). This converges in
+        ~one or two hops and never orphans an ``exclusive_idle`` waiter, unlike
+        clearing the per-acquire event would.
+        """
+        ev = asyncio.Event()
+
+        async def _arm() -> None:
+            try:
+                await asyncio.sleep(delay)
+            finally:
+                ev.set()
+
+        asyncio.create_task(_arm())
+        return ev
+
     def _refresh_vision_limits(self, entry: EngineEntry) -> None:
         """Recalculate vision limits from committed memory state.
 
@@ -1382,6 +1406,21 @@ class EnginePool:
                             f"{e.active_uses} active request(s)"
                         )
                         return e.exclusive_idle
+                    # active_uses==0 but recently accessed: a request is routed to the
+                    # exclusive model and is mid get_engine→acquire_engine (the
+                    # active_uses=0 dip — already covered by _ACTIVE_GRACE_SEC for the
+                    # enforcer, but not here until now). Loading a non-pinned model into
+                    # that ms-window coexists it with the (e.g. 44GB) exclusive model →
+                    # OOM (the 2026-06-05 stress kill: Embedding-4B loaded on top of the
+                    # 35B while two chat completions were still routing). Re-check after
+                    # a short delay instead of racing the load in.
+                    if e.last_access > 0 and (time.time() - e.last_access) < _ACTIVE_GRACE_SEC:
+                        logger.info(
+                            f"Deferring load of '{entry.model_id}': exclusive '{mid}' "
+                            f"accessed {time.time() - e.last_access:.3f}s ago "
+                            f"(active_uses=0 dip; grace re-check)"
+                        )
+                        return self._grace_recheck_event()
                     # Log WHY we didn't defer
                     if e.active_uses == 0:
                         logger.debug(
