@@ -82,6 +82,16 @@ ENFORCER_ABORT_RETRY_BACKOFF = 2.0
 # pressure.
 _ACTIVE_GRACE_SEC: float = 3.0
 
+# Short grace specifically for the exclusive-defer (NOT the 3s enforcer grace above).
+# Covers just the get_engine→acquire_engine dip where a routing request to the exclusive
+# model reads as active_uses=0; long enough for that hand-off under load, short enough
+# that a non-pinned load isn't held off for seconds after the exclusive model went idle
+# (the 3s grace did that — flooding the log and tripping get_engine's excessive-loop guard).
+_EXCLUSIVE_DEFER_GRACE_SEC: float = 0.5
+# Rate-limit per loading model for the "Deferring load …" INFO lines: a non-pinned load
+# can re-check the exclusive gate many times while a chat runs; one line per check floods.
+_DEFER_LOG_INTERVAL_SEC: float = 5.0
+
 # Safety margin subtracted from the Metal wall when budgeting in-flight
 # non-streaming inference transients (reserve_inference). Covers allocator
 # slop/fragmentation, the reservation-vs-max(active,phys) drift, and small
@@ -148,6 +158,7 @@ class EngineEntry:
     exclusive_max_hold: int = 0                    # Max seconds of continuous exclusive hold (0 = unlimited)
     exclusive_idle: asyncio.Event | None = None    # Signaled when exclusive model active_uses → 0
     _exclusive_hold_start: float = 0.0             # When active_uses went 0 → 1 (for max_hold tracking)
+    _last_defer_log_time: float = 0.0              # Rate-limit "Deferring load …" logs (1 / _DEFER_LOG_INTERVAL_SEC)
 
     @property
     def is_loading(self) -> bool:
@@ -1399,34 +1410,40 @@ class EnginePool:
                         f"active_uses={e.active_uses}, "
                         f"exclusive_idle={'set' if e.exclusive_idle is not None and e.exclusive_idle.is_set() else 'unset' if e.exclusive_idle is not None else 'None'}"
                     )
+                    now = time.time()
+                    # Rate-limit the "Deferring load …" INFO to 1/_DEFER_LOG_INTERVAL_SEC
+                    # per loading model — a non-pinned load re-checks this gate repeatedly
+                    # while a chat runs, and one line per check floods the log.
+                    _rate_ok = (now - entry._last_defer_log_time) >= _DEFER_LOG_INTERVAL_SEC
                     if e.active_uses > 0 and e.exclusive_idle is not None:
-                        logger.info(
-                            f"Deferring load of '{entry.model_id}': "
-                            f"exclusive model '{mid}' has "
-                            f"{e.active_uses} active request(s)"
-                        )
+                        if _rate_ok:
+                            entry._last_defer_log_time = now
+                            logger.info(
+                                f"Deferring load of '{entry.model_id}': exclusive "
+                                f"model '{mid}' has {e.active_uses} active request(s)"
+                            )
                         return e.exclusive_idle
-                    # active_uses==0 but recently accessed: a request is routed to the
-                    # exclusive model and is mid get_engine→acquire_engine (the
-                    # active_uses=0 dip — already covered by _ACTIVE_GRACE_SEC for the
-                    # enforcer, but not here until now). Loading a non-pinned model into
-                    # that ms-window coexists it with the (e.g. 44GB) exclusive model →
-                    # OOM (the 2026-06-05 stress kill: Embedding-4B loaded on top of the
-                    # 35B while two chat completions were still routing). Re-check after
-                    # a short delay instead of racing the load in.
-                    if e.last_access > 0 and (time.time() - e.last_access) < _ACTIVE_GRACE_SEC:
-                        logger.info(
-                            f"Deferring load of '{entry.model_id}': exclusive '{mid}' "
-                            f"accessed {time.time() - e.last_access:.3f}s ago "
-                            f"(active_uses=0 dip; grace re-check)"
-                        )
-                        return self._grace_recheck_event()
-                    # Log WHY we didn't defer
-                    if e.active_uses == 0:
-                        logger.debug(
-                            f"_prepare_memory_for('{entry.model_id}') "
-                            f"NOT deferring: exclusive '{mid}' has "
-                            f"active_uses=0 (no active requests)"
+                    # active_uses==0 but accessed within the SHORT defer-grace: a request
+                    # is mid get_engine→acquire_engine (the active_uses=0 dip). Loading a
+                    # non-pinned model into that window coexists it with the (e.g. 44GB)
+                    # exclusive model → OOM (the 2026-06-05 stress kill: Embedding-4B
+                    # loaded on the 35B while two chat completions were still routing).
+                    # Wait it out with a SINGLE sleep of the remaining grace (not a 50ms
+                    # poll loop), then re-check: by then the request has acquired (→ the
+                    # defer above) or the model is idle (load proceeds). The short grace
+                    # (vs the 3s enforcer grace) avoids holding the load off for seconds
+                    # after the chat finished — which flooded the log and tripped
+                    # get_engine's excessive-loop guard.
+                    remaining = e.last_access + _EXCLUSIVE_DEFER_GRACE_SEC - now
+                    if e.last_access > 0 and remaining > 0:
+                        if _rate_ok:
+                            entry._last_defer_log_time = now
+                            logger.info(
+                                f"Deferring load of '{entry.model_id}': exclusive "
+                                f"'{mid}' active_uses=0 dip (re-check in {remaining:.2f}s)"
+                            )
+                        return self._grace_recheck_event(
+                            min(remaining, _EXCLUSIVE_DEFER_GRACE_SEC)
                         )
 
         # Don't load while another model is still cleaning up Metal resources.
