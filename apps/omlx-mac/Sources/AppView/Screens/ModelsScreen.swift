@@ -215,21 +215,17 @@ private struct LibrarySection: View {
                                      size: 26,
                                      gradient: gradient(for: m))
                             VStack(alignment: .leading, spacing: 2) {
-                                HStack(spacing: 4) {
-                                    Text(m.settings?.displayName ?? m.id)
-                                        .font(.omlxText(13, weight: .medium))
-                                        .foregroundStyle(theme.text)
-                                        .lineLimit(1)
-                                        .truncationMode(.tail)
-                                    CopyIconButton(value: m.id)
-                                }
+                                Text(m.settings?.displayName ?? m.id)
+                                    .font(.omlxText(13, weight: .medium))
+                                    .foregroundStyle(theme.text)
+                                    .lineLimit(1)
+                                    .truncationMode(.tail)
                                 Text("\(m.id) · \(m.estimatedSizeFormatted ?? formatBytes(m.estimatedSize))")
                                     .font(.omlxMono(11))
                                     .foregroundStyle(theme.textSecondary)
                                     .lineLimit(1)
                                     .truncationMode(.middle)
                             }
-                            .layoutPriority(1)
                             Spacer(minLength: 8)
                             if isModelLoaded(m.id) {
                                 Button(String(localized: "models.library.unload",

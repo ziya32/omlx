@@ -151,7 +151,7 @@ final class AppServices: NSObject, ObservableObject {
     /// optional so the caller (Server screen → Apply) can submit only
     /// what actually changed:
     ///   • `basePath`: relocates every file under the current root, sets
-    ///     `OMLX_BASE_PATH` (env + bootstrap file), and
+    ///     `OMLX_BASE_PATH` (env + bootstrap file + shell rc), and
     ///     reconfigures the spawn args.
     ///   • `modelDir` / `modelDirs`: writes the explicit model root list into
     ///     `<basePath>/settings.json`; the first entry is the primary

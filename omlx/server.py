@@ -731,18 +731,9 @@ app.add_middleware(DebugRequestLoggingMiddleware)
 # =============================================================================
 
 
-def _wake_process_memory_enforcer(*, active: bool = False) -> None:
-    enforcer = _server_state.process_memory_enforcer
-    wake = getattr(enforcer, "wake", None) if enforcer is not None else None
-    if callable(wake):
-        wake(active=active)
-
-
 async def get_engine(
     model_id: str | None = None,
     engine_type: EngineType = EngineType.LLM,
-    _lease: bool = False,
-    _leased_out: list | None = None,
 ) -> Union[BaseEngine, EmbeddingEngine, RerankerEngine]:
     """
     Get engine for the specified model and type.
@@ -752,13 +743,6 @@ async def get_engine(
     Args:
         model_id: Model ID to get engine for, or None for default (LLM only)
         engine_type: Type of engine to retrieve (LLM, EMBEDDING, or RERANKER)
-        _lease: When True, take an atomic in-use lease on the engine that the
-            pool actually loaded (eviction-proof until released). The caller
-            MUST release exactly one lease per successful leased call.
-        _leased_out: When _lease is True, the EXACT pool model_id that was
-            leased is appended to this list. Release using that id (not the
-            request model) so the lease/release ids always match even when the
-            pool falls back to the default model.
 
     Returns:
         The loaded engine of the appropriate type
@@ -785,16 +769,9 @@ async def get_engine(
 
     # Resolve alias to real model_id
     model_id = pool.resolve_model_id(model_id, _server_state.settings_manager)
-    _wake_process_memory_enforcer(active=True)
 
-    # Only thread the _lease kwarg through when a lease is actually requested,
-    # so the common non-lease path keeps the original pool.get_engine(model_id)
-    # call contract (LLM/STT/TTS/STS handlers, and pool mocks, never lease).
-    _lease_kwargs = {"_lease": True} if _lease else {}
     try:
-        engine = await pool.get_engine(model_id, **_lease_kwargs)
-        if _lease and _leased_out is not None:
-            _leased_out.append(model_id)
+        engine = await pool.get_engine(model_id)
     except ModelNotFoundError as e:
         # Fallback to default model if enabled (LLM only)
         if (
@@ -808,13 +785,7 @@ async def get_engine(
                 f"default model '{_server_state.default_model}'"
             )
             try:
-                _wake_process_memory_enforcer(active=True)
-                fb_engine = await pool.get_engine(
-                    _server_state.default_model, **_lease_kwargs
-                )
-                if _lease and _leased_out is not None:
-                    _leased_out.append(_server_state.default_model)
-                return fb_engine
+                return await pool.get_engine(_server_state.default_model)
             except Exception:
                 pass  # Fall through to original 404
 
@@ -841,42 +812,35 @@ async def get_engine(
     except EnginePoolError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    # Validate engine type. If a lease was taken above but validation fails,
-    # release it before raising so a rejected request never leaks an in_use
-    # count (which would pin the engine non-evictable forever).
-    try:
-        if engine_type == EngineType.EMBEDDING:
-            if not isinstance(engine, EmbeddingEngine):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Model '{model_id}' is not an embedding model. "
-                    f"Use /v1/chat/completions for LLM models."
-                )
-        elif engine_type == EngineType.RERANKER:
-            if not isinstance(engine, RerankerEngine):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Model '{model_id}' is not a reranker model. "
-                    f"Use a SequenceClassification model for reranking."
-                )
-        elif engine_type == EngineType.LLM:
-            # #507: non-LLM engines (STT/TTS/STS/Embedding/Reranker) previously
-            # fell through and crashed on `engine.model_type` with an unhandled
-            # 500. Reject with a clear 400 pointing the caller at the right
-            # endpoint.
-            if not isinstance(engine, BaseEngine):
-                _endpoint_hint = _suggest_endpoint_for_engine(engine)
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"Model '{model_id}' is not an LLM / chat model. "
-                        f"{_endpoint_hint}"
-                    ),
-                )
-    except BaseException:
-        if _lease and _leased_out:
-            await pool.release_engine(_leased_out.pop())
-        raise
+    # Validate engine type
+    if engine_type == EngineType.EMBEDDING:
+        if not isinstance(engine, EmbeddingEngine):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Model '{model_id}' is not an embedding model. "
+                f"Use /v1/chat/completions for LLM models."
+            )
+    elif engine_type == EngineType.RERANKER:
+        if not isinstance(engine, RerankerEngine):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Model '{model_id}' is not a reranker model. "
+                f"Use a SequenceClassification model for reranking."
+            )
+    elif engine_type == EngineType.LLM:
+        # #507: non-LLM engines (STT/TTS/STS/Embedding/Reranker) previously
+        # fell through and crashed on `engine.model_type` with an unhandled
+        # 500. Reject with a clear 400 pointing the caller at the right
+        # endpoint.
+        if not isinstance(engine, BaseEngine):
+            _endpoint_hint = _suggest_endpoint_for_engine(engine)
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Model '{model_id}' is not an LLM / chat model. "
+                    f"{_endpoint_hint}"
+                ),
+            )
 
     return engine
 
@@ -963,43 +927,6 @@ async def get_reranker_engine(model: str) -> RerankerEngine:
         HTTPException: If model not found, is not a reranker model, or memory error
     """
     return await get_engine(model, EngineType.RERANKER)
-
-
-@asynccontextmanager
-async def acquire_embedding_engine(model: str):
-    """Acquire an embedding engine with an atomic, eviction-proof in-use lease.
-
-    Resolves + loads + validates exactly like get_embedding_engine, but holds
-    the engine non-evictable for the duration of the request and releases the
-    lease on the EXACT pool model_id the pool loaded (handles default-model
-    fallback) in finally.
-    """
-    leased: list = []
-    engine = await get_engine(
-        model, EngineType.EMBEDDING, _lease=True, _leased_out=leased
-    )
-    try:
-        yield engine
-    finally:
-        if leased:
-            await get_engine_pool().release_engine(leased[0])
-
-
-@asynccontextmanager
-async def acquire_reranker_engine(model: str):
-    """Acquire a reranker engine with an atomic, eviction-proof in-use lease.
-
-    See acquire_embedding_engine for the lease/release contract.
-    """
-    leased: list = []
-    engine = await get_engine(
-        model, EngineType.RERANKER, _lease=True, _leased_out=leased
-    )
-    try:
-        yield engine
-    finally:
-        if leased:
-            await get_engine_pool().release_engine(leased[0])
 
 
 def get_sampling_params(
@@ -2003,11 +1930,7 @@ async def create_embeddings(
             detail="Server is busy with oQ quantization. Please try again after quantization completes.",
         )
 
-    # Validate the model up front (resolves + loads + type-checks) so a bad
-    # model still 400/404s before we start the streaming response. The actual
-    # eviction-proof lease is taken inside _build_embeddings, which is where
-    # the engine is used (the StreamingResponse runs that coroutine later).
-    await get_embedding_engine(request.model)
+    engine = await get_embedding_engine(request.model)
 
     if request.items is not None:
         embedding_inputs = normalize_embedding_items(request.items)
@@ -2022,8 +1945,7 @@ async def create_embeddings(
     async def _build_embeddings():
         start_time = time.perf_counter()
         try:
-            async with acquire_embedding_engine(request.model) as engine:
-                output = await engine.embed(embedding_inputs)
+            output = await engine.embed(embedding_inputs)
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         except TypeError as e:
@@ -2127,9 +2049,7 @@ async def create_rerank(
             detail="Server is busy with oQ quantization. Please try again after quantization completes.",
         )
 
-    # Validate the model up front (resolves + loads + type-checks). The
-    # eviction-proof lease is held only around the actual rerank() call below.
-    await get_reranker_engine(request.model)
+    engine = await get_reranker_engine(request.model)
 
     # Preserve original structure for the engine (multimodal rerankers need
     # dicts with 'image'), but keep a normalized text view for logging and
@@ -2146,12 +2066,11 @@ async def create_rerank(
     # Perform reranking
     start_time = time.perf_counter()
 
-    async with acquire_reranker_engine(request.model) as engine:
-        output = await engine.rerank(
-            query=request.query,
-            documents=documents_raw,
-            top_n=request.top_n,
-        )
+    output = await engine.rerank(
+        query=request.query,
+        documents=documents_raw,
+        top_n=request.top_n,
+    )
 
     elapsed = time.perf_counter() - start_time
     logger.info(

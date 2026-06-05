@@ -47,7 +47,6 @@ from .request import Request, RequestOutput, RequestStatus, SamplingParams
 from .speculative.vlm_mtp import VLMMTPDrafter, run_vlm_mtp_decode
 from .utils.proc_memory import get_phys_footprint
 from .utils.sampling import make_sampler as omlx_make_sampler
-from .utils.tokenizer import create_streaming_detokenizer
 
 # Module-level alias so Scheduler.__init__ can fall back to mlx-lm's default
 # stream when no per-engine stream is provided.
@@ -228,6 +227,12 @@ except ImportError:
     CacheTypeRegistry = None
     ModelCacheConfig = None
     HAS_CACHE_TYPE_HANDLERS = False
+
+# Import streaming detokenizer for proper UTF-8 handling
+try:
+    from mlx_lm.tokenizer_utils import NaiveStreamingDetokenizer
+except ImportError:
+    NaiveStreamingDetokenizer = None
 
 # Import protocol-specific output parser support
 try:
@@ -639,7 +644,6 @@ class SchedulerConfig:
     hot_cache_only: bool = False
     paged_ssd_cache_max_size: int = 100 * 1024 * 1024 * 1024  # 100GB default
     hot_cache_max_size: int = 0  # In-memory hot cache size in bytes (0 = disabled)
-    hot_cache_budget: Any | None = None  # Shared process-wide hot cache budget
 
     # Model identification (for cache isolation between different models)
     model_name: str = ""  # OpenAI API model name (e.g., "mlx-community/Llama-3.2-3B")
@@ -789,8 +793,6 @@ class Scheduler:
         # TurboQuant KV cache (set by engine if model_settings has it enabled)
         self._turboquant_kv_bits: float | None = None
         self._turboquant_skip_last: bool = True
-        # Memoized MLA-architecture detection (see _model_uses_mla / #1613).
-        self._mla_model: bool | None = None
 
         # Request management - following vLLM's design
         self.waiting: deque[Request] = deque()  # Waiting queue (FCFS)
@@ -839,7 +841,7 @@ class Scheduler:
         # Adaptive prefill throttle params, propagated from enforcer.
         # Until set, _adaptive_chunk_size is a no-op (returns requested as-is).
         self._prefill_safe_zone_ratio: float = 0.80
-        self._prefill_min_chunk_tokens: int = 256
+        self._prefill_min_chunk_tokens: int = 32
         self._prefill_abort_margin: float = self._PREFILL_ABORT_MARGIN
         self._pending_prefill_eviction_request: PrefillEvictionRequest | None = None
         # EWMA estimator of per-token chunk transient bytes, used by
@@ -1583,11 +1585,11 @@ class Scheduler:
         """
         if request_id not in self._request_detokenizers:
             # Always create a fresh detokenizer - no pooling to prevent state contamination
-            detok = create_streaming_detokenizer(
-                self.tokenizer,
-                model_path=self.config.model_name,
-            )
-            if detok is None:
+            if hasattr(self.tokenizer, "detokenizer"):
+                detok = self.tokenizer.detokenizer
+            elif NaiveStreamingDetokenizer is not None:
+                detok = NaiveStreamingDetokenizer(self.tokenizer)
+            else:
                 # Fallback: return None, we'll use decode([token])
                 return None
             detok.reset()
@@ -1713,88 +1715,6 @@ class Scheduler:
     # External prefill (composition pattern — replaces _process_prompts)
     # ------------------------------------------------------------------
 
-    def _model_uses_mla(self) -> bool:
-        """Detect Multi-head Latent Attention models (DeepSeek-V2/V3/V4,
-        GLM-4-MoE / GLM-4.7-Flash, Kimi-K2, ...).
-
-        MLA compresses K/V into a low-rank latent plus a separate rope key and
-        reads the *fetched* cache tensors directly — e.g.
-        ``kv_latent, k_pe = cache.update_and_fetch(...)`` then
-        ``k_pe.swapaxes(-1, -2)`` (mlx_lm/models/glm4_moe_lite.py). TurboQuant
-        replaces the cache state with quantized NamedTuples that have no array
-        methods, so that ``.swapaxes`` raises ``AttributeError`` (#1613). MLA
-        also stores keys/values with mismatched head dims, which the codec does
-        not support. Such models stay fp16 — no crash, no TurboQuant.
-
-        Result is memoized: the model never changes for a scheduler instance.
-        """
-        cached = getattr(self, "_mla_model", None)
-        if cached is not None:
-            return cached
-
-        detected = False
-        model = getattr(self, "model", None)
-
-        # kv_lora_rank is the defining MLA hyperparameter and is an int on real
-        # models. It may sit on the top-level config or be nested under a
-        # text/LM sub-config (VLM MLA, e.g. kimi_vl -> text_config). The
-        # isinstance(int) check guards against mocks where it is a sentinel.
-        def _cfg_has_kv_lora(cfg: Any, depth: int = 0) -> bool:
-            if cfg is None or depth > 3:
-                return False
-            if isinstance(getattr(cfg, "kv_lora_rank", None), int):
-                return True
-            return any(
-                _cfg_has_kv_lora(getattr(cfg, sub, None), depth + 1)
-                for sub in (
-                    "text_config",
-                    "llm_config",
-                    "language_config",
-                    "thinker_config",
-                )
-            )
-
-        # Config signal. For VLMs the scheduler sees VLMModelAdapter, whose
-        # .args delegates to the language model; also probe (_)language_model.
-        for holder in (
-            model,
-            getattr(model, "_language_model", None),
-            getattr(model, "language_model", None),
-        ):
-            if holder is None:
-                continue
-            if _cfg_has_kv_lora(getattr(holder, "args", None)) or _cfg_has_kv_lora(
-                getattr(holder, "config", None)
-            ):
-                detected = True
-                break
-
-        # Architecture signal: an attention submodule carrying the MLA
-        # down-projection, latent layernorm, or latent rank. Covers models
-        # whose config does not surface kv_lora_rank where the scheduler can
-        # see it (e.g. a directly-loaded VLM with a nested text config).
-        if not detected and model is not None and hasattr(model, "modules"):
-            try:
-                for m in model.modules():
-                    if (
-                        hasattr(m, "kv_a_proj_with_mqa")
-                        or hasattr(m, "kv_a_layernorm")
-                        or isinstance(getattr(m, "kv_lora_rank", None), int)
-                    ):
-                        detected = True
-                        break
-            except Exception:
-                pass
-
-        if detected:
-            logger.info(
-                "TurboQuant disabled: model uses Multi-head Latent Attention "
-                "(MLA), which is incompatible with quantized KV cache states; "
-                "keeping fp16 KV cache (#1613)."
-            )
-        self._mla_model = detected
-        return detected
-
     def _turboquant_eligible(self, prompt_cache: list[Any]) -> bool:
         """True if every cache layer can be safely TurboQuant-converted for
         continuous batching.
@@ -1805,15 +1725,8 @@ class Scheduler:
         rotating-attention caches (Llama-4, sliding-window) need
         maybe_trim_front / rotating semantics that BatchTurboQuantKVCache does
         not provide, so those models stay fp16 — no crash, no TurboQuant.
-
-        MLA models (DeepSeek / GLM-4.7-Flash) are also excluded: they keep
-        plain KVCache objects but read fetched cache tensors directly, which
-        TurboQuant's quantized states do not support (#1613).
         """
         from mlx_lm.models.cache import CacheList, KVCache
-
-        if self._model_uses_mla():
-            return False
 
         def _ok(c: Any) -> bool:
             if isinstance(c, KVCache):
@@ -2230,7 +2143,7 @@ class Scheduler:
     # halves SDPA-fallback transient (∝ query_len × kv_len), so crossing
     # one tier under memory pressure roughly doubles the available
     # headroom for the next chunk's intermediates.
-    _PREFILL_STEP_TIERS: tuple[int, ...] = (1024, 512)
+    _PREFILL_STEP_TIERS: tuple[int, ...] = (1024, 512, 256, 128)
 
     # Safety margin applied to the headroom (hard_cap - current) when sizing
     # a chunk predictively. The remaining 10% absorbs estimator error and the
@@ -2541,10 +2454,14 @@ class Scheduler:
         if current >= soft_watermark and hard_cap > soft_watermark:
             band = hard_cap - soft_watermark
             band_ratio = max(0.0, min(1.0, (current - soft_watermark) / band))
-            if band_ratio < 0.50:
+            if band_ratio < 0.25:
                 bucket = self._PREFILL_STEP_TIERS[0]  # 1024
-            else:
+            elif band_ratio < 0.50:
                 bucket = self._PREFILL_STEP_TIERS[1]  # 512
+            elif band_ratio < 0.75:
+                bucket = self._PREFILL_STEP_TIERS[2]  # 256
+            else:
+                bucket = self._PREFILL_STEP_TIERS[3]  # 128
             n = max(min_chunk, min(n, bucket))
 
         if n < requested:
@@ -7392,7 +7309,6 @@ class Scheduler:
                 max_size_bytes=self.config.paged_ssd_cache_max_size,
                 hot_cache_max_bytes=self.config.hot_cache_max_size,
                 hot_cache_only=self.config.hot_cache_only,
-                hot_cache_budget=self.config.hot_cache_budget,
                 expected_model_name=self.config.model_name or "",
                 expected_num_layers=expected_num_layers,
             )

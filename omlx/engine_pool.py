@@ -17,7 +17,6 @@ import asyncio
 import gc
 import logging
 import time
-from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
@@ -70,7 +69,6 @@ class EngineEntry:
     loading_started_at: float | None = None  # Timestamp when current load started
     is_pinned: bool = False  # Never evict if True
     abort_loading: bool = False  # Set by memory enforcer to abort in-progress load
-    in_use: int = 0  # in-flight acquire/use lease count; never evict while > 0
 
 
 class EnginePool:
@@ -109,27 +107,11 @@ class EnginePool:
         self._suppress_ttl: bool = False  # Suppress TTL during benchmarks
         self._load_seconds_per_gb_ema: float | None = None
         self._load_time_observations: int = 0
-        self.configure_hot_cache_budget()
 
     @property
     def current_model_memory(self) -> int:
         """Current memory used by loaded models in bytes."""
         return self._current_model_memory
-
-    def configure_hot_cache_budget(self) -> None:
-        """Ensure loaded schedulers share one process-wide hot cache budget."""
-        hot_max = int(getattr(self._scheduler_config, "hot_cache_max_size", 0) or 0)
-        if hot_max <= 0:
-            self._scheduler_config.hot_cache_budget = None
-            return
-
-        current = getattr(self._scheduler_config, "hot_cache_budget", None)
-        if current is not None and getattr(current, "max_bytes", None) == hot_max:
-            return
-
-        from .cache.paged_ssd_cache import SharedHotCacheBudget
-
-        self._scheduler_config.hot_cache_budget = SharedHotCacheBudget(hot_max)
 
     def _current_ceiling(self) -> int:
         """Resolve the current memory ceiling via the enforcer callback.
@@ -144,12 +126,6 @@ class EnginePool:
             return int(cb())
         except Exception:  # noqa: BLE001
             return 0
-
-    def _wake_process_memory_enforcer(self, *, active: bool = False) -> None:
-        enforcer = self._process_memory_enforcer
-        wake = getattr(enforcer, "wake", None) if enforcer is not None else None
-        if callable(wake):
-            wake(active=active)
 
     @property
     def model_count(self) -> int:
@@ -353,7 +329,6 @@ class EnginePool:
         self,
         model_id: str,
         force_lm: bool = False,
-        _lease: bool = False,
     ) -> (
         BaseEngine
         | EmbeddingEngine
@@ -402,8 +377,6 @@ class EnginePool:
                     await self._unload_engine(model_id)
                 else:
                     entry.last_access = time.time()
-                    if _lease:
-                        entry.in_use += 1
                     return entry.engine
 
             # Pre-load admission against the memory ceiling from the
@@ -455,31 +428,7 @@ class EnginePool:
             # Now load the model
             await self._load_engine(model_id, force_lm=force_lm)
 
-            loaded = self._entries[model_id]
-            if _lease:
-                loaded.in_use += 1
-            return loaded.engine
-
-    async def release_engine(self, model_id: str) -> None:
-        """Release one in-use lease previously taken via get_engine(_lease=True)."""
-        async with self._lock:
-            e = self._entries.get(model_id)
-            if e is not None and e.in_use > 0:
-                e.in_use -= 1
-
-    @asynccontextmanager
-    async def acquire(self, model_id: str, force_lm: bool = False):
-        """Acquire an engine with an atomic in-use lease.
-
-        The lease is taken under the pool lock at acquire time and always
-        released in finally, so the engine cannot be evicted mid-request even
-        on exception.
-        """
-        engine = await self.get_engine(model_id, force_lm=force_lm, _lease=True)
-        try:
-            yield engine
-        finally:
-            await self.release_engine(model_id)
+            return self._entries[model_id].engine
 
     def _find_lru_victim(self) -> str | None:
         """
@@ -494,8 +443,6 @@ class EnginePool:
         candidates = []
         for mid, e in self._entries.items():
             if e.engine is None or e.is_pinned:
-                continue
-            if e.in_use > 0:
                 continue
             try:
                 if e.engine.has_active_requests():
@@ -521,7 +468,7 @@ class EnginePool:
 
     def _is_idle_for_prefill_eviction(self, entry: EngineEntry) -> bool:
         engine = entry.engine
-        if engine is None or entry.is_pinned or entry.is_loading or entry.in_use > 0:
+        if engine is None or entry.is_pinned or entry.is_loading:
             return False
         try:
             if engine.has_active_requests():
@@ -623,17 +570,6 @@ class EnginePool:
             await entry.engine.stop()
         except Exception as e:
             logger.warning(f"Error stopping engine for {model_id}: {e}")
-
-        # #1595: the immediate-abort stop() above tears the engine down without the normal
-        # per-request completion callbacks, so a non-streaming engine's active_requests
-        # counter can leak a phantom count (a stale engine then looks permanently busy).
-        # Reset it on teardown so has_active_requests() and the status API stay consistent.
-        reset = getattr(entry.engine, "_reset_activity_tracking", None)
-        if callable(reset):
-            try:
-                reset()
-            except Exception as e:
-                logger.warning(f"Error resetting activity counter for {model_id}: {e}")
 
         # Yield to the event loop before dropping the engine reference.
         #
@@ -744,8 +680,6 @@ class EnginePool:
                     f"active_memory={format_size(active_after)}"
                 )
 
-        self._wake_process_memory_enforcer()
-
     async def _load_engine(self, model_id: str, force_lm: bool = False) -> None:
         """
         Load an engine for the specified model.
@@ -763,7 +697,6 @@ class EnginePool:
 
         entry.is_loading = True
         entry.loading_started_at = time.monotonic()
-        self._wake_process_memory_enforcer(active=True)
         load_started_at = entry.loading_started_at
         load_completed = False
         entry.abort_loading = False
@@ -1138,7 +1071,6 @@ class EnginePool:
             entry.is_loading = False
             entry.loading_started_at = None
             entry.abort_loading = False
-            self._wake_process_memory_enforcer()
 
     async def preload_pinned_models(self) -> None:
         """
@@ -1250,7 +1182,7 @@ class EnginePool:
                     continue
 
                 # Check if model has active requests
-                has_active = entry.engine.has_active_requests() or entry.in_use > 0
+                has_active = entry.engine.has_active_requests()
 
                 if has_active:
                     entry.last_access = now

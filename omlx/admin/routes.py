@@ -579,34 +579,18 @@ async def _apply_model_dirs_runtime(model_dirs: list[str]) -> tuple[bool, str]:
     """
     from pathlib import Path
 
-    from ..model_discovery import (
-        model_directory_access_error,
-        model_directory_write_error,
-    )
+    from ..model_discovery import model_directory_access_error
     from ..server import _server_state
 
     if _server_state.engine_pool is None:
         return False, "Engine pool not initialized"
 
-    if not model_dirs:
-        return False, "At least one model directory is required"
-
-    primary_path = Path(model_dirs[0]).expanduser().resolve()
-    write_error = model_directory_write_error(primary_path, create=True)
-    if write_error is not None:
-        return False, write_error
-
-    active_model_dirs = [str(primary_path)]
-    for model_dir in model_dirs[1:]:
+    # Validate all model directories
+    for model_dir in model_dirs:
         model_path = Path(model_dir).expanduser().resolve()
         access_error = model_directory_access_error(model_path)
         if access_error is not None:
-            logger.warning(
-                "Skipping inaccessible model directory during runtime reload: %s",
-                access_error,
-            )
-            continue
-        active_model_dirs.append(str(model_path))
+            return False, access_error
 
     pool = _server_state.engine_pool
 
@@ -629,27 +613,28 @@ async def _apply_model_dirs_runtime(model_dirs: list[str]) -> tuple[bool, str]:
 
     # Update downloader model directories
     global _hf_downloader, _ms_downloader, _oq_manager, _hf_uploader
-    primary_dir = str(primary_path)
-    if _hf_downloader is not None:
-        _hf_downloader.update_model_dir(primary_dir)
-    if _ms_downloader is not None:
-        _ms_downloader.update_model_dir(primary_dir)
+    if model_dirs:
+        primary_dir = model_dirs[0]
+        if _hf_downloader is not None:
+            _hf_downloader.update_model_dir(primary_dir)
+        if _ms_downloader is not None:
+            _ms_downloader.update_model_dir(primary_dir)
 
     # Update components that scan all model directories
     if _oq_manager is not None:
-        _oq_manager.update_model_dirs(active_model_dirs)
+        _oq_manager.update_model_dirs(model_dirs)
     if _hf_uploader is not None:
-        _hf_uploader.update_model_dirs(active_model_dirs)
+        _hf_uploader.update_model_dirs(model_dirs)
 
     # Re-discover models from new directories
     try:
-        pool.discover_models(active_model_dirs, pinned_models)
+        pool.discover_models(model_dirs, pinned_models)
         if _server_state.settings_manager is not None:
             pool.apply_settings_overrides(_server_state.settings_manager)
     except Exception as e:
         return False, f"Failed to discover models: {e}"
 
-    dir_count = len(active_model_dirs)
+    dir_count = len(model_dirs)
     return True, (
         f"Re-discovered {pool.model_count} models "
         f"from {dir_count} director{'ies' if dir_count > 1 else 'y'}"
@@ -820,8 +805,6 @@ async def _apply_cache_settings_runtime(
         pool._scheduler_config.hot_cache_max_size = (
             global_settings.cache.get_hot_cache_max_size_bytes()
         )
-    if hasattr(pool, "configure_hot_cache_budget"):
-        pool.configure_hot_cache_budget()
 
     # Unload all loaded models so they use new config when reloaded
     loaded_models = pool.get_loaded_model_ids()
@@ -3861,12 +3844,12 @@ def _build_runtime_cache_observability(
 
     payload["effective_block_sizes"] = sorted(block_sizes)
 
-    # Aggregate hot-cache and disk-max across models. Hot cache max is a single
-    # process-wide budget shared by all loaded model managers, so keep the
-    # largest reported cap instead of summing per-model rows. Disk max also
-    # keeps the config fallback via max() because a single SSD cache directory
-    # is shared — the effective cap is the largest configured limit, not a
-    # per-model sum.
+    # Aggregate hot-cache and disk-max across models.
+    # hot_cache_max sums across models (each model reserves its own slice of
+    # the same process-wide hot cache budget) so the gauge denominator matches
+    # the summed numerator.  disk_max keeps the config fallback via max()
+    # because a single SSD cache directory is shared — the effective cap is
+    # the largest configured limit, not a per-model sum.
     hot_cache_max = 0
     disk_max = payload["disk_max_bytes"]
     hot_cache_size_total = 0
@@ -3874,7 +3857,7 @@ def _build_runtime_cache_observability(
     for m in payload["models"]:
         hot_cache_size_total += m.get("hot_cache_size_bytes", 0)
         hot_cache_entries_total += m.get("hot_cache_entries", 0)
-        hot_cache_max = max(hot_cache_max, m.get("hot_cache_max_bytes", 0))
+        hot_cache_max += m.get("hot_cache_max_bytes", 0)
         disk_max = max(disk_max, m.get("max_size_bytes", 0))
     payload["hot_cache_max_bytes"] = hot_cache_max
     payload["hot_cache_size_bytes"] = hot_cache_size_total

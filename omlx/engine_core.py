@@ -17,7 +17,6 @@ import concurrent.futures
 import logging
 import time
 import uuid
-from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import (
     Any,
@@ -111,7 +110,7 @@ class EngineConfig:
 
     model_name: str = ""
     scheduler_config: Optional[SchedulerConfig] = None
-    step_interval: float = 0.05  # Idle wait timeout; requests wake the loop
+    step_interval: float = 0.001  # 1ms between steps
     stream_interval: int = 1  # Tokens to batch before streaming (1=every token)
     prefill_eviction_callback: Optional[Callable[[Any], Awaitable[bool]]] = None
 
@@ -187,8 +186,6 @@ class EngineCore:
         # Engine state
         self._running = False
         self._task: Optional[asyncio.Task] = None
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._wake_event: Optional[asyncio.Event] = None
         self._start_time: Optional[float] = None
         self._steps_executed = 0
 
@@ -199,8 +196,6 @@ class EngineCore:
         if self._running:
             return
 
-        self._loop = asyncio.get_running_loop()
-        self._wake_event = asyncio.Event()
         self._running = True
         self._start_time = time.time()
         self._task = asyncio.create_task(self._engine_loop())
@@ -209,35 +204,18 @@ class EngineCore:
     async def stop(self) -> None:
         """Stop the engine loop."""
         self._running = False
-        if self._wake_event is not None:
-            self._wake_event.set()
         if self._task:
             self._task.cancel()
-            with suppress(asyncio.CancelledError):
+            try:
                 await self._task
+            except asyncio.CancelledError:
+                pass
             self._task = None
-        self._wake_event = None
-        self._loop = None
         logger.info("Engine stopped")
 
     def is_running(self) -> bool:
         """Check if engine is running."""
         return self._running
-
-    def _wake_engine_loop(self) -> None:
-        """Wake the idle engine loop after scheduler-visible state changes."""
-        event = getattr(self, "_wake_event", None)
-        loop = getattr(self, "_loop", None)
-        if event is None or loop is None or loop.is_closed():
-            return
-        try:
-            running_loop = asyncio.get_running_loop()
-        except RuntimeError:
-            running_loop = None
-        if running_loop is loop:
-            event.set()
-        else:
-            loop.call_soon_threadsafe(event.set)
 
     async def _engine_loop(self) -> None:
         """Main engine loop - runs scheduler steps on the MLX executor.
@@ -326,19 +304,8 @@ class EngineCore:
                             )
                         continue
                 else:
-                    event = self._wake_event
-                    if event is None:
-                        await asyncio.sleep(step_interval)
-                    else:
-                        event.clear()
-                        # Avoid losing a request that arrived between
-                        # has_requests() and clear().
-                        if self.scheduler.has_requests():
-                            continue
-                        with suppress(TimeoutError):
-                            await asyncio.wait_for(
-                                event.wait(), timeout=step_interval
-                            )
+                    # No work, yield control
+                    await asyncio.sleep(step_interval)
 
             except asyncio.CancelledError:
                 break
@@ -463,7 +430,6 @@ class EngineCore:
         except BaseException:
             self._cleanup_request(request_id)
             raise
-        self._wake_engine_loop()
 
         return request_id
 
@@ -506,7 +472,6 @@ class EngineCore:
         event = self._finished_events.get(request_id)
         if event is not None:
             event.set()
-        self._wake_engine_loop()
 
         return result
 
@@ -559,7 +524,6 @@ class EngineCore:
             logger.warning(
                 f"Aborted {len(request_ids)} requests due to memory pressure"
             )
-            self._wake_engine_loop()
         return len(request_ids)
 
     def _cleanup_request(self, request_id: str) -> None:

@@ -282,9 +282,7 @@ class MockEnginePool:
             "max_model_memory": self.max_model_memory,
         }
 
-    async def get_engine(self, model_id: str, _lease: bool = False):
-        # _lease mirrors the real EnginePool's acquire-vs-use lease (#1667);
-        # the mock has no eviction so it just accepts the flag.
+    async def get_engine(self, model_id: str):
         # Return appropriate engine based on model name pattern
         if "embed" in model_id.lower():
             if self._embedding_engine:
@@ -295,10 +293,6 @@ class MockEnginePool:
                 return self._reranker_engine
             raise ValueError(f"No reranker engine for {model_id}")
         return self._llm_engine
-
-    async def release_engine(self, model_id: str) -> None:
-        # No-op release counterpart of the in-use lease (#1667).
-        return None
 
 
 @pytest.fixture
