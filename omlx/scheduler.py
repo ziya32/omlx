@@ -736,6 +736,14 @@ def _prompt_cache_needs_snapshots(prompt_cache: list[Any]) -> bool:
     return False
 
 
+def _batch_generator_all_tokens(request: Any) -> list[int]:
+    """Seed tokens for mlx-lm's TokenBuffer before the kickoff token."""
+    token_ids = getattr(request, "prompt_token_ids", None)
+    if token_ids is None:
+        return []
+    return list(token_ids[:-1])
+
+
 def _cache_layer_token_count(cache_obj: Any) -> int:
     """Return the number of tokens stored in a single cache layer."""
     sub_caches = getattr(cache_obj, "caches", None)
@@ -3153,6 +3161,7 @@ class Scheduler:
             [state.last_token],
             max_tokens=[request.sampling_params.max_tokens],
             caches=[state.cache] if state.cache else None,
+            all_tokens=[_batch_generator_all_tokens(request)],
             samplers=[state.sampler],
             logits_processors=[per_row_lps],
             state_machines=[state.sm],
@@ -6296,6 +6305,7 @@ class Scheduler:
                 [tokens_to_process],
                 max_tokens=[request.sampling_params.max_tokens],
                 caches=[cache_to_use] if cache_to_use else None,
+                all_tokens=[_batch_generator_all_tokens(request)],
                 samplers=[sampler],
                 logits_processors=[per_row_lps],
                 state_machines=[sm],
