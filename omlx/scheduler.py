@@ -2012,14 +2012,18 @@ class Scheduler:
                     )
                     raise RuntimeError("Memory limit exceeded during prefill")
                 elif current > self._memory_limit_bytes:
-                    logger.warning(
-                        f"Prefill above max_bytes at "
-                        f"{processed_tokens} tokens: "
-                        f"{current / 1024**3:.1f}GB > "
-                        f"{self._memory_limit_bytes / 1024**3:.1f}GB "
-                        f"(ceiling: "
-                        f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB)"
-                    )
+                    # Rate-limit: this fires per prefill step while above max_bytes — one
+                    # line per step floods. 1 / 5s is enough to surface the condition.
+                    if time.time() - getattr(self, "_last_prefill_warn", 0.0) >= 5.0:
+                        self._last_prefill_warn = time.time()
+                        logger.warning(
+                            f"Prefill above max_bytes at "
+                            f"{processed_tokens} tokens: "
+                            f"{current / 1024**3:.1f}GB > "
+                            f"{self._memory_limit_bytes / 1024**3:.1f}GB "
+                            f"(ceiling: "
+                            f"{self._memory_hard_limit_bytes / 1024**3:.1f}GB)"
+                        )
 
             # Check for pending aborts between prefill chunks.
             abort_uids = self._check_pending_aborts_for_uids(
@@ -5864,7 +5868,7 @@ class Scheduler:
                     continue
                 stats_parts.append(f"{phase}={total_ms:.1f}ms/{count}")
             if stats_parts:
-                logger.info("Cache phase timings: %s", ", ".join(stats_parts))
+                logger.debug("Cache phase timings: %s", ", ".join(stats_parts))
 
         # Schedule deferred Metal cache cleanup after request completion.
         if finished_ids:
