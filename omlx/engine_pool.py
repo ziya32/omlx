@@ -1671,7 +1671,19 @@ class EnginePool:
         # in-flight inference transients so a load that would collide with an
         # outstanding non-streaming decode evicts/waits instead of committing
         # weights over the wall (closes the load↔inference race).
-        while self._committed_plus_reservations() + required > ceiling:
+        # §P5: ALSO count the live LLM/VLM generation transient
+        # (_scheduler_inflight_bytes — the same term _reservable_free already
+        # subtracts on the inference side). Without it, load admission was
+        # blind to a RUNNING chat generation: the 2026-06-09 round-3 stress
+        # crash admitted an Embedding-4B load to "total: 49.46GB" on a 51.8GB
+        # cap while the 35B was mid-decode — its KV/decode transient then had
+        # ~2.3GB of room, and the next scheduler step Metal-panicked. With
+        # this term the load waits (exclusive_idle / drain) and loads after.
+        while (
+            self._committed_plus_reservations()
+            + self._scheduler_inflight_bytes()
+            + required
+        ) > ceiling:
             victim_id = self._find_drain_or_evict_candidate()
             if victim_id is None:
                 # Can't evict anything. Find a draining model to wait on.
@@ -1690,10 +1702,14 @@ class EnginePool:
                         return e.unload_complete  # Wait for Metal cleanup
 
                 # Nothing draining, loading, or unloading.
-                # Try without KV headroom as a last resort
+                # Try without KV headroom as a last resort (§P5: still counts
+                # the live generation transient — the headroom concession is
+                # about OUR KV estimate, never about the running chat's room).
                 required_no_headroom = entry.estimated_size
                 if (
-                    self._committed_plus_reservations() + required_no_headroom
+                    self._committed_plus_reservations()
+                    + self._scheduler_inflight_bytes()
+                    + required_no_headroom
                     <= ceiling
                 ):
                     logger.info(
@@ -1703,6 +1719,24 @@ class EnginePool:
                         f"{format_size(ceiling - self._committed_plus_reservations())})"
                     )
                     break  # Proceed without headroom
+
+                # §P5: the live LLM/VLM generation transient is (part of) what
+                # blocks this load. It clears when the exclusive model goes
+                # idle — wait on that, then retry with the room it frees.
+                if self._scheduler_inflight_bytes() > 0:
+                    for _mid, _e in self._entries.items():
+                        if (
+                            _e.exclusive and _e.is_pinned
+                            and _e.active_uses > 0
+                            and _e.exclusive_idle is not None
+                        ):
+                            logger.info(
+                                f"Load of {entry.model_id} waiting for the "
+                                f"exclusive generation on '{_mid}' to finish "
+                                f"(live transient "
+                                f"{format_size(self._scheduler_inflight_bytes())})"
+                            )
+                            return _e.exclusive_idle
 
                 # §P2: over the ceiling ONLY because of in-flight inference
                 # transients (committed weights alone leave room) — those
@@ -1779,9 +1813,17 @@ class EnginePool:
             # = max(active, phys) may already include a *materialized*
             # transient, so this can double-count — deliberately conservative
             # (errs toward evicting a racing load, never toward OOM).
+            # §P5: also add the live LLM/VLM generation transient — the
+            # NOT-yet-materialized KV/decode growth of a running chat.
+            # current_active sees only what has materialized so far; the
+            # round-3 stress crash admitted a load with the 35B mid-decode
+            # and its next steps Metal-panicked into the room the load took.
+            # Double-counting the materialized part is the same deliberate
+            # conservatism as the reservation term above.
             projected = (
                 current_active + entry.estimated_size
                 + self._inflight_reservations
+                + self._scheduler_inflight_bytes()
             )
             if projected <= enforcer.get_final_ceiling():
                 return None
@@ -1834,11 +1876,13 @@ class EnginePool:
             # All cleanup done. Re-check actual Metal memory — Metal's
             # allocator may not have reclaimed pages even after clear_cache.
             current_active = max(mx.get_active_memory(), get_phys_footprint())
-            # Reservation-aware (§3b): same conservative term as the initial
-            # projection above so both reads agree under a live decode.
+            # Reservation-aware (§3b) + §P5 scheduler term: same conservative
+            # sum as the initial projection above so both reads agree under a
+            # live decode/generation.
             projected = (
                 current_active + entry.estimated_size
                 + self._inflight_reservations
+                + self._scheduler_inflight_bytes()
             )
             if projected <= enforcer.get_final_ceiling():
                 logger.info(

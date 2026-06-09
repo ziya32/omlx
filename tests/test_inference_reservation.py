@@ -1174,3 +1174,42 @@ class TestQueueHeadReservation:
         assert admitted == ["op1", "op2"]
         assert peak["v"] == 4 * GiB  # overshoots never stacked
         assert pool._inflight_reservations == 0
+
+
+class TestLoadSeesGenerationTransient:
+    """§P5 — load admission counts the live LLM/VLM generation transient
+    (the same _scheduler_inflight_bytes the inference side subtracts).
+    Round-3 stress crash: an Embedding-4B load admitted to 49.46GB on a
+    51.8GB cap while the 35B was mid-decode; its next steps Metal-panicked
+    into the room the load took."""
+
+    @pytest.mark.asyncio
+    async def test_load_waits_on_exclusive_idle_while_generating(self, monkeypatch):
+        pool = _make_pool()
+        monkeypatch.setattr(pool, "_current_ceiling", lambda: 52 * GiB)
+        big = _add_entry(pool, "pinned-big", size=42 * GiB, is_pinned=True)
+        big.exclusive = True
+        big.active_uses = 1  # a chat is RUNNING
+        big.exclusive_idle = asyncio.Event()
+        target = _add_entry(pool, "embed", size=8 * GiB)
+        target.engine = None
+        target.state = EngineState.UNLOADED
+        # Live generation transient ≈ 3.3GiB (0.08 × weights), wired the way
+        # the enforcer wires it in production (§3e).
+        enforcer = MagicMock()
+        enforcer.get_scheduler_inflight_bytes.return_value = int(3.3 * GiB)
+        # No process-memory cap in this unit (isolate the §P5 ceiling loop);
+        # _check_process_memory no-ops on a 0 ceiling.
+        enforcer.get_final_ceiling.return_value = 0
+        pool._process_memory_enforcer = enforcer
+
+        # 42 + 3.3 + 8 = 53.3 > 52 → must WAIT for the generation to finish,
+        # not admit the load into the chat's working room.
+        ev = await pool._prepare_memory_for(target)
+        assert ev is big.exclusive_idle
+
+        # Generation over (transient gone) → 42 + 8 = 50 ≤ 52 → load proceeds.
+        enforcer.get_scheduler_inflight_bytes.return_value = 0
+        big.active_uses = 0
+        ev2 = await pool._prepare_memory_for(target)
+        assert ev2 is None
