@@ -1498,3 +1498,87 @@ class TestEngineEvictedErrorInvariant:
             # Any other exception type is fine — load will fail on
             # the fake model blob, but that's expected.
             pass
+
+
+class TestExclusiveContentionLeaseRelease:
+    """A non-pinned request parked at the exclusive-contention gate must RELEASE
+    its engine lease, then re-acquire it on wake.
+
+    Regression for the OMLX_STRESS drain-livelock: with the caller's lease held
+    while parked behind a busy exclusive model, the idle engine could not be
+    evicted (active_uses>0), so its memory-eviction drain livelocked for the full
+    300s get_engine timeout while /v1/idle read idle. Releasing the lease while
+    parked lets _clear_for_exclusive evict the idle engine cleanly; the request
+    re-batches (or reloads, re-gated by _prepare_memory_for) on wake.
+    """
+
+    @pytest.fixture
+    def pool(self, small_mock_model_dir):
+        p = _make_pool(ceiling=10 * 1024**3)
+        p.discover_models(str(small_mock_model_dir))
+        # model-a = the EXCLUSIVE pinned model (the 35B analog), loaded.
+        excl = p._entries["model-a"]
+        excl.is_pinned = True
+        excl.exclusive = True
+        excl.state = EngineState.ACTIVE
+        excl.engine = MagicMock()
+        # model-b = the NON-PINNED model (embedding analog), loaded + ready.
+        emb = p._entries["model-b"]
+        emb.is_pinned = False
+        emb.exclusive = False
+        emb.state = EngineState.ACTIVE
+        emb.engine = MagicMock()
+        return p
+
+    @pytest.mark.asyncio
+    async def test_parked_request_releases_lease_and_reacquires_on_wake(self, pool):
+        excl = pool._entries["model-a"]
+        emb = pool._entries["model-b"]
+
+        pool.acquire_engine("model-a")  # exclusive busy → creates exclusive_idle
+        assert excl.active_uses == 1 and excl.exclusive_idle is not None
+        pool.acquire_engine("model-b")  # the caller's lease, BEFORE get_engine
+        assert emb.active_uses == 1
+
+        task = asyncio.create_task(pool.get_engine("model-b"))
+        try:
+            # It parks at the contention gate; the fix RELEASES the lease there,
+            # so active_uses drops to 0 — the engine becomes idle-evictable
+            # instead of dead-locking a drain.
+            for _ in range(400):
+                if emb.active_uses == 0:
+                    break
+                await asyncio.sleep(0.005)
+            else:
+                raise AssertionError("get_engine never parked / released the lease")
+            assert emb.active_uses == 0
+            assert not task.done()
+
+            # Exclusive model goes idle → wake the waiter.
+            excl.active_uses = 0
+            excl.exclusive_idle.set()
+
+            engine = await asyncio.wait_for(task, timeout=2.0)
+        finally:
+            if not task.done():
+                task.cancel()
+
+        assert engine is emb.engine   # returned the still-loaded engine
+        assert emb.active_uses == 1   # re-acquired on wake, held for the caller
+
+    @pytest.mark.asyncio
+    async def test_timeout_while_parked_leaves_lease_released_no_underflow(self, pool):
+        """If the park times out, the released lease stays released, and the
+        server's finally release_engine is a clamped no-op (never negative)."""
+        emb = pool._entries["model-b"]
+        pool._max_wait_timeout = 0.05  # fast timeout; exclusive stays busy
+
+        pool.acquire_engine("model-a")
+        pool.acquire_engine("model-b")
+        with pytest.raises(ModelLoadingError):
+            await pool.get_engine("model-b")
+        # The fix released the lease at the defer; the request never re-acquired
+        # (it timed out), so exactly one net decrement — no underflow.
+        assert emb.active_uses == 0
+        pool.release_engine("model-b")  # simulate the server-side finally
+        assert emb.active_uses == 0

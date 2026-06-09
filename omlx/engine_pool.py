@@ -750,6 +750,11 @@ class EnginePool:
         start_time = time.monotonic()
         iterations = 0
         enforcer_abort_retries = 0
+        # When we park a non-pinned request at the exclusive-contention gate we
+        # RELEASE its engine lease (so the now-idle engine can be evicted cleanly
+        # for the exclusive model's headroom instead of dead-locking the drain)
+        # and re-acquire it on wake, before the next dispatch hands the engine out.
+        released_for_contention = False
 
         while True:
             iterations += 1
@@ -843,9 +848,28 @@ class EnginePool:
                                 contention_event = _e.exclusive_idle
                                 break
                         if contention_event is not None:
+                            # Release the caller's lease while we PARK here. We are
+                            # not using this engine — we're waiting on an UNRELATED
+                            # exclusive model — so holding active_uses only blocks a
+                            # memory-eviction drain of THIS idle engine: the deadlock
+                            # where the drain waits for us while we wait for the
+                            # exclusive model (it livelocks the drain for the full
+                            # 300s get_engine timeout). Releasing restores this
+                            # branch's own documented invariant (above): the entry
+                            # becomes idle-evictable, so _clear_for_exclusive can
+                            # unload it CLEANLY (no drain wait), and we reload from
+                            # SSD on wake — gated again by _prepare_memory_for's
+                            # exclusive check, so a reload only begins once the
+                            # exclusive model is idle (no abort-mid-load churn).
+                            # Re-acquired on wake before the next dispatch returns
+                            # the engine, so the use-window stays eviction-protected.
+                            # The waiter is non-pinned, so the release has no
+                            # exclusive-idle side effects.
+                            self.release_engine(model_id)
+                            released_for_contention = True
                             logger.debug(
-                                f"get_engine({model_id}) non-pinned deferred: "
-                                f"exclusive model has active_uses>0"
+                                f"get_engine({model_id}) non-pinned deferred "
+                                f"(lease released): exclusive model active_uses>0"
                             )
                             event = contention_event
                             wait_target = "exclusive_contention"
@@ -1121,6 +1145,15 @@ class EnginePool:
                         f"({self._max_wait_timeout}s)",
                         model_id=model_id,
                     )
+
+                # Woke from the wait (reached only on success — the except above
+                # either continues or raises). If we released our lease to park at
+                # the exclusive-contention gate, re-acquire it NOW, before the next
+                # dispatch can return or reload the engine, so the use-window is
+                # lease-protected again. Non-pinned ⇒ no exclusive side effects.
+                if released_for_contention:
+                    self.acquire_engine(model_id)
+                    released_for_contention = False
 
                 if __debug__:
                     logger.debug(
