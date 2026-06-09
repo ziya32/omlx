@@ -370,6 +370,24 @@ class EnginePool:
             return 0
         return max(0, cap - self._inference_margin_bytes(cap))
 
+    def _overshoot_allowance(self) -> int:
+        """Sanctioned TOTAL of outstanding transients under contention (§P3+).
+
+        ``_wall_budget`` already excludes the inference margin, so a CONTENDED
+        admit (nothing reclaimable, nothing freeing) may dip INTO the margin —
+        never past the raw cap. Bounding the SUM of outstanding reservations
+        by the margin keeps small forwards (≈0.3–0.6 GiB each) interleaving
+        under over-commit — the workload this box ran un-reserved for months —
+        while a SECOND TTS-sized transient (≈4 GiB) parks on the release pulse
+        (two of those stacked is the 2-TTS Metal panic, re-confirmed by the
+        2026-06-09 re-validation crash).
+        """
+        from .process_memory_enforcer import get_effective_metal_cap_bytes
+        cap = get_effective_metal_cap_bytes()
+        if cap <= 0:
+            return 0
+        return self._inference_margin_bytes(cap)
+
     def _scheduler_inflight_bytes(self) -> int:
         """Live LLM/VLM scheduler generation transient (§3e); 0 if unwired.
 
@@ -2253,51 +2271,49 @@ class EnginePool:
                         )
                         ev = self._entries[victim].unload_complete
                     if victim is None:
-                        own = self._entries.get(model_id)
-                        if own is not None and own.state == EngineState.DRAINING:
-                            # §P3 loser path: a concurrent reservation is
-                            # DRAINING OUR model and is parked until our lease
-                            # drops. Any wait here re-creates the cycle (it
-                            # waits on us). Run best-effort NOW — one bounded
-                            # overshoot — finish, release the lease, and the
-                            # winner's drain completes with real headroom.
-                            self._inflight_reservations += est_bytes
-                            reserved = True
-                            logger.warning(
-                                "reserve_inference: %s over budget while a "
-                                "concurrent reservation drains it — yielding "
-                                "best-effort to unblock the drain (Metal may "
-                                "OOM)", model_id,
-                            )
-                            break
+                        # Nothing evictable in OUR power (pinned + self only,
+                        # or a busy victim in the disallowed §P3 direction).
+                        # Wait on an INDEPENDENT reclaim already underway if
+                        # one exists (excludes self, so it can never wait on
+                        # us — cycle-free even while our own model drains).
                         ev = self._pending_reclaim_event(model_id)
-                        if (
-                            ev is None
-                            and self._inflight_reservations > 0
-                            and est_bytes
-                            <= self._wall_budget() - self._committed_memory()
-                        ):
-                            # §P2: over budget ONLY because of other in-flight
-                            # transients (weights alone leave room for us) —
-                            # they release in seconds. Wait for the next
-                            # release pulse instead of decoding over the wall;
-                            # the timeout backstop below still degrades to
-                            # best-effort if a release never comes.
-                            ev = self._reservation_released
                         if ev is None:
-                            # Only pinned models + self remain and nothing is
-                            # freeing: last-resort best-effort. Log loudly; the
-                            # config's single op + pinned weights already
-                            # exceed the wall (a model too large to serve
-                            # safely). Never reached on an evictable config.
-                            self._inflight_reservations += est_bytes
-                            reserved = True
-                            logger.warning(
-                                "reserve_inference: %s over budget, nothing "
-                                "reclaimable; best-effort (Metal may OOM)",
-                                model_id,
-                            )
-                            break
+                            # CONTENDED ADMIT, margin-bounded (§P2/§P3+). The
+                            # wall budget already excludes the inference
+                            # margin, so over-budget ops may dip INTO that
+                            # margin — never past the raw cap: admit while the
+                            # TOTAL outstanding transients stay within
+                            # _overshoot_allowance() (small forwards keep
+                            # interleaving under over-commit; a SECOND
+                            # TTS-sized transient parks — two stacked is the
+                            # 2-TTS Metal panic, re-confirmed 2026-06-09 when
+                            # an evict_for_memory drain made BOTH queued TTS
+                            # ops yield within 20ms). inflight==0 always
+                            # admits (SOLO overshoot — with nothing running
+                            # there is no pulse to wait for, and one bounded
+                            # overshoot is the old-world behavior; also what
+                            # unblocks a drain waiting on OUR lease). The
+                            # waiters park on the release pulse: reservation
+                            # holders are by construction RUNNING, never
+                            # parked, so a pulse always comes — no deadlock,
+                            # and the winner's drain completes as the chain's
+                            # leases drop one by one.
+                            if (
+                                self._inflight_reservations == 0
+                                or self._inflight_reservations + est_bytes
+                                <= self._overshoot_allowance()
+                            ):
+                                self._inflight_reservations += est_bytes
+                                reserved = True
+                                logger.warning(
+                                    "reserve_inference: %s over budget, "
+                                    "nothing reclaimable — contended admit "
+                                    "within the margin (outstanding %s)",
+                                    model_id,
+                                    format_size(self._inflight_reservations),
+                                )
+                                break
+                            ev = self._reservation_released
                 # ---- outside the lock: await the reclaim, then re-loop ----
                 # We only ever wait on ANOTHER model's reclaim — the victim we
                 # just evicted, or a reclaim already underway. We NEVER wait on

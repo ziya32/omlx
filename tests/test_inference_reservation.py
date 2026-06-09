@@ -886,12 +886,16 @@ class TestReservationReleaseWait:
     release pulse, never best-effort/507 for pressure that clears in seconds."""
 
     @pytest.mark.asyncio
-    async def test_waiter_proceeds_on_release_not_best_effort(self, monkeypatch):
+    async def test_waiter_parks_when_stacking_would_exceed_the_margin(self, monkeypatch):
+        """Contended admits are MARGIN-BOUNDED: with a 3 GiB transient already
+        outstanding, a second 3 GiB op (total 6 > the 4 GiB margin) must PARK
+        on the release pulse — stacking TTS-sized overshoots is the 2-TTS
+        Metal panic. After the release it takes its turn solo."""
         pool = _make_pool()
-        _patch_cap(monkeypatch, 50 * GiB)  # budget 46
+        _patch_cap(monkeypatch, 50 * GiB)  # budget 46, margin (allowance) 4
         _add_entry(pool, "pinned-big", size=40 * GiB, is_pinned=True)
         _add_entry(pool, "embed", size=4 * GiB, busy=True)  # self
-        # committed 44; weight-free room = 2 GiB exactly.
+        # committed 44; weight-free room = 2 GiB — a 3 GiB op is over budget.
         pool._unload_engine = AsyncMock(
             side_effect=AssertionError("pinned/self must not be evicted")
         )
@@ -899,26 +903,52 @@ class TestReservationReleaseWait:
             side_effect=AssertionError("nothing should drain")
         )
 
-        a = pool.reserve_inference("embed", 2 * GiB)
-        await a.__aenter__()
-        assert pool._inflight_reservations == 2 * GiB
+        a = pool.reserve_inference("embed", 3 * GiB)
+        await a.__aenter__()  # SOLO contended admit (inflight was 0)
+        assert pool._inflight_reservations == 3 * GiB
 
         admitted = asyncio.Event()
 
         async def _op_b():
-            async with pool.reserve_inference("embed", 2 * GiB):
+            async with pool.reserve_inference("embed", 3 * GiB):
                 admitted.set()
 
         tb = asyncio.create_task(_op_b())
         await asyncio.sleep(0.05)
-        # B is over budget ONLY because of A's transient: it must be WAITING
-        # (not admitted, not best-effort — best-effort would read 4 GiB here).
+        # 3 + 3 = 6 GiB > the 4 GiB allowance: B must be PARKED, not stacked.
         assert not admitted.is_set()
-        assert pool._inflight_reservations == 2 * GiB
+        assert pool._inflight_reservations == 3 * GiB
 
         await a.__aexit__(None, None, None)  # release fires the pulse
         await asyncio.wait_for(admitted.wait(), timeout=2.0)
         await tb
+        assert pool._inflight_reservations == 0
+
+    @pytest.mark.asyncio
+    async def test_small_forwards_interleave_within_the_margin(self, monkeypatch):
+        """Within the allowance, contended admits still INTERLEAVE — small
+        encoder forwards (≈0.5 GiB) must not serialize one-at-a-time under
+        over-commit (the workload this box ran un-reserved for months)."""
+        pool = _make_pool()
+        _patch_cap(monkeypatch, 50 * GiB)  # budget 46, margin (allowance) 4
+        _add_entry(pool, "pinned-big", size=42 * GiB, is_pinned=True)
+        _add_entry(pool, "embed", size=4 * GiB, busy=True)  # self
+        # committed 46 — zero weight-free room: every op is contended.
+        gate = asyncio.Event()
+        peak = {"v": 0}
+
+        async def _op():
+            async with pool.reserve_inference("embed", 1 * GiB):
+                peak["v"] = max(peak["v"], pool._inflight_reservations)
+                await gate.wait()
+
+        tasks = [asyncio.create_task(_op()) for _ in range(3)]
+        await asyncio.sleep(0.05)
+        # All three fit the 4 GiB allowance together (1+1+1).
+        assert pool._inflight_reservations == 3 * GiB
+        gate.set()
+        await asyncio.gather(*tasks)
+        assert peak["v"] == 3 * GiB
         assert pool._inflight_reservations == 0
 
     @pytest.mark.asyncio
@@ -1100,3 +1130,47 @@ class TestQueueHeadReservation:
         async with eng._reserved_working_set(0):
             pass
         assert pinged == []
+
+    @pytest.mark.asyncio
+    async def test_losers_overshoot_one_at_a_time(self, monkeypatch):
+        """Two queued ops on a DRAINING model must not co-spike: the second
+        loser parks on the release pulse until the first overshoot releases.
+        (2026-06-09 re-validation crash: an evict_for_memory drain hit TTS and
+        BOTH queued TTS ops yielded within 20ms — two ~4GiB decodes crossed
+        the Metal wall together, the 2-TTS OOM in new clothes.)"""
+        pool = _make_pool()
+        _patch_cap(monkeypatch, 50 * GiB)  # budget 46
+        _add_entry(pool, "a-embed", size=24 * GiB, busy=True, last_access=0.5)
+        own = _add_entry(pool, "b-tts", size=20 * GiB, busy=True, last_access=5.0)
+        own.state = EngineState.DRAINING  # the winner already drained us
+        pool._start_drain = MagicMock(
+            side_effect=AssertionError("losers must not start a counter-drain")
+        )
+
+        peak = {"v": 0}
+        gate = asyncio.Event()
+        admitted = []
+
+        async def _op1():
+            async with pool.reserve_inference("b-tts", 4 * GiB):
+                admitted.append("op1")
+                peak["v"] = max(peak["v"], pool._inflight_reservations)
+                await gate.wait()
+
+        async def _op2():
+            async with pool.reserve_inference("b-tts", 4 * GiB):
+                admitted.append("op2")
+                peak["v"] = max(peak["v"], pool._inflight_reservations)
+
+        t1 = asyncio.create_task(_op1())
+        await asyncio.sleep(0.05)  # op1 yields best-effort SOLO
+        t2 = asyncio.create_task(_op2())
+        await asyncio.sleep(0.05)
+        assert admitted == ["op1"]  # op2 is parked on the release pulse
+        assert pool._inflight_reservations == 4 * GiB
+
+        gate.set()  # op1 finishes -> pulse -> op2 takes its turn
+        await asyncio.gather(t1, t2)
+        assert admitted == ["op1", "op2"]
+        assert peak["v"] == 4 * GiB  # overshoots never stacked
+        assert pool._inflight_reservations == 0
