@@ -266,6 +266,22 @@ class MockEnginePool:
     def current_model_memory(self) -> int:
         return 1000000
 
+    # /health busy-ness reads these via _count_active_requests (Fix E.1).
+    @property
+    def total_active_uses(self) -> int:
+        return 0
+
+    @property
+    def contention_parked(self) -> int:
+        return 0
+
+    @property
+    def loading_model_count(self) -> int:
+        return 0
+
+    def llm_request_counts(self):
+        return (0, 0)
+
     def get_entry(self, model_id: str):
         return None
 

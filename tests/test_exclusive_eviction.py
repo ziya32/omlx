@@ -286,6 +286,12 @@ class TestExclusiveIdleWait:
         _activate_entry(entry_a, pinned=True, exclusive=True)
         entry_a.active_uses = 0
         entry_a.exclusive_idle = None  # idle → no event
+        # TRULY idle: age the access/release past the exclusive-defer dip
+        # grace (_EXCLUSIVE_DEFER_GRACE_SEC). _activate_entry stamps
+        # last_access = now, which the dip gate rightly treats as "a request
+        # is mid-routing" and defers — this test is about the IDLE case.
+        entry_a.last_access = time.time() - 10.0
+        entry_a.last_release = 0.0
 
         enforcer = MagicMock()
         enforcer.get_final_ceiling.return_value = 10 * 1024**4

@@ -242,6 +242,17 @@ class EnginePool:
         # be interrupted by a second CancelledError (or the lock-acquire
         # timeout), permanently leaking the reservation.
         self._inflight_reservations: int = 0
+        # Edge-triggered "a reservation was released" pulse (§P2). Over-budget
+        # waiters whose overshoot is ATTRIBUTABLE to in-flight transients
+        # (weights alone fit; only the reservations push past budget) grab the
+        # CURRENT event under the lock and await it outside; every release
+        # swaps in a fresh event and sets the old one, so each pulse wakes
+        # exactly the waiters that observed it (no busy-loop, no lost wakeup:
+        # a release between the check and the await set the very object the
+        # waiter holds). Before this, those waiters either 507'd a load or
+        # decoded best-effort over the Metal wall for pressure that clears in
+        # seconds. Loop-only state, like the counter itself.
+        self._reservation_released: asyncio.Event = asyncio.Event()
         # Requests currently PARKED at get_engine's exclusive-contention gate
         # with their lease released (see the park in get_engine). They hold
         # no active_uses while parked, so without this counter they would be
@@ -1675,6 +1686,25 @@ class EnginePool:
                     )
                     break  # Proceed without headroom
 
+                # §P2: over the ceiling ONLY because of in-flight inference
+                # transients (committed weights alone leave room) — those
+                # release in seconds. Wait for the next release pulse instead
+                # of failing the load with a permanent-style 507 for a
+                # condition that clears on its own. get_engine's wait timeout
+                # is the backstop for a wedged release.
+                if (
+                    self._inflight_reservations > 0
+                    and self._committed_memory() + required_no_headroom
+                    <= ceiling
+                ):
+                    logger.info(
+                        f"Load of {entry.model_id} waiting for "
+                        f"{format_size(self._inflight_reservations)} of "
+                        f"in-flight inference transients to release "
+                        f"(weights fit; transient pressure only)"
+                    )
+                    return self._reservation_released
+
                 # Truly stuck (all pinned)
                 raise ModelTooLargeError(
                     entry.model_id, required, ceiling
@@ -1843,6 +1873,24 @@ class EnginePool:
                     f"reclaimed during load. Proceeding cautiously."
                 )
                 return None
+
+            # §P2: the projection includes in-flight inference transients
+            # (and may double-count a materialized one). If removing them
+            # brings the load within the cautious-proceed bound, they release
+            # in seconds — wait for the next release pulse instead of a
+            # permanent-style 507.
+            if (
+                self._inflight_reservations > 0
+                and projected - self._inflight_reservations
+                <= enforcer.get_final_ceiling() + headroom
+            ):
+                logger.info(
+                    f"Load of {entry.model_id} waiting for "
+                    f"{format_size(self._inflight_reservations)} of in-flight "
+                    f"inference transients to release (projected "
+                    f"{format_size(projected)} fits without them)"
+                )
+                return self._reservation_released
 
             # Truly cannot fit — even with cleanup done, Metal retains too
             # much memory for the new model to load safely.
@@ -2178,23 +2226,64 @@ class EnginePool:
                         reserved = True
                         break
                     victim = self._pick_inference_victim(model_id)  # pinned-/self-safe
-                    if victim is not None:
-                        if self._victim_busy(victim):
+                    if victim is not None and self._victim_busy(victim):
+                        # §P3: deterministic drain DIRECTION for busy victims.
+                        # Two concurrent over-budget ops on different busy
+                        # models used to pick EACH OTHER, start mutual drains,
+                        # and park on each other's drain_complete — neither
+                        # drain can finish while both ops hold their leases (a
+                        # 300s standoff that ends with BOTH decoding over the
+                        # wall). Only the op whose pool key sorts smaller may
+                        # drain a busy victim; the other falls through to the
+                        # wait/yield paths below.
+                        if model_id < victim:
                             self._start_drain(victim)
                             ev = self._entries[victim].drain_complete
                         else:
-                            # Phase-1 unload: flips engine=None + schedules the
-                            # DEFERRED cleanup; weights stay counted until the
-                            # unload_complete event fires (so we await it below,
-                            # outside the lock, before re-checking — we do NOT
-                            # admit best-effort while the victim is still
-                            # committed). Mirrors _prepare_memory_for.
-                            await self._unload_engine(
-                                victim, reason="evict_for_inference"
+                            victim = None  # disallowed direction — no drain
+                    elif victim is not None:
+                        # Phase-1 unload: flips engine=None + schedules the
+                        # DEFERRED cleanup; weights stay counted until the
+                        # unload_complete event fires (so we await it below,
+                        # outside the lock, before re-checking — we do NOT
+                        # admit best-effort while the victim is still
+                        # committed). Mirrors _prepare_memory_for.
+                        await self._unload_engine(
+                            victim, reason="evict_for_inference"
+                        )
+                        ev = self._entries[victim].unload_complete
+                    if victim is None:
+                        own = self._entries.get(model_id)
+                        if own is not None and own.state == EngineState.DRAINING:
+                            # §P3 loser path: a concurrent reservation is
+                            # DRAINING OUR model and is parked until our lease
+                            # drops. Any wait here re-creates the cycle (it
+                            # waits on us). Run best-effort NOW — one bounded
+                            # overshoot — finish, release the lease, and the
+                            # winner's drain completes with real headroom.
+                            self._inflight_reservations += est_bytes
+                            reserved = True
+                            logger.warning(
+                                "reserve_inference: %s over budget while a "
+                                "concurrent reservation drains it — yielding "
+                                "best-effort to unblock the drain (Metal may "
+                                "OOM)", model_id,
                             )
-                            ev = self._entries[victim].unload_complete
-                    else:
+                            break
                         ev = self._pending_reclaim_event(model_id)
+                        if (
+                            ev is None
+                            and self._inflight_reservations > 0
+                            and est_bytes
+                            <= self._wall_budget() - self._committed_memory()
+                        ):
+                            # §P2: over budget ONLY because of other in-flight
+                            # transients (weights alone leave room for us) —
+                            # they release in seconds. Wait for the next
+                            # release pulse instead of decoding over the wall;
+                            # the timeout backstop below still degrades to
+                            # best-effort if a release never comes.
+                            ev = self._reservation_released
                         if ev is None:
                             # Only pinned models + self remain and nothing is
                             # freeing: last-resort best-effort. Log loudly; the
@@ -2247,6 +2336,13 @@ class EnginePool:
                 self._inflight_reservations = max(
                     0, self._inflight_reservations - est_bytes
                 )
+                # §P2 release pulse: wake waiters parked on "a transient will
+                # clear in seconds". Swap-then-set (all sync — still safe in
+                # this lock-free finally): waiters that grabbed the OLD event
+                # wake now; later waiters grab the fresh one.
+                released_pulse = self._reservation_released
+                self._reservation_released = asyncio.Event()
+                released_pulse.set()
 
     def is_engine_actively_held(self, entry: EngineEntry) -> bool:
         """Strict check: handler currently holds a lease OR scheduler is running.

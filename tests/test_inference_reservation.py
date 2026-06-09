@@ -27,6 +27,7 @@ from omlx.engine_pool import (
     EnginePool,
     EngineState,
 )
+from omlx.exceptions import ModelTooLargeError
 
 GiB = 1024**3
 MiB = 1024**2
@@ -873,3 +874,229 @@ class TestDrainingSelfNoDeadlock:
         assert pool._find_drain_or_evict_candidate(exclude_model_id="tts") == "embed"
         # ...and without exclusion it would (wrongly, for inference) pick self.
         assert pool._find_drain_or_evict_candidate() == "tts"
+
+
+# ---------------------------------------------------------------------------
+# §P2/§P3/§P4 — admission fixes (2026-06-09 stress Metal-panic follow-up)
+# ---------------------------------------------------------------------------
+
+
+class TestReservationReleaseWait:
+    """§P2 — overshoot attributable to in-flight transients ⇒ WAIT for the
+    release pulse, never best-effort/507 for pressure that clears in seconds."""
+
+    @pytest.mark.asyncio
+    async def test_waiter_proceeds_on_release_not_best_effort(self, monkeypatch):
+        pool = _make_pool()
+        _patch_cap(monkeypatch, 50 * GiB)  # budget 46
+        _add_entry(pool, "pinned-big", size=40 * GiB, is_pinned=True)
+        _add_entry(pool, "embed", size=4 * GiB, busy=True)  # self
+        # committed 44; weight-free room = 2 GiB exactly.
+        pool._unload_engine = AsyncMock(
+            side_effect=AssertionError("pinned/self must not be evicted")
+        )
+        pool._start_drain = MagicMock(
+            side_effect=AssertionError("nothing should drain")
+        )
+
+        a = pool.reserve_inference("embed", 2 * GiB)
+        await a.__aenter__()
+        assert pool._inflight_reservations == 2 * GiB
+
+        admitted = asyncio.Event()
+
+        async def _op_b():
+            async with pool.reserve_inference("embed", 2 * GiB):
+                admitted.set()
+
+        tb = asyncio.create_task(_op_b())
+        await asyncio.sleep(0.05)
+        # B is over budget ONLY because of A's transient: it must be WAITING
+        # (not admitted, not best-effort — best-effort would read 4 GiB here).
+        assert not admitted.is_set()
+        assert pool._inflight_reservations == 2 * GiB
+
+        await a.__aexit__(None, None, None)  # release fires the pulse
+        await asyncio.wait_for(admitted.wait(), timeout=2.0)
+        await tb
+        assert pool._inflight_reservations == 0
+
+    @pytest.mark.asyncio
+    async def test_load_waits_for_release_instead_of_507(self, monkeypatch):
+        """_prepare_memory_for: weights fit, transients overshoot ⇒ return the
+        release event (caller waits + retries) — NOT ModelTooLargeError."""
+        pool = _make_pool()
+        monkeypatch.setattr(pool, "_current_ceiling", lambda: 46 * GiB)
+        _add_entry(pool, "pinned-big", size=40 * GiB, is_pinned=True)
+        target = _add_entry(pool, "embed", size=4 * GiB)
+        target.engine = None
+        target.state = EngineState.UNLOADED
+        pool._inflight_reservations = 4 * GiB  # a live transient
+
+        ev = await pool._prepare_memory_for(target)
+        assert ev is pool._reservation_released
+
+        # With NO transients and weights alone over the ceiling, it still
+        # raises — the permanent case stays a permanent error.
+        pool._inflight_reservations = 0
+        monkeypatch.setattr(pool, "_current_ceiling", lambda: 43 * GiB)
+        with pytest.raises(ModelTooLargeError):
+            await pool._prepare_memory_for(target)
+
+    @pytest.mark.asyncio
+    async def test_release_pulse_is_edge_triggered(self, monkeypatch):
+        """Each release swaps in a fresh event: a waiter that arrives AFTER a
+        pulse must not see a stale set() and busy-loop through admission."""
+        pool = _make_pool()
+        _patch_cap(monkeypatch, 50 * GiB)
+        _add_entry(pool, "m", size=1 * GiB)
+        before = pool._reservation_released
+        async with pool.reserve_inference("m", 1 * GiB):
+            pass
+        after = pool._reservation_released
+        assert before.is_set() and not after.is_set()
+        assert before is not after
+
+
+class TestDrainDirection:
+    """§P3 — busy-victim drains are DIRECTIONAL (smaller key drains larger);
+    the mutual-drain standoff (both ops parked on each other's drain for the
+    full timeout, then BOTH overshooting) is unrepresentable."""
+
+    @pytest.mark.asyncio
+    async def test_larger_key_may_not_drain_busy_victim(self, monkeypatch):
+        pool = _make_pool()
+        _patch_cap(monkeypatch, 50 * GiB)  # budget 46
+        _add_entry(pool, "a-embed", size=24 * GiB, busy=True, last_access=0.5)
+        _add_entry(pool, "b-tts", size=20 * GiB, busy=True, last_access=5.0)
+        pool._start_drain = MagicMock(
+            side_effect=AssertionError("'b-tts' must not drain 'a-embed'")
+        )
+        # Over budget for the op on 'b-tts'; only busy 'a-embed' is a candidate
+        # but the direction is disallowed → nothing reclaimable → best-effort
+        # (bounded, loud) instead of a mutual-drain standoff.
+        async with pool.reserve_inference("b-tts", 4 * GiB):
+            assert pool._inflight_reservations == 4 * GiB
+        assert pool._entries["a-embed"].state == EngineState.ACTIVE
+
+    @pytest.mark.asyncio
+    async def test_smaller_key_drains_busy_victim_and_waits(self, monkeypatch):
+        import time as _time
+
+        pool = _make_pool()
+        _patch_cap(monkeypatch, 50 * GiB)  # budget 46
+        _add_entry(pool, "a-tts", size=20 * GiB, busy=True, last_access=5.0)
+        _add_entry(pool, "b-embed", size=24 * GiB, busy=True, last_access=0.5)
+
+        def _fake_start_drain(mid):
+            e = pool._entries[mid]
+            e.state = EngineState.DRAINING
+            e.drain_complete = asyncio.Event()
+            e.drain_started = _time.time()
+
+        pool._start_drain = MagicMock(side_effect=_fake_start_drain)
+
+        admitted = asyncio.Event()
+
+        async def _op():
+            async with pool.reserve_inference("a-tts", 4 * GiB):
+                admitted.set()
+
+        t = asyncio.create_task(_op())
+        await asyncio.sleep(0.05)
+        # The allowed direction drained the busy victim and is WAITING on it.
+        pool._start_drain.assert_called_once_with("b-embed")
+        assert pool._entries["b-embed"].state == EngineState.DRAINING
+        assert not admitted.is_set()
+
+        # Victim's requests finish → drain completes → the op proceeds.
+        victim = pool._entries["b-embed"]
+        victim.engine = None
+        victim.state = EngineState.UNLOADED
+        victim.drain_complete.set()
+        await asyncio.wait_for(admitted.wait(), timeout=2.0)
+        await t
+
+    @pytest.mark.asyncio
+    async def test_loser_with_own_model_draining_yields_immediately(self, monkeypatch):
+        """The mutual shape: the winner is already draining OUR model and is
+        parked until our lease drops. Any wait here re-creates the cycle — the
+        loser must run best-effort NOW (one bounded overshoot) so its lease
+        drops and the winner's drain completes."""
+        pool = _make_pool()
+        _patch_cap(monkeypatch, 50 * GiB)  # budget 46
+        _add_entry(pool, "a-embed", size=24 * GiB, busy=True, last_access=0.5)
+        own = _add_entry(pool, "b-tts", size=20 * GiB, busy=True, last_access=5.0)
+        own.state = EngineState.DRAINING  # the winner already drained us
+        pool._start_drain = MagicMock(
+            side_effect=AssertionError("loser must not start a counter-drain")
+        )
+
+        async with asyncio.timeout(2.0):
+            async with pool.reserve_inference("b-tts", 4 * GiB):
+                assert pool._inflight_reservations == 4 * GiB
+        assert pool._inflight_reservations == 0
+
+
+class TestQueueHeadReservation:
+    """§P4 — the reservation is taken at the op's executor turn (after the
+    queue ping), not at method entry: K queued ops no longer sum K×est of
+    phantom pressure that evicts co-resident models."""
+
+    @pytest.mark.asyncio
+    async def test_ping_runs_before_reserve(self, monkeypatch):
+        from contextlib import asynccontextmanager
+
+        import omlx.engine.base as base_mod
+
+        order = []
+
+        class _RecordingExecutor:
+            def submit(self, fn, *args, **kwargs):
+                order.append("ping" if fn is base_mod._executor_queue_ping
+                             else "other")
+                import concurrent.futures
+                f = concurrent.futures.Future()
+                f.set_result(fn(*args, **kwargs))
+                return f
+
+        monkeypatch.setattr(
+            base_mod, "get_mlx_executor", lambda: _RecordingExecutor()
+        )
+
+        class _FakePool:
+            @asynccontextmanager
+            async def reserve_inference(self, mid, est):
+                order.append(f"reserve:{mid}:{est}")
+                yield
+
+        eng = TTSEngine("/fake/path-m")
+        eng._pool = _FakePool()
+        eng._pool_model_id = "m"
+        async with eng._reserved_working_set(1024):
+            order.append("body")
+        assert order == ["ping", "reserve:m:1024", "body"]
+
+    @pytest.mark.asyncio
+    async def test_zero_estimate_skips_the_ping(self, monkeypatch):
+        import omlx.engine.base as base_mod
+
+        pinged = []
+        monkeypatch.setattr(
+            base_mod, "get_mlx_executor",
+            lambda: pinged.append("ping") or None,
+        )
+
+        from contextlib import asynccontextmanager
+
+        class _FakePool:
+            @asynccontextmanager
+            async def reserve_inference(self, mid, est):
+                yield
+
+        eng = TTSEngine("/fake/path-m")
+        eng._pool = _FakePool()
+        eng._pool_model_id = "m"
+        async with eng._reserved_working_set(0):
+            pass
+        assert pinged == []
