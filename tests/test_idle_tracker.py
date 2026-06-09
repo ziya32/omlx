@@ -37,10 +37,16 @@ TEST_API_KEY = "test-api-key"
 # ---------------------------------------------------------------------------
 
 
-def _pool_with_active(n_active: int):
-    """Build a MagicMock engine pool whose engines report ``n_active``
-    in-flight requests via ``_output_collectors`` — the same field the real
-    ``/api/status`` walk and ``_count_active_requests`` aggregate."""
+def _pool_with_active(n_active: int, n_leases: int | None = None):
+    """Build a MagicMock engine pool.
+
+    ``n_active`` requests are reported as actively COMPUTING via each engine's
+    ``_output_collectors`` (the in-scheduler signal the ``/api/status`` walk
+    aggregates). ``n_leases`` is the pool-wide ``total_active_uses`` — engine
+    leases held OR awaited — and defaults to ``n_active``. Pass
+    ``n_leases > n_active`` to simulate requests **blocked in get_engine**
+    (lease acquired before the ``get_engine`` await, so they hold a lease but
+    populate no collector and bump no ``_in_flight``)."""
     core = MagicMock(spec=["_output_collectors", "scheduler"])
     core._output_collectors = {f"req-{i}": None for i in range(n_active)}
     core.scheduler = None
@@ -55,8 +61,9 @@ def _pool_with_active(n_active: int):
     entry.is_loading = False
     entry.engine = engine
 
-    pool = MagicMock(spec=["_entries"])
+    pool = MagicMock(spec=["_entries", "total_active_uses"])
     pool._entries = {"model-a": entry}
+    pool.total_active_uses = n_active if n_leases is None else n_leases
     return pool
 
 
@@ -256,13 +263,14 @@ def test_count_active_requests_handles_partial_engines(server_state):
     entry_no_core.engine = engine_no_core
 
     full = _pool_with_active(4)._entries["model-a"]
-    pool = MagicMock(spec=["_entries"])
+    pool = MagicMock(spec=["_entries", "total_active_uses"])
     pool._entries = {
         "empty": empty,
         "no-async": entry_no_async,
         "no-core": entry_no_core,
         "model-a": full,
     }
+    pool.total_active_uses = 0  # isolate the collector walk (the partial-engine path)
     server_state.engine_pool = pool
     assert server._count_active_requests() == 4
 
@@ -672,3 +680,75 @@ def test_concurrent_in_flight_counts_are_correct(server_state):
     asyncio.run(_drive())
     assert peak["value"] == 5  # all five were counted simultaneously
     assert server._count_active_requests() == 0
+
+
+# ---------------------------------------------------------------------------
+# BLOCKED-IN-GET_ENGINE counting (fix-dreaming follow-up)
+#
+# acquire_engine (active_uses) fires BEFORE the get_engine await, but a request
+# path's _enter_inference / _output_collectors only populate AFTER it. So a
+# request blocked waiting for a loading / draining / exclusive-contended model
+# holds an engine LEASE yet is invisible to _in_flight and the collector walk.
+# /v1/idle must still read busy via the pool's total_active_uses, or the
+# dream/zone gate fires into a wedged-but-not-computing server.
+# ---------------------------------------------------------------------------
+
+
+def test_total_active_uses_sums_leases_ignoring_pins():
+    """The pool property sums every entry's active_uses; an idle PINNED model
+    contributes 0 (pinning is a separate flag — no baseline to subtract)."""
+    from omlx.engine_pool import EngineEntry, EnginePool
+
+    def _entry(model_id, active_uses, pinned=False):
+        return EngineEntry(
+            model_id=model_id, model_path=f"/x/{model_id}",
+            model_type="embedding", engine_type="embedding",
+            estimated_size=0, active_uses=active_uses, is_pinned=pinned,
+        )
+
+    pool = EnginePool.__new__(EnginePool)  # bypass the model-dir scan; test the property
+    pool._entries = {
+        "busy": _entry("busy", 2),
+        "pinned-idle": _entry("pinned-idle", 0, pinned=True),
+        "one": _entry("one", 1),
+    }
+    assert pool.total_active_uses == 3  # 2 + 0 + 1 — the pin adds nothing
+    pool._entries = {}
+    assert pool.total_active_uses == 0
+
+
+def test_count_active_requests_counts_blocked_in_get_engine(server_state):
+    """A request BLOCKED in get_engine holds a lease (active_uses>0) but has not
+    started computing — no _output_collectors, no _in_flight. The server must
+    STILL report it via total_active_uses, else /v1/idle reads idle while the
+    server is wedged (the regression that let a dream fire into a busy omlx)."""
+    server_state.engine_pool = _pool_with_active(n_active=0, n_leases=2)
+    assert server._in_flight_requests == 0
+    assert server._count_active_requests() == 2
+    snap = server.get_idle_snapshot()
+    assert snap["active_requests"] == 2
+    assert snap["busy"] is True
+
+
+def test_idle_endpoint_busy_for_blocked_acquire(client, server_state):
+    """End-to-end through HTTP: a request blocked waiting to ACQUIRE a model
+    reads busy via GET /v1/idle (and /health) even though nothing computes."""
+    server_state.engine_pool = _pool_with_active(n_active=0, n_leases=1)
+    data = client.get("/v1/idle").json()
+    assert data["active_requests"] == 1
+    assert data["busy"] is True
+
+
+def test_count_active_requests_max_includes_active_uses(server_state):
+    """total_active_uses is the authoritative superset: one request seen as a
+    lease AND a collector AND _in_flight stays 1 (max, not sum); and leases win
+    when they exceed the computing signals (1 computing + 2 blocked-in-acquire)."""
+    server_state.engine_pool = _pool_with_active(n_active=1, n_leases=1)
+    server._enter_inference()
+    try:
+        assert server._count_active_requests() == 1
+    finally:
+        server._exit_inference()
+
+    server_state.engine_pool = _pool_with_active(n_active=1, n_leases=3)
+    assert server._count_active_requests() == 3

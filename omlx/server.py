@@ -336,22 +336,26 @@ def _exit_inference() -> None:
 def _count_active_requests() -> int:
     """Aggregate in-flight inference requests server-wide.
 
-    Combines two independent signals and returns the larger:
+    Returns the MAX of three signals (max, not sum, so a single request that
+    appears in several at once isn't double-counted):
 
-    * the explicit ``_in_flight_requests`` counter, bracketing the full
-      inference window (entry→exit) for EVERY request class — including
-      non-streaming chat/completions and the scheduler-less embedding / rerank /
-      token-count / audio paths; and
-    * the per-engine ``_output_collectors`` walk the ``/api/status`` endpoint
-      reports, which sees concurrent in-scheduler LLM token requests.
+    * **the engine pool's ``total_active_uses``** — the authoritative signal.
+      Every request path (``use_engine``, audio ``_use_engine``, the embeddings
+      endpoint) calls ``acquire_engine`` BEFORE its ``get_engine`` await, so this
+      counts a request for its WHOLE lifetime, **including the time it is blocked
+      waiting to acquire** a loading / draining / exclusive-contended model. This
+      closes the blind spot where a request wedged in ``get_engine`` held an
+      engine lease (``active_uses>0``) yet ``/v1/idle`` read idle — letting the
+      dream/zone gate fire into a contended server (see fix-dreaming notes).
+    * the ``_in_flight_requests`` counter, which brackets the window from INSIDE
+      ``use_engine`` / ``_with_engine_guard`` (i.e. only once PAST ``get_engine``)
+      — a subset of ``active_uses``, kept as defense against a transient
+      ``active_uses`` dip during a get_engine→acquire hand-off; and
+    * the per-engine ``_output_collectors`` the ``/api/status`` endpoint walks,
+      which sees concurrent in-scheduler LLM token requests.
 
-    ``max`` (rather than a sum) is deliberate: a single non-streaming token
-    request shows up in BOTH signals at once (the counter for its whole life,
-    the collector during its scheduler step), so summing would double-count it.
-    Taking the max keeps a lone request at 1 while still surfacing the true
-    concurrency when many distinct requests are in flight (each bumps the
-    counter, so the counter ≥ the collector total). Erring toward over-counting
-    busy is the safe direction for the idle gate — under-counting is the bug.
+    Erring toward over-counting busy is the safe direction for the idle gate —
+    under-counting is the bug (it let a dream fire into a busy omlx).
 
     Returns 0 when nothing is in flight (and the pool may not be initialized).
     """
@@ -373,7 +377,11 @@ def _count_active_requests() -> int:
                 continue
             collector_active += len(getattr(core, "_output_collectors", {}))
 
-    return max(in_flight, collector_active)
+    # The authoritative count: engine leases held OR awaited (covers the
+    # blocked-in-get_engine window that the two signals above miss).
+    pool_active_uses = pool.total_active_uses if pool is not None else 0
+
+    return max(in_flight, collector_active, pool_active_uses)
 
 
 def get_idle_snapshot() -> dict:

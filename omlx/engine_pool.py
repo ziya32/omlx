@@ -421,6 +421,23 @@ class EnginePool:
         """Number of currently loaded models."""
         return sum(1 for e in self._entries.values() if e.engine is not None)
 
+    @property
+    def total_active_uses(self) -> int:
+        """Total in-flight engine leases across all models.
+
+        The sum of every entry's ``active_uses`` — the number of request
+        handlers that have acquired, **or are blocked waiting to acquire**, an
+        engine. ``acquire_engine`` is the single chokepoint every request path
+        (``use_engine``, audio ``_use_engine``, the embeddings endpoint) calls
+        BEFORE its ``get_engine`` await, so a request wedged waiting for a
+        loading / draining / exclusive-contended model still counts here even
+        though it is not yet computing. Pinning is a separate flag
+        (``is_pinned``), so an idle pinned model contributes 0 — no baseline to
+        subtract. Used by the server-wide idle tracker (``/v1/idle``) so a
+        contended-but-not-computing server never reads as idle.
+        """
+        return sum(e.active_uses for e in self._entries.values())
+
     # -------------------------------------------------------------------------
     # Vision limits (memory-aware, pre-load)
     # -------------------------------------------------------------------------
