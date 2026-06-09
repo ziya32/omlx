@@ -27,6 +27,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import omlx.server as server
+from omlx.engine_pool import EnginePool
 from omlx.server import ServerState, app
 
 TEST_API_KEY = "test-api-key"
@@ -37,16 +38,24 @@ TEST_API_KEY = "test-api-key"
 # ---------------------------------------------------------------------------
 
 
-def _pool_with_active(n_active: int, n_leases: int | None = None):
+def _pool_with_active(
+    n_active: int,
+    n_leases: int | None = None,
+    *,
+    n_parked: int = 0,
+    n_loading: int = 0,
+):
     """Build a MagicMock engine pool.
 
-    ``n_active`` requests are reported as actively COMPUTING via each engine's
-    ``_output_collectors`` (the in-scheduler signal the ``/api/status`` walk
-    aggregates). ``n_leases`` is the pool-wide ``total_active_uses`` — engine
-    leases held OR awaited — and defaults to ``n_active``. Pass
-    ``n_leases > n_active`` to simulate requests **blocked in get_engine**
-    (lease acquired before the ``get_engine`` await, so they hold a lease but
-    populate no collector and bump no ``_in_flight``)."""
+    ``n_active`` requests are reported as actively COMPUTING via the pool's
+    ``llm_request_counts()`` (the in-scheduler signal, walked pool-side).
+    ``n_leases`` is the pool-wide ``total_active_uses`` — engine leases held
+    OR awaited — and defaults to ``n_active``. Pass ``n_leases > n_active``
+    to simulate requests **blocked in get_engine** (lease acquired before the
+    ``get_engine`` await, so they hold a lease but populate no collector and
+    bump no ``_in_flight``). ``n_parked`` simulates requests parked
+    lease-LESS at the exclusive-contention gate; ``n_loading`` simulates
+    in-flight model loads — both must read busy on ``/v1/idle``."""
     core = MagicMock(spec=["_output_collectors", "scheduler"])
     core._output_collectors = {f"req-{i}": None for i in range(n_active)}
     core.scheduler = None
@@ -61,9 +70,18 @@ def _pool_with_active(n_active: int, n_leases: int | None = None):
     entry.is_loading = False
     entry.engine = engine
 
-    pool = MagicMock(spec=["_entries", "total_active_uses"])
+    pool = MagicMock(spec=[
+        "_entries",
+        "total_active_uses",
+        "contention_parked",
+        "loading_model_count",
+        "llm_request_counts",
+    ])
     pool._entries = {"model-a": entry}
     pool.total_active_uses = n_active if n_leases is None else n_leases
+    pool.contention_parked = n_parked
+    pool.loading_model_count = n_loading
+    pool.llm_request_counts.return_value = (n_active, 0)
     return pool
 
 
@@ -82,15 +100,22 @@ def server_state():
 
 @pytest.fixture(autouse=True)
 def _reset_in_flight():
-    """Reset the module-level in-flight counter around every test.
+    """Reset the module-level idle-tracker globals around every test.
 
     ``_in_flight_requests`` is a process-global; without this a leaked count
     from one test (or a balanced enter/exit that left it at a non-zero
     baseline) would bleed into the next. Asserts it is balanced at teardown so
     a missing decrement anywhere is caught as a test failure, not silently
-    carried forward."""
+    carried forward.
+
+    ``_last_inference_at`` is also a process-global: tests that exercise
+    ``record_inference_activity`` under a patched ``time.monotonic`` would
+    otherwise leave a fake epoch (111.0 / 999.0) behind, poisoning every
+    later test's real ``idle_seconds`` with hours of phantom idleness."""
     server._in_flight_requests = 0
+    saved_last_inference = server._last_inference_at
     yield
+    server._last_inference_at = saved_last_inference
     assert server._in_flight_requests == 0, (
         "in-flight counter leaked: " f"{server._in_flight_requests}"
     )
@@ -238,8 +263,10 @@ def test_idle_seconds_never_negative(server_state):
     assert snap["idle_seconds"] == 0.0
 
 
-def test_count_active_requests_handles_partial_engines(server_state):
-    """_count_active_requests tolerates None engines / missing cores."""
+def test_llm_request_counts_handles_partial_engines(server_state):
+    """EnginePool.llm_request_counts (the one private-attr walk, now pool-side
+    so /v1/idle and /api/status share it) tolerates None engines / missing
+    cores; and _count_active_requests returns 0 with no pool at all."""
     # Pool is None → 0.
     server_state.engine_pool = None
     assert server._count_active_requests() == 0
@@ -263,15 +290,48 @@ def test_count_active_requests_handles_partial_engines(server_state):
     entry_no_core.engine = engine_no_core
 
     full = _pool_with_active(4)._entries["model-a"]
-    pool = MagicMock(spec=["_entries", "total_active_uses"])
+    pool = EnginePool()
     pool._entries = {
         "empty": empty,
         "no-async": entry_no_async,
         "no-core": entry_no_core,
         "model-a": full,
     }
-    pool.total_active_uses = 0  # isolate the collector walk (the partial-engine path)
-    server_state.engine_pool = pool
+    assert pool.llm_request_counts() == (4, 0)
+
+
+def test_idle_endpoint_busy_for_parked_contention_waiter(client, server_state):
+    """A request parked lease-LESS at the exclusive-contention gate (its lease
+    is released while it waits so the eviction drain stays unblocked) must
+    still read busy via /v1/idle — contention_parked keeps it visible."""
+    server_state.engine_pool = _pool_with_active(
+        n_active=0, n_leases=0, n_parked=1
+    )
+    data = client.get("/v1/idle").json()
+    assert data["active_requests"] == 1
+    assert data["busy"] is True
+
+
+def test_idle_endpoint_busy_during_model_load(client, server_state):
+    """An in-flight model LOAD must read busy — a load may be driven by a
+    lease-less caller (public/admin load, pinned preload), and tens of GB
+    mid-load is exactly when admitting a model-loading dream is most
+    dangerous."""
+    server_state.engine_pool = _pool_with_active(
+        n_active=0, n_leases=0, n_loading=1
+    )
+    data = client.get("/v1/idle").json()
+    assert data["active_requests"] == 1
+    assert data["busy"] is True
+
+
+def test_pool_busy_components_sum_disjoint_populations(server_state):
+    """Leases + parked + loading are DISJOINT populations (a parked waiter
+    released its lease; a lease-less load holds none) — the pool signal sums
+    them rather than maxing."""
+    server_state.engine_pool = _pool_with_active(
+        n_active=1, n_leases=2, n_parked=1, n_loading=1
+    )
     assert server._count_active_requests() == 4
 
 

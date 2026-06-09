@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1567,18 +1568,130 @@ class TestExclusiveContentionLeaseRelease:
         assert emb.active_uses == 1   # re-acquired on wake, held for the caller
 
     @pytest.mark.asyncio
-    async def test_timeout_while_parked_leaves_lease_released_no_underflow(self, pool):
-        """If the park times out, the released lease stays released, and the
-        server's finally release_engine is a clamped no-op (never negative)."""
+    async def test_timeout_while_parked_reacquires_so_callers_release_balances(self, pool):
+        """A park TIMEOUT must re-acquire the released lease before raising.
+
+        get_engine must never raise with the caller's lease consumed: the
+        caller's finally calls release_engine unconditionally, and an
+        un-re-acquired park would make that a DOUBLE release — stealing a
+        sibling in-flight request's lease (active_uses → 0 mid-inference →
+        the drain monitor / _clear_for_exclusive evicts the engine under it).
+        release_engine's at-zero clamp would mask the theft, so assert the
+        SIBLING's count, not mere non-negativity.
+        """
         emb = pool._entries["model-b"]
         pool._max_wait_timeout = 0.05  # fast timeout; exclusive stays busy
 
         pool.acquire_engine("model-a")
-        pool.acquire_engine("model-b")
+        pool.acquire_engine("model-b")  # the timed-out caller's lease
+        pool.acquire_engine("model-b")  # a SIBLING request mid-inference
         with pytest.raises(ModelLoadingError):
             await pool.get_engine("model-b")
-        # The fix released the lease at the defer; the request never re-acquired
-        # (it timed out), so exactly one net decrement — no underflow.
-        assert emb.active_uses == 0
-        pool.release_engine("model-b")  # simulate the server-side finally
-        assert emb.active_uses == 0
+        # The wait's finally re-acquired the parked lease before the raise:
+        # the caller still owns exactly one, the sibling owns one.
+        assert emb.active_uses == 2
+        assert pool.contention_parked == 0
+        pool.release_engine("model-b")  # the caller's finally
+        assert emb.active_uses == 1     # the sibling's lease is intact
+
+    @pytest.mark.asyncio
+    async def test_cancel_while_parked_reacquires_so_callers_release_balances(self, pool):
+        """Client disconnect (CancelledError) while parked must also re-acquire.
+
+        Same invariant as the timeout path: the caller's finally release must
+        stay balanced, or each disconnect under exclusive contention cancels
+        one unrelated in-flight request's lease.
+        """
+        emb = pool._entries["model-b"]
+
+        pool.acquire_engine("model-a")
+        pool.acquire_engine("model-b")  # the cancelled caller's lease
+        pool.acquire_engine("model-b")  # a SIBLING request mid-inference
+
+        task = asyncio.create_task(pool.get_engine("model-b"))
+        try:
+            for _ in range(400):
+                if pool.contention_parked == 1:
+                    break
+                await asyncio.sleep(0.005)
+            else:
+                raise AssertionError("get_engine never parked")
+            # Parked: the caller's lease is released, the sibling's remains.
+            assert emb.active_uses == 1
+
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            if not task.done():
+                task.cancel()
+
+        # The wait's finally re-acquired before CancelledError propagated.
+        assert emb.active_uses == 2
+        assert pool.contention_parked == 0
+        pool.release_engine("model-b")  # the caller's finally
+        assert emb.active_uses == 1     # the sibling's lease is intact
+
+    @pytest.mark.asyncio
+    async def test_parked_waiter_is_counted_for_idle_busyness(self, pool):
+        """While parked, the waiter is invisible to total_active_uses (its
+        lease is released) — contention_parked must keep it visible so
+        /v1/idle never reads a contended server as idle."""
+        excl = pool._entries["model-a"]
+
+        pool.acquire_engine("model-a")
+        pool.acquire_engine("model-b")
+        assert pool.contention_parked == 0
+
+        task = asyncio.create_task(pool.get_engine("model-b"))
+        try:
+            for _ in range(400):
+                if pool.contention_parked == 1:
+                    break
+                await asyncio.sleep(0.005)
+            else:
+                raise AssertionError("get_engine never parked")
+            # The parked waiter dropped its lease but stays countable.
+            assert pool._entries["model-b"].active_uses == 0
+            assert pool.contention_parked == 1
+
+            excl.active_uses = 0
+            excl.exclusive_idle.set()
+            await asyncio.wait_for(task, timeout=2.0)
+        finally:
+            if not task.done():
+                task.cancel()
+        assert pool.contention_parked == 0
+
+    @pytest.mark.asyncio
+    async def test_dip_grace_anchors_on_request_end_not_dispatch(self, pool):
+        """The exclusive-defer dip grace must anchor on max(last_access,
+        last_release): last_access is stamped at DISPATCH, so for any
+        exclusive request longer than the grace the post-release dip looked
+        ancient and a non-pinned load slipped in beside the 44GB model (the
+        2026-06-05 coexistence OOM the grace exists to prevent)."""
+        excl = pool._entries["model-a"]
+        emb = pool._entries["model-b"]
+
+        # The exclusive chat DISPATCHED long ago and JUST finished.
+        excl.active_uses = 0
+        excl.last_access = time.time() - 60.0
+        excl.last_release = time.time() - 0.05
+        # A non-pinned LOAD admitted into this dip must be deferred...
+        emb.engine = None
+        emb.state = EngineState.UNLOADED
+        ev = await pool._prepare_memory_for(emb)
+        assert ev is not None, (
+            "dip unprotected: grace anchored on dispatch-time last_access"
+        )
+        # ...and with the dip fully aged out, the load proceeds.
+        excl.last_release = time.time() - 10.0
+        ev2 = await pool._prepare_memory_for(emb)
+        assert ev2 is None
+
+    def test_release_engine_stamps_last_release(self, pool):
+        emb = pool._entries["model-b"]
+        assert emb.last_release == 0.0
+        pool.acquire_engine("model-b")
+        pool.release_engine("model-b")
+        assert emb.last_release > 0.0

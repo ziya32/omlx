@@ -452,10 +452,42 @@ class TestVictimSelection:
 
 
 class TestEstimateHooks:
-    def test_base_default_zero(self):
+    def test_base_default_is_forward_estimate(self):
+        # The base default delegates to the single-forward estimate
+        # (0.08 × resident weights, shared by STT/STS/embedding/reranker)
+        # instead of four identical one-line overrides.
         eng = MagicMock(spec=BaseNonStreamingEngine)
-        # The real default returns 0.
+        eng._estimate_forward_working_set_bytes.return_value = 0
         assert BaseNonStreamingEngine.estimate_working_set_bytes(eng) == 0
+        eng._estimate_forward_working_set_bytes.return_value = 7
+        assert BaseNonStreamingEngine.estimate_working_set_bytes(eng) == 7
+
+    def test_unpooled_engine_estimates_zero(self):
+        # A real engine with no pool reserves nothing (strict no-op, §5).
+        eng = TTSEngine("fake-tts")
+        assert eng._resident_weight_bytes() == 0
+        assert eng._estimate_forward_working_set_bytes() == 0
+
+    def test_forward_estimate_uses_stamped_pool_key_not_path(self):
+        """Production engines carry model_name = the full model PATH while
+        ``_entries`` is keyed by the short id, so a model_name lookup ALWAYS
+        missed and silently zeroed every forward-engine reservation (the §3d
+        guard was dead in pooled production). The estimate must resolve via
+        the ``_pool_model_id`` the pool stamps at load."""
+        import math
+
+        eng = TTSEngine("/fake/m")  # path-style name — the production shape
+        pool = _make_pool()
+        _add_entry(pool, "m", size=10 * GiB)
+        eng._pool = pool
+        # Without the stamp the lookup misses (the historical silent no-op)…
+        assert eng._resident_weight_bytes() == 0
+        # …with the load-time stamp it resolves the real entry.
+        eng._pool_model_id = "m"
+        assert eng._resident_weight_bytes() == 10 * GiB
+        assert eng._estimate_forward_working_set_bytes() == math.ceil(
+            10 * GiB * 0.08
+        )
 
     def test_tts_default_max_tokens(self):
         eng = TTSEngine("fake-tts")

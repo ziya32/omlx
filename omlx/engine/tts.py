@@ -9,7 +9,6 @@ when mlx-audio is not installed.
 """
 
 import asyncio
-import contextlib
 import json
 import logging
 from collections.abc import AsyncIterator
@@ -468,21 +467,12 @@ class TTSEngine(BaseNonStreamingEngine):
             # Reserve the whole-waveform decode transient against the Metal
             # wall BEFORE running it (§3d). The non-streaming decode
             # materializes the full waveform in one mx.eval — a multi-GB
-            # transient no resident-weight accounting models. reserve_inference
-            # is a strict no-op when est<=0 / no Metal cap. Guarded so
-            # non-pooled / unit-test use (self._pool is None) never touches the
-            # pool. Held across the generate/decode loop; released on every
-            # exit path (normal / AudioError / abort / cancel).
-            async with contextlib.AsyncExitStack() as _reserve_stack:
-                if self._pool is not None:
-                    await _reserve_stack.enter_async_context(
-                        self._pool.reserve_inference(
-                            self._model_name,
-                            self.estimate_working_set_bytes(
-                                text=text, max_tokens=max_tokens
-                            ),
-                        )
-                    )
+            # transient no resident-weight accounting models. No-op without a
+            # Metal cap / pool. Held across the generate/decode loop; released
+            # on every exit path (normal / AudioError / abort / cancel).
+            async with self._reserved_working_set(
+                self.estimate_working_set_bytes(text=text, max_tokens=max_tokens)
+            ):
                 loop = asyncio.get_running_loop()
                 executor = get_mlx_executor()
 
@@ -653,14 +643,9 @@ class TTSEngine(BaseNonStreamingEngine):
             # model (§3d / §4). No-op without a Metal cap or a pool. The
             # reservation is held across the whole stream and released when the
             # generator is exhausted / closed (client disconnect cancels it).
-            async with contextlib.AsyncExitStack() as _reserve_stack:
-                if self._pool is not None:
-                    await _reserve_stack.enter_async_context(
-                        self._pool.reserve_inference(
-                            self._model_name,
-                            self._estimate_streaming_working_set_bytes(),
-                        )
-                    )
+            async with self._reserved_working_set(
+                self._estimate_streaming_working_set_bytes()
+            ):
                 loop = asyncio.get_running_loop()
                 while True:
                     chunk = await loop.run_in_executor(get_mlx_executor(), _next_pcm_chunk)

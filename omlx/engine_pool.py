@@ -133,6 +133,10 @@ class EngineEntry:
     preserve_thinking_default: bool | None = None  # True when template supports preserve_thinking (Qwen 3.6+)
     engine: BaseEngine | EmbeddingEngine | RerankerEngine | STTEngine | STSEngine | TTSEngine | None = None  # Loaded engine instance
     last_access: float = 0.0  # Timestamp for LRU (0 if never loaded)
+    last_release: float = 0.0  # When a lease was last released (request END;
+    #                            last_access is bumped at dispatch = request
+    #                            START, so the exclusive-defer dip grace must
+    #                            anchor on max(last_access, last_release))
     is_pinned: bool = False  # Never evict if True
     abort_loading: bool = False  # Enforcer→loader signal: abort this in-flight
     #                              load (memory pressure). Reset at each load
@@ -230,10 +234,22 @@ class EnginePool:
         # inference size themselves against each other symmetrically under
         # this one lock. Incremented at admission by reserve_inference(),
         # subtracted in its finally; read by the scheduler's predictive
-        # generation guard via a synchronous callback (§3e). Read/written
-        # only under self._lock; the scheduler read is a lock-free atomic
-        # int load (GIL-safe).
+        # generation guard via a synchronous callback (§3e). Mutated only on
+        # the event loop (every mutation site is a coroutine, so plain int
+        # arithmetic is atomic between awaits); the scheduler read is a
+        # lock-free atomic int load (GIL-safe). The finally-decrement is
+        # deliberately LOCK-FREE: awaiting the pool lock inside a finally can
+        # be interrupted by a second CancelledError (or the lock-acquire
+        # timeout), permanently leaking the reservation.
         self._inflight_reservations: int = 0
+        # Requests currently PARKED at get_engine's exclusive-contention gate
+        # with their lease released (see the park in get_engine). They hold
+        # no active_uses while parked, so without this counter they would be
+        # invisible to total_active_uses / the /v1/idle busy signal.
+        # Incremented with the park-release, decremented with the wake
+        # re-acquire (both paired via the wait's try/finally); event-loop
+        # only, so plain int arithmetic suffices.
+        self._contention_parked: int = 0
 
     # -------------------------------------------------------------------------
     # State transition helpers
@@ -430,13 +446,70 @@ class EnginePool:
         engine. ``acquire_engine`` is the single chokepoint every request path
         (``use_engine``, audio ``_use_engine``, the embeddings endpoint) calls
         BEFORE its ``get_engine`` await, so a request wedged waiting for a
-        loading / draining / exclusive-contended model still counts here even
-        though it is not yet computing. Pinning is a separate flag
+        loading / draining model still counts here even though it is not yet
+        computing. ONE exception: a request parked at the exclusive-contention
+        gate has its lease RELEASED while it waits (so the idle engine stays
+        cleanly evictable) — those are tracked by ``contention_parked``
+        instead; busy-ness consumers must add both. Pinning is a separate flag
         (``is_pinned``), so an idle pinned model contributes 0 — no baseline to
         subtract. Used by the server-wide idle tracker (``/v1/idle``) so a
         contended-but-not-computing server never reads as idle.
         """
         return sum(e.active_uses for e in self._entries.values())
+
+    @property
+    def contention_parked(self) -> int:
+        """Requests parked (lease released) at the exclusive-contention gate.
+
+        Complements ``total_active_uses``: a parked waiter dropped its lease so
+        the eviction drain stays unblocked, which also removes it from the
+        lease count — this counter keeps it visible to ``/v1/idle`` busy-ness.
+        """
+        return self._contention_parked
+
+    @property
+    def loading_model_count(self) -> int:
+        """Number of entries with a model load currently in flight.
+
+        A load may be driven by a lease-less caller (TTS pre-validation
+        historically, the public/admin load endpoints, pinned preload), so the
+        lease count alone can read 0 while tens of GB are mid-load — exactly
+        when admitting gateway idle work (a second model load) is most
+        dangerous. ``/v1/idle`` counts these as busy.
+        """
+        return sum(
+            1 for e in self._entries.values()
+            if e.state == EngineState.LOADING
+        )
+
+    def llm_request_counts(self) -> tuple[int, int]:
+        """``(active, waiting)`` LLM scheduler requests across loaded engines.
+
+        Walks each batched engine's private chain
+        (``entry.engine._engine.engine``) to its ``_output_collectors`` /
+        ``scheduler.waiting``. The one fragile private-attr walk lives HERE —
+        next to ``_entries`` — so a core rename breaks exactly one place;
+        both ``/v1/idle``'s busy signal and ``/api/status`` read it.
+        Non-batched engines (embedding/audio) have no ``_engine`` chain and
+        contribute 0.
+        """
+        active = 0
+        waiting = 0
+        for entry in self._entries.values():
+            engine = entry.engine
+            if engine is None:
+                continue
+            async_core = getattr(engine, "_engine", None)
+            if async_core is None:
+                continue
+            core = getattr(async_core, "engine", None)
+            if core is None:
+                continue
+            active += len(getattr(core, "_output_collectors", {}))
+            sched = getattr(core, "scheduler", None)
+            if sched is not None:
+                waiting += len(getattr(sched, "waiting", []))
+        return active, waiting
 
     # -------------------------------------------------------------------------
     # Vision limits (memory-aware, pre-load)
@@ -753,7 +826,10 @@ class EnginePool:
         # When we park a non-pinned request at the exclusive-contention gate we
         # RELEASE its engine lease (so the now-idle engine can be evicted cleanly
         # for the exclusive model's headroom instead of dead-locking the drain)
-        # and re-acquire it on wake, before the next dispatch hands the engine out.
+        # and re-acquire it on EVERY wait exit — success, timeout, or
+        # cancellation — via the wait's try/finally, so the caller's paired
+        # release_engine() always stays balanced. While parked, the request is
+        # counted in _contention_parked so /v1/idle still sees it as busy.
         released_for_contention = False
 
         while True:
@@ -867,6 +943,7 @@ class EnginePool:
                             # exclusive-idle side effects.
                             self.release_engine(model_id)
                             released_for_contention = True
+                            self._contention_parked += 1
                             logger.debug(
                                 f"get_engine({model_id}) non-pinned deferred "
                                 f"(lease released): exclusive model active_uses>0"
@@ -1108,13 +1185,34 @@ class EnginePool:
                 )
 
                 try:
-                    await asyncio.wait_for(
-                        event.wait(), timeout=self._max_wait_timeout
-                    )
-                    logger.debug(
-                        f"get_engine({model_id}) woke from {wait_target}, "
-                        f"re-entering loop (iteration={iterations})"
-                    )
+                    try:
+                        await asyncio.wait_for(
+                            event.wait(), timeout=self._max_wait_timeout
+                        )
+                        logger.debug(
+                            f"get_engine({model_id}) woke from {wait_target}, "
+                            f"re-entering loop (iteration={iterations})"
+                        )
+                    finally:
+                        # Re-acquire the lease released at the exclusive-
+                        # contention park on EVERY wait exit — success, the
+                        # timeout raise below, or CancelledError (client
+                        # disconnect). get_engine must never return OR raise
+                        # with the caller's lease consumed: the caller's
+                        # paired release_engine() in its finally would
+                        # otherwise double-release and steal a SIBLING
+                        # request's lease on the same model (active_uses → 0
+                        # mid-inference → the drain monitor / enforcer evicts
+                        # the engine under it). This also keeps lease-less
+                        # get_engine callers (admin/public load endpoints)
+                        # net-zero if they ever park here. acquire_engine is
+                        # synchronous, so this is cancellation-safe; it runs
+                        # before the next dispatch can hand the engine out,
+                        # so the use-window stays eviction-protected.
+                        if released_for_contention:
+                            self.acquire_engine(model_id)
+                            released_for_contention = False
+                            self._contention_parked -= 1
                 except asyncio.TimeoutError:
                     elapsed = time.monotonic() - start_time
 
@@ -1145,15 +1243,6 @@ class EnginePool:
                         f"({self._max_wait_timeout}s)",
                         model_id=model_id,
                     )
-
-                # Woke from the wait (reached only on success — the except above
-                # either continues or raises). If we released our lease to park at
-                # the exclusive-contention gate, re-acquire it NOW, before the next
-                # dispatch can return or reload the engine, so the use-window is
-                # lease-protected again. Non-pinned ⇒ no exclusive side effects.
-                if released_for_contention:
-                    self.acquire_engine(model_id)
-                    released_for_contention = False
 
                 if __debug__:
                     logger.debug(
@@ -1264,6 +1353,12 @@ class EnginePool:
         entry = self._entries.get(model_id)
         if entry is not None and entry.active_uses > 0:
             entry.active_uses -= 1
+            # Request END timestamp. last_access is bumped at get_engine
+            # DISPATCH (request start), so for any request longer than the
+            # defer grace the post-release active_uses=0 dip would look
+            # ancient to _prepare_memory_for's dip check — the grace must
+            # anchor on max(last_access, last_release).
+            entry.last_release = time.time()
             if entry.exclusive:
                 logger.debug(
                     f"release_engine({model_id}) active_uses={entry.active_uses}"
@@ -1353,14 +1448,12 @@ class EnginePool:
         clearing the per-acquire event would.
         """
         ev = asyncio.Event()
-
-        async def _arm() -> None:
-            try:
-                await asyncio.sleep(delay)
-            finally:
-                ev.set()
-
-        asyncio.create_task(_arm())
+        # Scheduled on the loop's timer wheel (which holds a strong ref to the
+        # TimerHandle) instead of a bare fire-and-forget Task: asyncio keeps
+        # only weak references to tasks, so the Task form is one refactor away
+        # from being garbage-collected mid-sleep — leaving the waiter stuck
+        # for the full max_wait_timeout on an event nobody sets.
+        asyncio.get_running_loop().call_later(delay, ev.set)
         return ev
 
     def _refresh_vision_limits(self, entry: EngineEntry) -> None:
@@ -1473,19 +1566,26 @@ class EnginePool:
                                 f"model '{mid}' has {e.active_uses} active request(s)"
                             )
                         return e.exclusive_idle
-                    # active_uses==0 but accessed within the SHORT defer-grace: a request
-                    # is mid get_engine→acquire_engine (the active_uses=0 dip). Loading a
-                    # non-pinned model into that window coexists it with the (e.g. 44GB)
-                    # exclusive model → OOM (the 2026-06-05 stress kill: Embedding-4B
-                    # loaded on the 35B while two chat completions were still routing).
-                    # Wait it out with a SINGLE sleep of the remaining grace (not a 50ms
-                    # poll loop), then re-check: by then the request has acquired (→ the
-                    # defer above) or the model is idle (load proceeds). The short grace
-                    # (vs the 3s enforcer grace) avoids holding the load off for seconds
-                    # after the chat finished — which flooded the log and tripped
-                    # get_engine's excessive-loop guard.
-                    remaining = e.last_access + _EXCLUSIVE_DEFER_GRACE_SEC - now
-                    if e.last_access > 0 and remaining > 0:
+                    # active_uses==0 but ACTIVE within the SHORT defer-grace: a request
+                    # is mid get_engine→acquire_engine, or the previous request just
+                    # released and the next pipelined one is still routing (the
+                    # active_uses=0 dip). Loading a non-pinned model into that window
+                    # coexists it with the (e.g. 44GB) exclusive model → OOM (the
+                    # 2026-06-05 stress kill: Embedding-4B loaded on the 35B while two
+                    # chat completions were still routing). Anchor on BOTH ends of a
+                    # request — last_access (dispatch) AND last_release (lease drop) —
+                    # because for any request longer than the grace, dispatch time
+                    # alone has already aged out by the time the dip begins, leaving
+                    # the realistic between-two-chats dip unprotected. Wait it out
+                    # with a SINGLE sleep of the remaining grace (not a 50ms poll
+                    # loop), then re-check: by then the request has acquired (→ the
+                    # defer above) or the model is idle (load proceeds). The short
+                    # grace (vs the 3s enforcer grace) avoids holding the load off for
+                    # seconds after the chat finished — which flooded the log and
+                    # tripped get_engine's excessive-loop guard.
+                    last_activity = max(e.last_access, e.last_release)
+                    remaining = last_activity + _EXCLUSIVE_DEFER_GRACE_SEC - now
+                    if last_activity > 0 and remaining > 0:
                         if _rate_ok:
                             entry._last_defer_log_time = now
                             logger.info(
@@ -1961,13 +2061,15 @@ class EnginePool:
     def _victim_busy(self, model_id: str) -> bool:
         """Whether an eviction victim has in-flight work (drain, don't kill).
 
-        Mirrors the busy check inlined in ``_prepare_memory_for``. Called
-        under self._lock.
+        Delegates to ``is_engine_actively_held`` — the pool's single busy
+        predicate (already used by ``_find_drain_or_evict_candidate`` and the
+        process_memory_enforcer) — so "actively held" cannot drift between
+        victim selection and the drain-vs-kill choice, and a torn-down engine
+        mid-eviction reads not-busy instead of raising. Called under
+        self._lock.
         """
         victim = self._entries.get(model_id)
-        if victim is None or victim.engine is None:
-            return False
-        return victim.engine.has_active_requests() or victim.active_uses > 0
+        return victim is not None and self.is_engine_actively_held(victim)
 
     def _pending_reclaim_event(
         self, exclude_model_id: str | None = None
@@ -2133,10 +2235,18 @@ class EnginePool:
             yield
         finally:
             if reserved:
-                async with self._tracked_lock("reserve_inference"):
-                    self._inflight_reservations = max(
-                        0, self._inflight_reservations - est_bytes
-                    )
+                # LOCK-FREE on purpose. Awaiting the pool lock inside a
+                # finally can itself be interrupted — a second CancelledError
+                # (disconnect + shutdown double-cancel) lands at the lock
+                # acquire, and _tracked_lock's 60s acquire timeout raises
+                # EnginePoolError — either skips the decrement and leaks a
+                # multi-GB reservation forever (no reconciliation exists).
+                # All mutators run on the event loop, so plain int
+                # arithmetic between awaits is atomic; the scheduler's
+                # cross-thread reader was always a lock-free GIL-atomic load.
+                self._inflight_reservations = max(
+                    0, self._inflight_reservations - est_bytes
+                )
 
     def is_engine_actively_held(self, entry: EngineEntry) -> bool:
         """Strict check: handler currently holds a lease OR scheduler is running.
@@ -2202,6 +2312,7 @@ class EnginePool:
         engine_to_stop = entry.engine
         entry.engine = None  # prevent new requests
         entry.last_access = 0.0
+        entry.last_release = 0.0  # clear the dip-grace anchor with it
         entry.actual_size = None  # observed size lost when engine unloads
         entry.unload_complete = asyncio.Event()
         self._set_state(entry, EngineState.UNLOADING, reason)
@@ -2570,6 +2681,16 @@ class EnginePool:
         # every use (``if self._pool is not None``) so non-pooled / unit-test
         # use of an engine never touches the pool.
         engine._pool = self
+        # Stamp the canonical ``_entries`` key alongside the back-reference.
+        # Engines are constructed with ``model_name = entry.model_path`` (the
+        # full PATH) while ``_entries`` is keyed by the short ``model_id``, so
+        # an engine-side ``pool._entries.get(self.model_name)`` always misses
+        # — which silently zeroed the §3d weight-fraction working-set
+        # estimates for embedding/reranker/STT/STS (their reservations were
+        # strict no-ops in pooled production). This is the single chokepoint
+        # every engine type passes through, and the same mismatch class
+        # _resolve_reservation_key patches on the reserve side.
+        engine._pool_model_id = model_id
 
         # Propagate memory limit to new engine's scheduler
         if self._process_memory_enforcer is not None:

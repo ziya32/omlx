@@ -9,7 +9,6 @@ when mlx-audio is not installed.
 """
 
 import asyncio
-import contextlib
 import logging
 import time
 from dataclasses import dataclass
@@ -276,16 +275,9 @@ class STTEngine(BaseNonStreamingEngine):
         )
         try:
             # Reserve the forward-pass transient against the Metal wall (§3d).
-            # Held across the (possibly chunked) transcription; no-op without a
-            # Metal cap / pool; guarded + released on every exit path.
-            async with contextlib.AsyncExitStack() as _reserve_stack:
-                if self._pool is not None:
-                    await _reserve_stack.enter_async_context(
-                        self._pool.reserve_inference(
-                            self.model_name,
-                            self.estimate_working_set_bytes(),
-                        )
-                    )
+            # Held across the (possibly chunked) transcription; no-op without
+            # a Metal cap / pool; released on every exit path.
+            async with self._reserved_working_set():
                 result = await self._do_transcribe(
                     model, audio_path, language, prompt, on_progress, kwargs,
                 )
@@ -298,10 +290,6 @@ class STTEngine(BaseNonStreamingEngine):
                 return result
         finally:
             await self._finish_activity(activity_id)
-
-    def estimate_working_set_bytes(self, **call_kwargs: Any) -> int:
-        """Single-forward ASR transient ≈ 0.08 × weights (§4)."""
-        return self._estimate_forward_working_set_bytes()
 
     # ------------------------------------------------------------------
     # Long-audio chunking and per-chunk progress events

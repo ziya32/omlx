@@ -886,17 +886,23 @@ async def create_speech(
             if instruct is None and ms.default_instruct:
                 instruct = ms.default_instruct
 
-    # Pre-validation: load the engine to surface 4xx/5xx before the
-    # request body is fully consumed. No lease acquired here because
-    # the actual TTS call below uses ``_use_engine`` which acquires its
-    # own lease. ``pool.get_engine`` is idempotent (returns cached
-    # engine if loaded), so this is essentially a fast type-check.
-    try:
-        engine = await pool.get_engine(resolved_model)
-    except BaseException as exc:
-        _raise_pool_acquire_http(exc, resolved_model)
-
-    if not isinstance(engine, TTSEngine):
+    # Pre-validation: surface 404/400 before doing any work. LOAD-FREE on
+    # purpose — this used to await ``pool.get_engine`` with NO lease held, so
+    # a COLD TTS model ran its full multi-GB load right here while every
+    # /v1/idle busy signal read 0 (no lease, no _in_flight, TTS populates no
+    # collectors): the gateway could admit a model-loading dream cycle into
+    # the middle of the load. The entry's ``model_type`` comes from discovery
+    # (no engine needed); the actual load happens below under ``_use_engine``
+    # / the streaming branch's lease, where it is counted busy. The
+    # isinstance(engine, TTSEngine) checks on both execution paths remain the
+    # authoritative type check.
+    pre_entry = pool.get_entry(resolved_model)
+    if pre_entry is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Model '{resolved_model}' not found",
+        )
+    if pre_entry.model_type != "audio_tts":
         raise HTTPException(
             status_code=400,
             detail=f"Model '{resolved_model}' is not a text-to-speech model",
@@ -968,6 +974,17 @@ async def create_speech(
                     yield chunk
             finally:
                 _release_once()
+                # The stream actually ran — refresh the server-wide idle
+                # tracker at stream END (Fix E.1), mirroring the chat
+                # streaming handlers' _guarded finally in server.py. The
+                # first-chunk record at handler-return otherwise leaves
+                # idle_seconds ≈ the full stream duration the instant the
+                # lease drops, so a 3-minute TTS stream would satisfy the
+                # gateway's "idle for N seconds" dream gate immediately.
+                # Deliberately NOT in _release_once: the never-iterated
+                # weakref-finalize path must not count as inference (same
+                # exclusion as server.py's never-iterated disconnect path).
+                _record_audio_request(resolved)
 
         inner = _stream_speech_response(
             engine, request, stream_ref_audio_path, streaming_interval,

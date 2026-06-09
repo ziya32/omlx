@@ -64,6 +64,10 @@ def import_error_pool():
     pool = _make_lifespan_safe_pool()
     pool.resolve_model_id = MagicMock(side_effect=lambda mid, _sm=None: mid)
     pool.get_engine = AsyncMock(side_effect=ImportError(_INSTALL_HINT))
+    # The TTS pre-validation type-checks the entry (load-free) before any
+    # engine work; give it a TTS-typed entry so speech requests pass it and
+    # reach the leased get_engine, where the ImportError under test fires.
+    pool.get_entry = MagicMock(return_value=MagicMock(model_type="audio_tts"))
     return pool
 
 

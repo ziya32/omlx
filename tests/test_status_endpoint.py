@@ -6,9 +6,26 @@ from unittest.mock import MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
+from omlx.engine_pool import EnginePool
 from omlx.server import ServerState, app
 
 TEST_API_KEY = "test-api-key"
+
+
+def _mock_pool() -> MagicMock:
+    """Spec'd pool mock with the REAL llm_request_counts bound to it.
+
+    The active/waiting walk moved from the endpoint into
+    ``EnginePool.llm_request_counts`` (shared with ``/v1/idle``); binding the
+    real method (it reads only ``_entries``) keeps the endpoint tests
+    exercising the production counting code through the mock pool.
+    """
+    pool = MagicMock(spec=[
+        "model_count", "loaded_model_count", "get_loaded_model_ids",
+        "current_model_memory", "_entries", "llm_request_counts",
+    ])
+    pool.llm_request_counts = lambda: EnginePool.llm_request_counts(pool)
+    return pool
 
 
 @pytest.fixture
@@ -45,10 +62,7 @@ class TestStatusEndpoint:
 
     def test_returns_pool_info(self, client):
         """When engine pool exists, return model and memory stats."""
-        pool = MagicMock(spec=[
-            "model_count", "loaded_model_count", "get_loaded_model_ids",
-            "current_model_memory", "_entries",
-        ])
+        pool = _mock_pool()
         pool.model_count = 5
         pool.loaded_model_count = 2
         pool.get_loaded_model_ids.return_value = ["model-a", "model-b"]
@@ -99,10 +113,7 @@ class TestStatusEndpoint:
         entry.is_loading = False
         entry.engine = engine
 
-        pool = MagicMock(spec=[
-            "model_count", "loaded_model_count", "get_loaded_model_ids",
-            "current_model_memory", "_entries",
-        ])
+        pool = _mock_pool()
         pool.model_count = 1
         pool.loaded_model_count = 1
         pool.get_loaded_model_ids.return_value = ["model-a"]
@@ -143,10 +154,7 @@ class TestStatusEndpoint:
 
     def test_unlimited_memory_max(self, client):
         """When no enforcer is present, formatted shows 'unlimited'."""
-        pool = MagicMock(spec=[
-            "model_count", "loaded_model_count", "get_loaded_model_ids",
-            "current_model_memory", "_entries",
-        ])
+        pool = _mock_pool()
         pool.model_count = 0
         pool.loaded_model_count = 0
         pool.get_loaded_model_ids.return_value = []

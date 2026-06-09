@@ -800,6 +800,9 @@ class Scheduler:
         # defer log line. The scheduler tick is ~200ms — without this the
         # log would emit dozens of duplicate lines per second under pressure.
         self._last_defer_log_time: float = 0.0
+        # Throttle (monotonic, same idiom) for the "Prefill above max_bytes"
+        # warning, which otherwise fires once per prefill step.
+        self._last_prefill_warn: float = 0.0
         # Cached max(mx.get_active_memory(), get_phys_footprint()) snapshot
         # taken at the start of each step() tick. Read via
         # _current_tick_memory_bytes(); 0 outside a tick.
@@ -2014,8 +2017,11 @@ class Scheduler:
                 elif current > self._memory_limit_bytes:
                     # Rate-limit: this fires per prefill step while above max_bytes — one
                     # line per step floods. 1 / 5s is enough to surface the condition.
-                    if time.time() - getattr(self, "_last_prefill_warn", 0.0) >= 5.0:
-                        self._last_prefill_warn = time.time()
+                    # Monotonic (not wall-clock): an NTP step / sleep-wake must not
+                    # mute or spam the warning. Declared in __init__ with the
+                    # sibling _last_defer_log_time throttle.
+                    if time.monotonic() - self._last_prefill_warn >= 5.0:
+                        self._last_prefill_warn = time.monotonic()
                         logger.warning(
                             f"Prefill above max_bytes at "
                             f"{processed_tokens} tokens: "
@@ -4630,11 +4636,24 @@ class Scheduler:
 
             usage_gb = current / (1024**3)
             ceiling_gb = self._memory_hard_limit_bytes / (1024**3)
+            # Machine-readable marker for gateway-side retry classification.
+            # STRUCTURAL ⟺ current usage ALONE already meets the ceiling —
+            # the resident weights won't shrink between client retries, so
+            # backoff-and-retry is futile and the gateway must fail fast.
+            # Clients match this stable token instead of regexing the prose,
+            # whose numbers are formatted with variable units (GB/MB) and
+            # whose wording may change.
+            structural = (
+                " [STRUCTURAL_PREFILL_OVERFLOW]"
+                if current >= self._memory_hard_limit_bytes
+                else ""
+            )
             return (
                 f"Prefill would require ~{format_bytes(current + peak)} peak "
                 f"(current {format_bytes(current)} + KV+SDPA {format_bytes(peak)}) "
                 f"but ceiling is {format_bytes(self._memory_hard_limit_bytes)} "
-                f"(usage {usage_gb:.1f} GB, ceiling {ceiling_gb:.1f} GB). "
+                f"(usage {usage_gb:.1f} GB, ceiling {ceiling_gb:.1f} GB)."
+                f"{structural} "
                 f"Reduce context length or lower memory_guard_tier."
             )
         return None

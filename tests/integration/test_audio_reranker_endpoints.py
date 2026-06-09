@@ -233,10 +233,10 @@ class MockEnginePool:
         self._tts_engine = MockTTSEngine()
         self._reranker_engine = MockRerankerEngine()
         self._entries = {
-            "test-llm-model": MagicMock(engine_type="batched", engine=self._llm_engine),
-            "test-asr-model": MagicMock(engine_type="audio_stt", engine=self._stt_engine),
-            "test-tts-model": MagicMock(engine_type="audio_tts", engine=self._tts_engine, model_path=tts_model_dir),
-            "test-reranker": MagicMock(engine_type="reranker", engine=self._reranker_engine),
+            "test-llm-model": MagicMock(engine_type="batched", model_type="llm", engine=self._llm_engine),
+            "test-asr-model": MagicMock(engine_type="audio_stt", model_type="audio_stt", engine=self._stt_engine),
+            "test-tts-model": MagicMock(engine_type="audio_tts", model_type="audio_tts", engine=self._tts_engine, model_path=tts_model_dir),
+            "test-reranker": MagicMock(engine_type="reranker", model_type="reranker", engine=self._reranker_engine),
         }
 
     @property
@@ -270,6 +270,11 @@ class MockEnginePool:
 
     def get_model_ids(self):
         return list(self._entries.keys())
+
+    def get_entry(self, model_id):
+        # The TTS pre-validation type-checks the entry (load-free) before
+        # any engine work — mirror EnginePool.get_entry.
+        return self._entries.get(model_id)
 
     def get_status(self):
         return {
@@ -978,7 +983,6 @@ class TestModelDiscoveryIntegration:
         (model_dir / "model.safetensors").write_bytes(b"\x00" * 1024)
 
         from omlx.model_discovery import detect_model_type
-        from omlx.engine_pool import EnginePool
 
         assert detect_model_type(model_dir) == "audio_stt"
 
@@ -1000,7 +1004,6 @@ class TestModelDiscoveryIntegration:
         (model_dir / "model.safetensors").write_bytes(b"\x00" * 1024)
 
         from omlx.model_discovery import detect_model_type
-        from omlx.engine_pool import EnginePool
 
         assert detect_model_type(model_dir) == "audio_tts"
 
@@ -1022,7 +1025,6 @@ class TestModelDiscoveryIntegration:
         (model_dir / "model.safetensors").write_bytes(b"\x00" * 1024)
 
         from omlx.model_discovery import detect_model_type
-        from omlx.engine_pool import EnginePool
 
         assert detect_model_type(model_dir) == "reranker"
 
@@ -1044,7 +1046,6 @@ class TestModelDiscoveryIntegration:
         (model_dir / "model.safetensors").write_bytes(b"\x00" * 1024)
 
         from omlx.model_discovery import detect_model_type
-        from omlx.engine_pool import EnginePool
         from omlx.model_settings import ModelSettingsManager
 
         # Without override, it's detected as LLM (no "reranker" in name)
@@ -1071,7 +1072,6 @@ class TestModelDiscoveryIntegration:
 
     def test_engine_pool_all_type_mappings(self):
         """Verify all model type -> engine type mappings exist."""
-        from omlx.engine_pool import EnginePool
 
         pool = _make_pool(ceiling=None)
         expected = {

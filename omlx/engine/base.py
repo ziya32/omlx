@@ -4,6 +4,7 @@ Base engine interface for oMLX inference.
 """
 
 import asyncio
+import contextlib
 import threading
 import time
 import uuid
@@ -317,19 +318,56 @@ class BaseNonStreamingEngine(ABC):
         # every use is guarded ``if self._pool is not None`` so the heavy
         # methods' working-set reservation (§3d) is a no-op without a pool.
         self._pool: Any | None = None
+        # The pool's canonical ``_entries`` key for this engine, stamped at
+        # load alongside ``_pool``. ``model_name`` is the full model PATH in
+        # pooled production, so it can NEVER be used to index ``_entries``
+        # directly — doing so silently zeroed the §3d weight-fraction
+        # estimates (the reservations were no-ops). None when non-pooled.
+        self._pool_model_id: str | None = None
 
     def estimate_working_set_bytes(self, **call_kwargs: Any) -> int:
         """Estimate this op's peak GPU working-set transient, in bytes.
 
-        Default 0 ⇒ no reservation (strict no-op admission). Engines whose
-        heavy method materializes a sizeable transient (notably non-streaming
-        TTS, which decodes the whole waveform in one ``mx.eval``) override
-        this so :meth:`EnginePool.reserve_inference` can budget the op
-        against the Metal wall before it runs. ``call_kwargs`` carries the
-        heavy method's params (e.g. ``text``, ``max_tokens``) so the estimate
-        can scale with the request.
+        Default: the single-forward/encoder estimate (0.08 × resident
+        weights, §4) — right for STT/STS/embedding/reranker, and 0 (strict
+        no-op admission) when non-pooled. Engines whose heavy method
+        materializes a different transient (notably TTS, which decodes the
+        whole waveform in one ``mx.eval``) override this so
+        :meth:`EnginePool.reserve_inference` can budget the op against the
+        Metal wall before it runs. ``call_kwargs`` carries the heavy method's
+        params (e.g. ``text``, ``max_tokens``) so the estimate can scale with
+        the request.
         """
-        return 0
+        return self._estimate_forward_working_set_bytes()
+
+    @contextlib.asynccontextmanager
+    async def _reserved_working_set(self, est_bytes: int | None = None):
+        """Reserve this op's working-set transient against the Metal wall (§3d).
+
+        The single bracket every heavy method uses::
+
+            async with self._reserved_working_set():
+                ... run_in_executor(...) ...
+
+        No-op when non-pooled (unit tests); ``reserve_inference`` itself
+        no-ops without a Metal cap or with est<=0. Reserves under the pool's
+        canonical entry key (``_pool_model_id``, stamped at load) — NOT
+        ``model_name``, which is a full PATH in pooled production — with
+        ``model_name`` as the fallback for engines constructed directly with
+        the short key. ``est_bytes=None`` ⇒ the engine's default
+        :meth:`estimate_working_set_bytes`; pass an explicit value for
+        request-scaled estimates (TTS). Released on every exit path.
+        """
+        pool = self._pool
+        if pool is None:
+            yield
+            return
+        if est_bytes is None:
+            est_bytes = self.estimate_working_set_bytes()
+        async with pool.reserve_inference(
+            self._pool_model_id or self.model_name, est_bytes
+        ):
+            yield
 
     # Per-op transient as a fraction of resident model weights, reused by the
     # single-forward/encoder engines (STT/STS/embedding/reranker). Mirrors the
@@ -340,15 +378,21 @@ class BaseNonStreamingEngine(ABC):
     def _resident_weight_bytes(self) -> int:
         """Resident weight size (bytes) of this engine's model, or 0.
 
-        Read from the owning pool's entry for ``self.model_name``. 0 when
-        there is no pool (unit-test / non-pooled) or the entry is unknown —
-        callers then reserve 0 (strict no-op).
+        Read from the owning pool's entry, keyed by the canonical
+        ``_pool_model_id`` the pool stamped at load — ``model_name`` is the
+        full model PATH in pooled production while ``_entries`` is keyed by
+        the short model_id, so a ``model_name`` lookup always missed and
+        silently zeroed every forward-engine reservation. ``model_name``
+        remains only as a fallback for tests that construct engines with the
+        short key directly. 0 when there is no pool (unit-test / non-pooled)
+        or the entry is unknown — callers then reserve 0 (strict no-op).
         """
         pool = self._pool
         if pool is None:
             return 0
         try:
-            entry = pool._entries.get(self.model_name)
+            key = self._pool_model_id or self.model_name
+            entry = pool._entries.get(key)
         except (AttributeError, TypeError):
             return 0
         if entry is None:

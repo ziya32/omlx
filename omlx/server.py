@@ -351,8 +351,15 @@ def _count_active_requests() -> int:
       ``use_engine`` / ``_with_engine_guard`` (i.e. only once PAST ``get_engine``)
       — a subset of ``active_uses``, kept as defense against a transient
       ``active_uses`` dip during a get_engine→acquire hand-off; and
-    * the per-engine ``_output_collectors`` the ``/api/status`` endpoint walks,
-      which sees concurrent in-scheduler LLM token requests.
+    * the in-scheduler LLM token requests (``EnginePool.llm_request_counts``).
+
+    The pool signal itself is a SUM of three disjoint populations: leases held
+    (``total_active_uses``), requests parked lease-less at the exclusive-
+    contention gate (``contention_parked``), and in-flight model LOADS
+    (``loading_model_count`` — a load may be driven by a lease-less caller such
+    as the public/admin load endpoints or pinned preload, and tens of GB
+    mid-load is exactly when admitting MORE model-loading work is most
+    dangerous).
 
     Erring toward over-counting busy is the safe direction for the idle gate —
     under-counting is the bug (it let a dream fire into a busy omlx).
@@ -362,26 +369,18 @@ def _count_active_requests() -> int:
     with _in_flight_lock:
         in_flight = _in_flight_requests
 
-    collector_active = 0
     pool = _server_state.engine_pool
-    if pool is not None:
-        for entry in pool._entries.values():
-            engine = entry.engine
-            if engine is None:
-                continue
-            async_core = getattr(engine, "_engine", None)
-            if async_core is None:
-                continue
-            core = getattr(async_core, "engine", None)
-            if core is None:
-                continue
-            collector_active += len(getattr(core, "_output_collectors", {}))
+    if pool is None:
+        return in_flight
 
-    # The authoritative count: engine leases held OR awaited (covers the
-    # blocked-in-get_engine window that the two signals above miss).
-    pool_active_uses = pool.total_active_uses if pool is not None else 0
+    collector_active, _waiting = pool.llm_request_counts()
+    pool_busy = (
+        pool.total_active_uses
+        + pool.contention_parked
+        + pool.loading_model_count
+    )
 
-    return max(in_flight, collector_active, pool_active_uses)
+    return max(in_flight, collector_active, pool_busy)
 
 
 def get_idle_snapshot() -> dict:
@@ -2156,20 +2155,7 @@ async def server_status(_: bool = Depends(verify_api_key)):
     active_requests = 0
     waiting_requests = 0
     if pool is not None:
-        for entry in pool._entries.values():
-            engine = entry.engine
-            if engine is None:
-                continue
-            async_core = getattr(engine, "_engine", None)
-            if async_core is None:
-                continue
-            core = getattr(async_core, "engine", None)
-            if core is None:
-                continue
-            active_requests += len(getattr(core, "_output_collectors", {}))
-            sched = getattr(core, "scheduler", None)
-            if sched is not None:
-                waiting_requests += len(getattr(sched, "waiting", []))
+        active_requests, waiting_requests = pool.llm_request_counts()
 
     return {
         "status": "ok",

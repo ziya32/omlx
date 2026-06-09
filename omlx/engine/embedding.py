@@ -8,7 +8,6 @@ streaming or chat completion.
 """
 
 import asyncio
-import contextlib
 import logging
 from typing import Any, Dict, List, Optional, Union
 
@@ -159,16 +158,8 @@ class EmbeddingEngine(BaseNonStreamingEngine):
         )
         try:
             # Reserve the forward-pass transient against the Metal wall (§3d).
-            # No-op without a Metal cap / pool. Guarded so non-pooled use never
-            # touches the pool; released on every exit path.
-            async with contextlib.AsyncExitStack() as _reserve_stack:
-                if self._pool is not None:
-                    await _reserve_stack.enter_async_context(
-                        self._pool.reserve_inference(
-                            self.model_name,
-                            self.estimate_working_set_bytes(),
-                        )
-                    )
+            # No-op without a Metal cap / pool; released on every exit path.
+            async with self._reserved_working_set():
                 loop = asyncio.get_running_loop()
                 output = await loop.run_in_executor(get_mlx_executor(), _embed_sync)
                 # Discard result if the enforcer aborted us while the MLX
@@ -182,10 +173,6 @@ class EmbeddingEngine(BaseNonStreamingEngine):
                 return output
         finally:
             await self._finish_activity(activity_id)
-
-    def estimate_working_set_bytes(self, **call_kwargs: Any) -> int:
-        """Single-forward encoder transient ≈ 0.08 × weights (§4)."""
-        return self._estimate_forward_working_set_bytes()
 
     def get_stats(self) -> Dict[str, Any]:
         """Get engine statistics."""
