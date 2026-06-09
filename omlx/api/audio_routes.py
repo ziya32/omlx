@@ -196,6 +196,16 @@ async def _use_engine(model_id: str):
         pool.release_engine(resolved)
         _raise_pool_acquire_http(exc, model_id)
 
+    # Count this audio (TTS/ASR/process) request as in-flight for the whole
+    # block — like server.py's ``use_engine`` — so ``/v1/idle`` reports ``busy``
+    # while audio inference runs, not just at the end-of-request hook (Fix E.1).
+    # Lazy import avoids the server<->audio_routes import cycle. Paired with the
+    # exit in the finally so it can never leak on error.
+    try:
+        from ..server import _enter_inference
+        _enter_inference()
+    except Exception:  # pragma: no cover - defensive; never block a request
+        pass
     try:
         # Close the race window between pool.get_engine's last yield
         # and the caller touching `engine`: if the process memory
@@ -207,6 +217,11 @@ async def _use_engine(model_id: str):
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         yield engine
     finally:
+        try:
+            from ..server import _exit_inference
+            _exit_inference()
+        except Exception:  # pragma: no cover - defensive
+            pass
         pool.release_engine(resolved)
 
 
@@ -233,6 +248,15 @@ def _record_audio_request(model_id: str) -> None:
         )
     except Exception as exc:
         logger.warning("Failed to record audio metrics for %s: %s", model_id, exc)
+
+    # Refresh the server-wide idle tracker so audio (TTS/ASR/process) counts
+    # as inference for the gateway idle gate (Fix E.1). Lazy import avoids a
+    # circular import — server imports this router at module load.
+    try:
+        from ..server import record_inference_activity
+        record_inference_activity()
+    except Exception as exc:  # pragma: no cover - defensive; never block a request
+        logger.warning("Failed to record audio idle activity for %s: %s", model_id, exc)
 
 
 async def _read_upload(file: UploadFile) -> bytes:

@@ -43,6 +43,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 import weakref
@@ -244,6 +245,153 @@ def get_engine_pool() -> EnginePool:
 def get_mcp_manager():
     """Get the MCP manager instance (may be None)."""
     return _server_state.mcp_manager
+
+
+# =============================================================================
+# Server-wide idle tracker (Fix E.1)
+# =============================================================================
+#
+# omlx is the single chokepoint every model request flows through — gateway-
+# leased OR direct (a perf benchmark / any OpenAI-compatible client talks to
+# this HTTP port without holding a gateway lease). So omlx's own idle state is
+# the authoritative "is the model server actually idle?" signal: it captures
+# exactly the direct-client load the gateway-side lease registry cannot see.
+#
+# ``_last_inference_at`` is a monotonic timestamp bumped at the END of every
+# inference (the moment the engine lease is released — see ``use_engine`` and
+# ``_with_engine_guard`` below, which are the shared finalizers for every
+# LLM/embedding/rerank/completion/chat/messages/responses request, plus the
+# audio TTS/ASR routes which call ``record_inference_activity`` from their own
+# completion hook). It is exposed on the auth-exempt, self-non-counting
+# ``/v1/idle`` endpoint so the gateway's idle gate can confirm omlx is quiet
+# before admitting a ZONE/DREAM cycle. Querying that endpoint must NOT touch
+# ``_last_inference_at`` — only real inference does — exactly mirroring §D5's
+# rule that ``/health`` is exempt from the activity lease.
+_last_inference_at: float = time.monotonic()
+
+# Explicit server-wide in-flight inference counter. Incremented on the ENTRY of
+# every inference (right after the engine lease is acquired) and decremented on
+# its EXIT via try/finally, so it can never leak on error. It is the companion
+# to ``_last_inference_at``: that timestamp answers "how long since the last
+# request finished?", this counter answers "is a request running RIGHT NOW?".
+#
+# Why this exists in addition to the ``_output_collectors`` walk below: those
+# collectors are only populated transiently inside ``EngineCore.generate()`` /
+# ``stream_generate()`` — i.e. only while the scheduler step for an LLM token
+# request is in flight. They are EMPTY for the pre/post-generation phases of a
+# non-streaming request (chat-template render, grammar compile, prefill
+# keepalive, result drain) AND for whole request classes that never touch the
+# scheduler collectors at all (embedding / rerank / token-count via
+# ``use_engine``, and audio TTS/ASR). Relying solely on the collectors made
+# ``/v1/idle`` report ``active_requests == 0`` while a non-streaming request was
+# mid-flight, which would let the gateway's dream/zone idle gate fire during
+# active use. This counter closes that gap by bracketing the FULL inference
+# window at the shared ``use_engine`` / ``_with_engine_guard`` chokepoints.
+#
+# Guarded by a plain ``threading.Lock``: increments/decrements run on the asyncio
+# event loop, but ``get_idle_snapshot`` is also read from uvicorn/TestClient
+# worker threads, so the read-modify-write must be atomic across threads.
+_in_flight_requests: int = 0
+_in_flight_lock = threading.Lock()
+
+
+def record_inference_activity() -> None:
+    """Mark that an inference request just completed (server-wide).
+
+    Called from the inference finalizers (``use_engine`` /
+    ``_with_engine_guard``) and the audio routes' completion hook. Pure
+    bookkeeping — never raises, so it can sit in a ``finally`` without
+    masking the request's own outcome.
+    """
+    global _last_inference_at
+    _last_inference_at = time.monotonic()
+
+
+def _enter_inference() -> None:
+    """Mark that an inference request just STARTED (server-wide).
+
+    Bumps the in-flight counter so ``/v1/idle`` reports ``busy`` for the whole
+    duration of the request — streaming OR non-streaming — not just during the
+    transient scheduler step. Pure bookkeeping; never raises.
+    """
+    global _in_flight_requests
+    with _in_flight_lock:
+        _in_flight_requests += 1
+
+
+def _exit_inference() -> None:
+    """Mark that an in-flight inference request just ENDED (server-wide).
+
+    The decrement half of ``_enter_inference``; always run from a ``finally`` so
+    an error mid-request can never leak a phantom in-flight count. Clamped at 0
+    defensively so a stray double-exit can never drive the counter negative
+    (which would mask a genuinely-busy server as idle). Never raises.
+    """
+    global _in_flight_requests
+    with _in_flight_lock:
+        if _in_flight_requests > 0:
+            _in_flight_requests -= 1
+
+
+def _count_active_requests() -> int:
+    """Aggregate in-flight inference requests server-wide.
+
+    Combines two independent signals and returns the larger:
+
+    * the explicit ``_in_flight_requests`` counter, bracketing the full
+      inference window (entry→exit) for EVERY request class — including
+      non-streaming chat/completions and the scheduler-less embedding / rerank /
+      token-count / audio paths; and
+    * the per-engine ``_output_collectors`` walk the ``/api/status`` endpoint
+      reports, which sees concurrent in-scheduler LLM token requests.
+
+    ``max`` (rather than a sum) is deliberate: a single non-streaming token
+    request shows up in BOTH signals at once (the counter for its whole life,
+    the collector during its scheduler step), so summing would double-count it.
+    Taking the max keeps a lone request at 1 while still surfacing the true
+    concurrency when many distinct requests are in flight (each bumps the
+    counter, so the counter ≥ the collector total). Erring toward over-counting
+    busy is the safe direction for the idle gate — under-counting is the bug.
+
+    Returns 0 when nothing is in flight (and the pool may not be initialized).
+    """
+    with _in_flight_lock:
+        in_flight = _in_flight_requests
+
+    collector_active = 0
+    pool = _server_state.engine_pool
+    if pool is not None:
+        for entry in pool._entries.values():
+            engine = entry.engine
+            if engine is None:
+                continue
+            async_core = getattr(engine, "_engine", None)
+            if async_core is None:
+                continue
+            core = getattr(async_core, "engine", None)
+            if core is None:
+                continue
+            collector_active += len(getattr(core, "_output_collectors", {}))
+
+    return max(in_flight, collector_active)
+
+
+def get_idle_snapshot() -> dict:
+    """Authoritative idle snapshot for the gateway admission gate.
+
+    ``idle_seconds`` is wall-time since the last completed inference;
+    ``busy`` is purely the in-flight signal (``active_requests > 0``). The
+    idle *threshold* (how long quiet is "idle enough" to admit a dream
+    cycle) lives gateway-side, so omlx reports the raw measurements and the
+    caller folds them into its predicate. Reading this snapshot does NOT
+    update ``_last_inference_at`` — it is not inference activity.
+    """
+    active = _count_active_requests()
+    return {
+        "idle_seconds": max(0.0, time.monotonic() - _last_inference_at),
+        "active_requests": active,
+        "busy": active > 0,
+    }
 
 
 async def verify_api_key(
@@ -953,13 +1101,22 @@ async def use_engine(
     # loads arriving concurrently see active_uses > 0 on exclusive
     # pinned models and defer at the contention gate in get_engine.
     pool.acquire_engine(resolved_id)
+    # Count this non-streaming request as in-flight for the WHOLE block (incl.
+    # the embedding/rerank/token-count paths that never populate the scheduler
+    # ``_output_collectors``), so ``/v1/idle`` reports ``busy`` while it runs
+    # (Fix E.1). Paired with ``_exit_inference`` in the finally — never leaks.
+    _enter_inference()
     try:
         engine = await get_engine(
             model_id, engine_type, resolved_id=resolved_id
         )
         yield engine
     finally:
+        _exit_inference()
         pool.release_engine(resolved_id)
+        # End of a (non-streaming) inference — refresh the server-wide
+        # idle tracker so the gateway idle gate sees this work (Fix E.1).
+        record_inference_activity()
 
 
 def _with_engine_guard(
@@ -1001,11 +1158,26 @@ def _with_engine_guard(
             pool.release_engine(resolved_model_id)
 
     async def _guarded() -> AsyncIterator[str]:
+        # Mark in-flight the moment iteration BEGINS (covers both true streaming
+        # responses and the non-streaming chat/completions that wrap their
+        # ``engine.chat()`` build in a StreamingResponse). Deliberately inside
+        # the generator body, paired with ``_exit_inference`` in the finally:
+        # the never-iterated client-disconnect path (weakref finalizer only)
+        # never runs this, so it neither counts nor records — matching
+        # ``record_inference_activity`` below (Fix E.1).
+        _enter_inference()
         try:
             async for item in generator:
                 yield item
         finally:
+            _exit_inference()
             _release_once()
+            # The stream ran (or errored mid-flight after starting) — this
+            # is real inference, so refresh the server-wide idle tracker
+            # (Fix E.1). Deliberately NOT in ``_release_once``: the weakref
+            # finalizer path fires when the body was never iterated (client
+            # disconnected before any tokens), which is not inference.
+            record_inference_activity()
 
     body = _guarded()
     # Fallback for the never-iterated case: fires on GC of ``body``.
@@ -1909,7 +2081,36 @@ async def health():
         "default_model": _server_state.default_model,
         "engine_pool": pool_status,
         "mcp": mcp_info,
+        # Authoritative idle snapshot, surfaced here too so the existing
+        # auth-exempt health probe carries it (Fix E.1). Reading /health
+        # does not count as inference — get_idle_snapshot() is read-only.
+        "idle": get_idle_snapshot(),
     }
+
+
+@app.get("/v1/idle")
+async def idle_status():
+    """Auth-exempt idle snapshot for the gateway admission gate (Fix E.1).
+
+    omlx is the single chokepoint every model request flows through
+    (gateway-leased OR direct), so its idle state is the authoritative
+    "is the model server actually idle?" signal — it sees the direct-client
+    load the gateway-side lease registry misses. The gateway's "idle for the
+    threshold" gate confirms ``idle_seconds`` here before admitting a
+    ZONE/DREAM cycle.
+
+    Auth-exempt (like ``/health``) so the admission probe never 401s,
+    decoupled from the API-key plumbing. Crucially this endpoint does NOT
+    update ``_last_inference_at`` — only real inference does — exactly
+    mirroring §D5's rule that ``/health`` is exempt from the activity lease.
+
+    Returns::
+
+        {"idle_seconds": <now - last inference>,
+         "active_requests": <in-flight count>,
+         "busy": <active_requests > 0>}
+    """
+    return get_idle_snapshot()
 
 
 @app.get("/api/status")
