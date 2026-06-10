@@ -1235,3 +1235,83 @@ class TestLoadSeesGenerationTransient:
         big.active_uses = 0
         ev2 = await pool._prepare_memory_for(target)
         assert ev2 is None
+
+
+class TestBudgetCorrector:
+    """§P6 — while a contended admit runs, the pool keeps reclaiming IDLE
+    victims instead of treating the admit-instant victim check as final.
+    Round-5 stress crash: the victim was busy for 17ms at the TTS op's admit
+    ("nothing reclaimable"), went idle seconds later, and sat resident
+    (6.14GB) through the whole fatal window."""
+
+    @pytest.mark.asyncio
+    async def test_corrector_evicts_victim_that_goes_idle_mid_op(self, monkeypatch):
+        pool = _make_pool()
+        _patch_cap(monkeypatch, 50 * GiB)  # budget 46
+        _add_entry(pool, "pinned-big", size=38 * GiB, is_pinned=True)
+        victim = _add_entry(pool, "a-embed", size=6 * GiB, busy=True,
+                            last_access=0.5)
+        _add_entry(pool, "b-tts", size=4 * GiB, busy=True, last_access=5.0)
+        _stub_phase1_unload(pool)
+        # committed 48 > 46: over budget; the only victim is BUSY and the
+        # §P3 direction ('b-tts' > 'a-embed') forbids draining it → the op
+        # contended-admits.
+        gate = asyncio.Event()
+        done = asyncio.Event()
+
+        async def _op():
+            async with pool.reserve_inference("b-tts", 2 * GiB):
+                await gate.wait()
+            done.set()
+
+        t = asyncio.create_task(_op())
+        await asyncio.sleep(0.05)
+        assert pool._inflight_reservations == 2 * GiB  # contended admit
+        assert pool._contended_admits == 1
+        assert pool._entries["a-embed"].state == EngineState.ACTIVE
+
+        # The victim's request finishes — it is now IDLE. The corrector must
+        # reclaim it within ~a tick, while the contended op still runs.
+        victim.engine.has_active_requests = MagicMock(return_value=False)
+        victim.active_uses = 0
+        for _ in range(40):
+            if pool._entries["a-embed"].state != EngineState.ACTIVE:
+                break
+            await asyncio.sleep(0.1)
+        assert pool._entries["a-embed"].state == EngineState.UNLOADING, (
+            "the corrector must evict the now-idle victim mid-op"
+        )
+
+        gate.set()
+        await asyncio.wait_for(done.wait(), timeout=2.0)
+        await t
+        assert pool._contended_admits == 0
+        # The corrector loop exits once nothing contended remains.
+        for _ in range(30):
+            if (pool._budget_corrector_task is None
+                    or pool._budget_corrector_task.done()):
+                break
+            await asyncio.sleep(0.1)
+        assert pool._budget_corrector_task.done()
+
+    @pytest.mark.asyncio
+    async def test_corrector_never_touches_busy_victims(self, monkeypatch):
+        pool = _make_pool()
+        _patch_cap(monkeypatch, 50 * GiB)  # budget 46
+        _add_entry(pool, "pinned-big", size=38 * GiB, is_pinned=True)
+        _add_entry(pool, "a-embed", size=6 * GiB, busy=True, last_access=0.5)
+        _add_entry(pool, "b-tts", size=4 * GiB, busy=True, last_access=5.0)
+        pool._unload_engine = AsyncMock(
+            side_effect=AssertionError("corrector must not evict a BUSY victim")
+        )
+        gate = asyncio.Event()
+
+        async def _op():
+            async with pool.reserve_inference("b-tts", 2 * GiB):
+                await gate.wait()
+
+        t = asyncio.create_task(_op())
+        await asyncio.sleep(1.3)  # > one corrector tick with the victim busy
+        assert pool._contended_admits == 1
+        gate.set()
+        await t

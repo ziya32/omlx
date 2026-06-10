@@ -253,6 +253,16 @@ class EnginePool:
         # decoded best-effort over the Metal wall for pressure that clears in
         # seconds. Loop-only state, like the counter itself.
         self._reservation_released: asyncio.Event = asyncio.Event()
+        # §P6: contended (over-budget) reservations currently RUNNING, and the
+        # corrector task that keeps reclaiming IDLE victims while any exist.
+        # Admission is otherwise one-shot: round-5 of the 2026-06-09 stress
+        # campaign crashed with a 6.14GB embedding engine loaded-and-IDLE
+        # through the whole fatal window — it was momentarily busy at the
+        # TTS op's admit instant (17ms after its last embed), so the one-shot
+        # victim check found "nothing reclaimable", and nothing ever looked
+        # again. The corrector is that missing reflex.
+        self._contended_admits: int = 0
+        self._budget_corrector_task: asyncio.Task | None = None
         # Requests currently PARKED at get_engine's exclusive-contention gate
         # with their lease released (see the park in get_engine). They hold
         # no active_uses while parked, so without this counter they would be
@@ -369,6 +379,51 @@ class EnginePool:
         if cap <= 0:
             return 0
         return max(0, cap - self._inference_margin_bytes(cap))
+
+    def _note_contended_admit(self) -> None:
+        """Record an over-budget admit and arm the §P6 budget corrector."""
+        self._contended_admits += 1
+        task = self._budget_corrector_task
+        if task is None or task.done():
+            self._budget_corrector_task = asyncio.create_task(
+                self._budget_corrector()
+            )
+
+    async def _budget_corrector(self) -> None:
+        """§P6 — keep reclaiming IDLE victims while contended admits run.
+
+        Admission's victim check is one-shot: an over-budget op that found
+        "nothing reclaimable" at its admit instant (a victim busy for one
+        more request, a §P3-disallowed drain) runs its whole decode while a
+        victim that went idle seconds later stays resident — round 5 of the
+        2026-06-09 stress campaign Metal-panicked with an idle 6.14GB
+        embedding engine loaded through the entire fatal window. While any
+        contended reservation is outstanding and the pool is over budget,
+        this loop unloads idle non-pinned victims (1s cadence; idle-only —
+        busy victims stay a drain decision for admission, so no §P3
+        entanglement) and exits the moment balance returns.
+        """
+        try:
+            while True:
+                await asyncio.sleep(1.0)
+                async with self._tracked_lock("budget_corrector"):
+                    if self._contended_admits <= 0:
+                        return
+                    if self._reservable_free() >= 0:
+                        return
+                    victim = self._find_drain_or_evict_candidate()
+                    if victim is None or self._victim_busy(victim):
+                        continue
+                    logger.info(
+                        "budget corrector: evicting idle '%s' while %d "
+                        "contended admit(s) run over budget", victim,
+                        self._contended_admits,
+                    )
+                    await self._unload_engine(
+                        victim, reason="evict_contended_corrector"
+                    )
+        except asyncio.CancelledError:
+            pass  # pool shutdown
 
     def _small_transient_threshold(self) -> int:
         """Transients at or below this run UNACCOUNTED (margin-absorbed).
@@ -2307,6 +2362,7 @@ class EnginePool:
         # they silently no-op and the op can wait on its OWN drain (2026-06-02).
         model_id = self._resolve_reservation_key(model_id)
         reserved = False
+        contended = False  # §P6: this admit ran over budget
         try:
             while True:
                 async with self._tracked_lock("reserve_inference"):
@@ -2377,6 +2433,8 @@ class EnginePool:
                             ):
                                 self._inflight_reservations += est_bytes
                                 reserved = True
+                                contended = True
+                                self._note_contended_admit()  # §P6 corrector
                                 logger.warning(
                                     "reserve_inference: %s over budget, "
                                     "nothing reclaimable — contended admit "
@@ -2406,6 +2464,8 @@ class EnginePool:
                     async with self._tracked_lock("reserve_inference"):
                         self._inflight_reservations += est_bytes
                         reserved = True
+                        contended = True
+                        self._note_contended_admit()  # §P6 corrector
                     break
                 # Re-acquire, recompute _reservable_free: the victim may now be
                 # fully UNLOADED (weights dropped from _committed_memory).
@@ -2424,6 +2484,11 @@ class EnginePool:
                 self._inflight_reservations = max(
                     0, self._inflight_reservations - est_bytes
                 )
+                if contended:
+                    # §P6: the corrector loop exits on its own once this hits
+                    # 0 (or the budget fits again). Plain int — same lock-free
+                    # rationale as the decrement above.
+                    self._contended_admits = max(0, self._contended_admits - 1)
                 # §P2 release pulse: wake waiters parked on "a transient will
                 # clear in seconds". Swap-then-set (all sync — still safe in
                 # this lock-free finally): waiters that grabbed the OLD event
@@ -2945,6 +3010,10 @@ class EnginePool:
         starting while we're tearing down.  This is acceptable because
         shutdown is a terminal operation — no new requests should arrive.
         """
+        # §P6: stop the budget corrector first (it takes the same lock).
+        task = self._budget_corrector_task
+        if task is not None and not task.done():
+            task.cancel()
         async with self._tracked_lock("shutdown"):
             for model_id in list(self._entries.keys()):
                 entry = self._entries.get(model_id)
