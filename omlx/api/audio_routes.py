@@ -886,16 +886,8 @@ async def create_speech(
             if instruct is None and ms.default_instruct:
                 instruct = ms.default_instruct
 
-    # Pre-validation: surface 404/400 before doing any work. LOAD-FREE on
-    # purpose — this used to await ``pool.get_engine`` with NO lease held, so
-    # a COLD TTS model ran its full multi-GB load right here while every
-    # /v1/idle busy signal read 0 (no lease, no _in_flight, TTS populates no
-    # collectors): the gateway could admit a model-loading dream cycle into
-    # the middle of the load. The entry's ``model_type`` comes from discovery
-    # (no engine needed); the actual load happens below under ``_use_engine``
-    # / the streaming branch's lease, where it is counted busy. The
-    # isinstance(engine, TTSEngine) checks on both execution paths remain the
-    # authoritative type check.
+    # Pre-validation: surface 404/400 before doing any work. The entry's
+    # ``model_type`` comes from discovery (no engine needed).
     pre_entry = pool.get_entry(resolved_model)
     if pre_entry is None:
         raise HTTPException(
@@ -903,6 +895,38 @@ async def create_speech(
             detail=f"Model '{resolved_model}' not found",
         )
     if pre_entry.model_type != "audio_tts":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model '{resolved_model}' is not a text-to-speech model",
+        )
+
+    # Pre-load + CHAT-YIELD SERIALIZER (reinstated 2026-06-09, this time
+    # LEASED). The original pre-validation's ``get_engine`` carried a
+    # load-bearing side effect the review missed when removing it: with the
+    # exclusive chat mid-request, ``get_engine`` PARKS at the exclusive-
+    # contention gate — so TTS work (load AND the decode that follows) never
+    # started while a chat generation was in flight. Removing it let TTS
+    # decodes overlap running generations on a ~50GB-committed box; all five
+    # 2026-06-09 stress crashes (Metal command-buffer OOM at the tri-modal
+    # test) trace to exactly that overlap, and the pre-review code passes
+    # the same suite at the same Metal cap. Nothing else provides this
+    # exclusion: §3e gates NEW scheduling against reservations and §P5 gates
+    # LOADS against generation, but a decode admitted between chat turns
+    # runs into the next turn unguarded.
+    #
+    # Reinstated WITH a lease so the wait/load is visible to /v1/idle and
+    # eviction-protected (the accounting bug that motivated the removal);
+    # the contention park's try/finally keeps the lease balanced, and the
+    # release→_use_engine re-acquire dip is covered by the last_release
+    # defer grace.
+    pool.acquire_engine(resolved_model)
+    try:
+        engine = await pool.get_engine(resolved_model)
+    except BaseException as exc:
+        pool.release_engine(resolved_model)
+        _raise_pool_acquire_http(exc, resolved_model)
+    pool.release_engine(resolved_model)
+    if not isinstance(engine, TTSEngine):
         raise HTTPException(
             status_code=400,
             detail=f"Model '{resolved_model}' is not a text-to-speech model",

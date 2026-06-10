@@ -15,15 +15,6 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 
 from omlx.engine_core import get_mlx_executor
 
-
-def _executor_queue_ping() -> None:
-    """Empty MLX-executor job — §P4's 'wait through the queue holding nothing'.
-
-    Submitted before taking a working-set reservation so the reservation
-    window starts at (about) the op's executor turn instead of spanning the
-    whole queue wait. Does no Metal work on purpose.
-    """
-    return None
 from omlx.mx_buffer_lock import locked_sync_and_clear_cache
 
 
@@ -374,28 +365,6 @@ class BaseNonStreamingEngine(ABC):
             return
         if est_bytes is None:
             est_bytes = self.estimate_working_set_bytes()
-        # Margin-absorbed SMALL transients bypass the reservation lane inside
-        # reserve_inference (EnginePool._small_transient_threshold) — so they
-        # must also skip the §P4 queue ping: parking an embedding forward
-        # behind a 35B generation's scheduler steps would be pure added
-        # latency for an admission decision that is a no-op anyway.
-        _threshold_fn = getattr(pool, "_small_transient_threshold", None)
-        _reserve_floor = _threshold_fn() if callable(_threshold_fn) else 0
-        if est_bytes > max(0, _reserve_floor):
-            # §P4: reserve at QUEUE-HEAD, not at method entry. The MLX
-            # executor is single-threaded; under a burst, K queued ops each
-            # used to hold their full reservation through the queue WAIT —
-            # where no Metal memory can materialize — so the phantom K×est
-            # sum drove the pool over budget, evicting co-resident models
-            # (evict_for_inference churn) and pushing ops to best-effort for
-            # pressure that never physically existed (the 2026-06-09 stress
-            # Metal panic). An empty executor round-trip parks us until the
-            # queue reaches (about) our turn; only then do we reserve. A
-            # stateful op (TTS/STT mid-stream) still holds its reservation
-            # across its later slots — that decode state is real Metal
-            # memory, not phantom.
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(get_mlx_executor(), _executor_queue_ping)
         async with pool.reserve_inference(
             self._pool_model_id or self.model_name, est_bytes
         ):

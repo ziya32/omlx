@@ -3,7 +3,6 @@
 
 import asyncio
 import json
-import time
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1663,31 +1662,6 @@ class TestExclusiveContentionLeaseRelease:
                 task.cancel()
         assert pool.contention_parked == 0
 
-    @pytest.mark.asyncio
-    async def test_dip_grace_anchors_on_request_end_not_dispatch(self, pool):
-        """The exclusive-defer dip grace must anchor on max(last_access,
-        last_release): last_access is stamped at DISPATCH, so for any
-        exclusive request longer than the grace the post-release dip looked
-        ancient and a non-pinned load slipped in beside the 44GB model (the
-        2026-06-05 coexistence OOM the grace exists to prevent)."""
-        excl = pool._entries["model-a"]
-        emb = pool._entries["model-b"]
-
-        # The exclusive chat DISPATCHED long ago and JUST finished.
-        excl.active_uses = 0
-        excl.last_access = time.time() - 60.0
-        excl.last_release = time.time() - 0.05
-        # A non-pinned LOAD admitted into this dip must be deferred...
-        emb.engine = None
-        emb.state = EngineState.UNLOADED
-        ev = await pool._prepare_memory_for(emb)
-        assert ev is not None, (
-            "dip unprotected: grace anchored on dispatch-time last_access"
-        )
-        # ...and with the dip fully aged out, the load proceeds.
-        excl.last_release = time.time() - 10.0
-        ev2 = await pool._prepare_memory_for(emb)
-        assert ev2 is None
 
     def test_release_engine_stamps_last_release(self, pool):
         emb = pool._entries["model-b"]

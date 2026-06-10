@@ -242,27 +242,6 @@ class EnginePool:
         # be interrupted by a second CancelledError (or the lock-acquire
         # timeout), permanently leaking the reservation.
         self._inflight_reservations: int = 0
-        # Edge-triggered "a reservation was released" pulse (§P2). Over-budget
-        # waiters whose overshoot is ATTRIBUTABLE to in-flight transients
-        # (weights alone fit; only the reservations push past budget) grab the
-        # CURRENT event under the lock and await it outside; every release
-        # swaps in a fresh event and sets the old one, so each pulse wakes
-        # exactly the waiters that observed it (no busy-loop, no lost wakeup:
-        # a release between the check and the await set the very object the
-        # waiter holds). Before this, those waiters either 507'd a load or
-        # decoded best-effort over the Metal wall for pressure that clears in
-        # seconds. Loop-only state, like the counter itself.
-        self._reservation_released: asyncio.Event = asyncio.Event()
-        # §P6: contended (over-budget) reservations currently RUNNING, and the
-        # corrector task that keeps reclaiming IDLE victims while any exist.
-        # Admission is otherwise one-shot: round-5 of the 2026-06-09 stress
-        # campaign crashed with a 6.14GB embedding engine loaded-and-IDLE
-        # through the whole fatal window — it was momentarily busy at the
-        # TTS op's admit instant (17ms after its last embed), so the one-shot
-        # victim check found "nothing reclaimable", and nothing ever looked
-        # again. The corrector is that missing reflex.
-        self._contended_admits: int = 0
-        self._budget_corrector_task: asyncio.Task | None = None
         # Requests currently PARKED at get_engine's exclusive-contention gate
         # with their lease released (see the park in get_engine). They hold
         # no active_uses while parked, so without this counter they would be
@@ -380,50 +359,7 @@ class EnginePool:
             return 0
         return max(0, cap - self._inference_margin_bytes(cap))
 
-    def _note_contended_admit(self) -> None:
-        """Record an over-budget admit and arm the §P6 budget corrector."""
-        self._contended_admits += 1
-        task = self._budget_corrector_task
-        if task is None or task.done():
-            self._budget_corrector_task = asyncio.create_task(
-                self._budget_corrector()
-            )
 
-    async def _budget_corrector(self) -> None:
-        """§P6 — keep reclaiming IDLE victims while contended admits run.
-
-        Admission's victim check is one-shot: an over-budget op that found
-        "nothing reclaimable" at its admit instant (a victim busy for one
-        more request, a §P3-disallowed drain) runs its whole decode while a
-        victim that went idle seconds later stays resident — round 5 of the
-        2026-06-09 stress campaign Metal-panicked with an idle 6.14GB
-        embedding engine loaded through the entire fatal window. While any
-        contended reservation is outstanding and the pool is over budget,
-        this loop unloads idle non-pinned victims (1s cadence; idle-only —
-        busy victims stay a drain decision for admission, so no §P3
-        entanglement) and exits the moment balance returns.
-        """
-        try:
-            while True:
-                await asyncio.sleep(1.0)
-                async with self._tracked_lock("budget_corrector"):
-                    if self._contended_admits <= 0:
-                        return
-                    if self._reservable_free() >= 0:
-                        return
-                    victim = self._find_drain_or_evict_candidate()
-                    if victim is None or self._victim_busy(victim):
-                        continue
-                    logger.info(
-                        "budget corrector: evicting idle '%s' while %d "
-                        "contended admit(s) run over budget", victim,
-                        self._contended_admits,
-                    )
-                    await self._unload_engine(
-                        victim, reason="evict_contended_corrector"
-                    )
-        except asyncio.CancelledError:
-            pass  # pool shutdown
 
     def _small_transient_threshold(self) -> int:
         """Transients at or below this run UNACCOUNTED (margin-absorbed).
@@ -442,23 +378,6 @@ class EnginePool:
             return 0
         return self._inference_margin_bytes(cap) // 4
 
-    def _overshoot_allowance(self) -> int:
-        """Sanctioned TOTAL of outstanding transients under contention (§P3+).
-
-        ``_wall_budget`` already excludes the inference margin, so a CONTENDED
-        admit (nothing reclaimable, nothing freeing) may dip INTO the margin —
-        never past the raw cap. Bounding the SUM of outstanding reservations
-        by the margin keeps small forwards (≈0.3–0.6 GiB each) interleaving
-        under over-commit — the workload this box ran un-reserved for months —
-        while a SECOND TTS-sized transient (≈4 GiB) parks on the release pulse
-        (two of those stacked is the 2-TTS Metal panic, re-confirmed by the
-        2026-06-09 re-validation crash).
-        """
-        from .process_memory_enforcer import get_effective_metal_cap_bytes
-        cap = get_effective_metal_cap_bytes()
-        if cap <= 0:
-            return 0
-        return self._inference_margin_bytes(cap)
 
     def _scheduler_inflight_bytes(self) -> int:
         """Live LLM/VLM scheduler generation transient (§3e); 0 if unwired.
@@ -1667,26 +1586,19 @@ class EnginePool:
                                 f"model '{mid}' has {e.active_uses} active request(s)"
                             )
                         return e.exclusive_idle
-                    # active_uses==0 but ACTIVE within the SHORT defer-grace: a request
-                    # is mid get_engine→acquire_engine, or the previous request just
-                    # released and the next pipelined one is still routing (the
-                    # active_uses=0 dip). Loading a non-pinned model into that window
-                    # coexists it with the (e.g. 44GB) exclusive model → OOM (the
-                    # 2026-06-05 stress kill: Embedding-4B loaded on the 35B while two
-                    # chat completions were still routing). Anchor on BOTH ends of a
-                    # request — last_access (dispatch) AND last_release (lease drop) —
-                    # because for any request longer than the grace, dispatch time
-                    # alone has already aged out by the time the dip begins, leaving
-                    # the realistic between-two-chats dip unprotected. Wait it out
-                    # with a SINGLE sleep of the remaining grace (not a 50ms poll
-                    # loop), then re-check: by then the request has acquired (→ the
-                    # defer above) or the model is idle (load proceeds). The short
-                    # grace (vs the 3s enforcer grace) avoids holding the load off for
-                    # seconds after the chat finished — which flooded the log and
-                    # tripped get_engine's excessive-loop guard.
-                    last_activity = max(e.last_access, e.last_release)
-                    remaining = last_activity + _EXCLUSIVE_DEFER_GRACE_SEC - now
-                    if last_activity > 0 and remaining > 0:
+                    # active_uses==0 but accessed within the SHORT defer-grace: a request
+                    # is mid get_engine→acquire_engine (the active_uses=0 dip). Loading a
+                    # non-pinned model into that window coexists it with the (e.g. 44GB)
+                    # exclusive model → OOM (the 2026-06-05 stress kill: Embedding-4B
+                    # loaded on the 35B while two chat completions were still routing).
+                    # Wait it out with a SINGLE sleep of the remaining grace (not a 50ms
+                    # poll loop), then re-check: by then the request has acquired (→ the
+                    # defer above) or the model is idle (load proceeds). The short grace
+                    # (vs the 3s enforcer grace) avoids holding the load off for seconds
+                    # after the chat finished — which flooded the log and tripped
+                    # get_engine's excessive-loop guard.
+                    remaining = e.last_access + _EXCLUSIVE_DEFER_GRACE_SEC - now
+                    if e.last_access > 0 and remaining > 0:
                         if _rate_ok:
                             entry._last_defer_log_time = now
                             logger.info(
@@ -1743,19 +1655,7 @@ class EnginePool:
         # in-flight inference transients so a load that would collide with an
         # outstanding non-streaming decode evicts/waits instead of committing
         # weights over the wall (closes the load↔inference race).
-        # §P5: ALSO count the live LLM/VLM generation transient
-        # (_scheduler_inflight_bytes — the same term _reservable_free already
-        # subtracts on the inference side). Without it, load admission was
-        # blind to a RUNNING chat generation: the 2026-06-09 round-3 stress
-        # crash admitted an Embedding-4B load to "total: 49.46GB" on a 51.8GB
-        # cap while the 35B was mid-decode — its KV/decode transient then had
-        # ~2.3GB of room, and the next scheduler step Metal-panicked. With
-        # this term the load waits (exclusive_idle / drain) and loads after.
-        while (
-            self._committed_plus_reservations()
-            + self._scheduler_inflight_bytes()
-            + required
-        ) > ceiling:
+        while self._committed_plus_reservations() + required > ceiling:
             victim_id = self._find_drain_or_evict_candidate()
             if victim_id is None:
                 # Can't evict anything. Find a draining model to wait on.
@@ -1774,14 +1674,10 @@ class EnginePool:
                         return e.unload_complete  # Wait for Metal cleanup
 
                 # Nothing draining, loading, or unloading.
-                # Try without KV headroom as a last resort (§P5: still counts
-                # the live generation transient — the headroom concession is
-                # about OUR KV estimate, never about the running chat's room).
+                # Try without KV headroom as a last resort
                 required_no_headroom = entry.estimated_size
                 if (
-                    self._committed_plus_reservations()
-                    + self._scheduler_inflight_bytes()
-                    + required_no_headroom
+                    self._committed_plus_reservations() + required_no_headroom
                     <= ceiling
                 ):
                     logger.info(
@@ -1791,43 +1687,6 @@ class EnginePool:
                         f"{format_size(ceiling - self._committed_plus_reservations())})"
                     )
                     break  # Proceed without headroom
-
-                # §P5: the live LLM/VLM generation transient is (part of) what
-                # blocks this load. It clears when the exclusive model goes
-                # idle — wait on that, then retry with the room it frees.
-                if self._scheduler_inflight_bytes() > 0:
-                    for _mid, _e in self._entries.items():
-                        if (
-                            _e.exclusive and _e.is_pinned
-                            and _e.active_uses > 0
-                            and _e.exclusive_idle is not None
-                        ):
-                            logger.info(
-                                f"Load of {entry.model_id} waiting for the "
-                                f"exclusive generation on '{_mid}' to finish "
-                                f"(live transient "
-                                f"{format_size(self._scheduler_inflight_bytes())})"
-                            )
-                            return _e.exclusive_idle
-
-                # §P2: over the ceiling ONLY because of in-flight inference
-                # transients (committed weights alone leave room) — those
-                # release in seconds. Wait for the next release pulse instead
-                # of failing the load with a permanent-style 507 for a
-                # condition that clears on its own. get_engine's wait timeout
-                # is the backstop for a wedged release.
-                if (
-                    self._inflight_reservations > 0
-                    and self._committed_memory() + required_no_headroom
-                    <= ceiling
-                ):
-                    logger.info(
-                        f"Load of {entry.model_id} waiting for "
-                        f"{format_size(self._inflight_reservations)} of "
-                        f"in-flight inference transients to release "
-                        f"(weights fit; transient pressure only)"
-                    )
-                    return self._reservation_released
 
                 # Truly stuck (all pinned)
                 raise ModelTooLargeError(
@@ -1885,17 +1744,9 @@ class EnginePool:
             # = max(active, phys) may already include a *materialized*
             # transient, so this can double-count — deliberately conservative
             # (errs toward evicting a racing load, never toward OOM).
-            # §P5: also add the live LLM/VLM generation transient — the
-            # NOT-yet-materialized KV/decode growth of a running chat.
-            # current_active sees only what has materialized so far; the
-            # round-3 stress crash admitted a load with the 35B mid-decode
-            # and its next steps Metal-panicked into the room the load took.
-            # Double-counting the materialized part is the same deliberate
-            # conservatism as the reservation term above.
             projected = (
                 current_active + entry.estimated_size
                 + self._inflight_reservations
-                + self._scheduler_inflight_bytes()
             )
             if projected <= enforcer.get_final_ceiling():
                 return None
@@ -1948,13 +1799,11 @@ class EnginePool:
             # All cleanup done. Re-check actual Metal memory — Metal's
             # allocator may not have reclaimed pages even after clear_cache.
             current_active = max(mx.get_active_memory(), get_phys_footprint())
-            # Reservation-aware (§3b) + §P5 scheduler term: same conservative
-            # sum as the initial projection above so both reads agree under a
-            # live decode/generation.
+            # Reservation-aware (§3b): same conservative term as the initial
+            # projection above so both reads agree under a live decode.
             projected = (
                 current_active + entry.estimated_size
                 + self._inflight_reservations
-                + self._scheduler_inflight_bytes()
             )
             if projected <= enforcer.get_final_ceiling():
                 logger.info(
@@ -2007,24 +1856,6 @@ class EnginePool:
                     f"reclaimed during load. Proceeding cautiously."
                 )
                 return None
-
-            # §P2: the projection includes in-flight inference transients
-            # (and may double-count a materialized one). If removing them
-            # brings the load within the cautious-proceed bound, they release
-            # in seconds — wait for the next release pulse instead of a
-            # permanent-style 507.
-            if (
-                self._inflight_reservations > 0
-                and projected - self._inflight_reservations
-                <= enforcer.get_final_ceiling() + headroom
-            ):
-                logger.info(
-                    f"Load of {entry.model_id} waiting for "
-                    f"{format_size(self._inflight_reservations)} of in-flight "
-                    f"inference transients to release (projected "
-                    f"{format_size(projected)} fits without them)"
-                )
-                return self._reservation_released
 
             # Truly cannot fit — even with cleanup done, Metal retains too
             # much memory for the new model to load safely.
@@ -2327,19 +2158,8 @@ class EnginePool:
         / ``_unload_engine`` / ``_start_drain`` machinery.
 
         Strict no-op (no lock, no state) when there is no Metal cap
-        (``_wall_budget() == 0``), the op declares no transient
-        (``est_bytes <= 0``) — §5 — or the transient is SMALL
-        (``est_bytes <= _small_transient_threshold()``): absorbing small
-        unaccounted transients is the inference MARGIN's designed job, and
-        reserving them is actively harmful. With a large pinned model
-        resident, every op is "over budget" by definition, so reserving a
-        0.3–0.6 GiB forward turned each one into an admission event — victim
-        evictions (``evict_for_inference``), reloads whose mlx load
-        temporaries spike ~2× the model size (#429), and synchronized
-        wake-ups at release boundaries. The 2026-06-09 stress campaign
-        crashed four ways on that churn while the un-reserved system passed
-        16/16 at the same wall: the §3d goal is to stop TWO BIG transients
-        stacking, not to meter noise the margin already covers.
+        (``_wall_budget() == 0``) or the op declares no transient
+        (``est_bytes <= 0``) — §5.
 
         Args:
             model_id: The model whose engine is performing the op. Never
@@ -2353,7 +2173,11 @@ class EnginePool:
         """
         budget = self._wall_budget()
         if est_bytes <= self._small_transient_threshold() or budget <= 0:
-            # Non-Apple / no cap / no estimate: strict no-op (§5).
+            # Strict no-op (§5): non-Apple / no cap / no estimate — or a SMALL
+            # transient the inference margin is designed to absorb (≤ margin/4,
+            # ≈1 GiB on a 64 GB Mac). Forward encoders (embedding ≈0.6 GiB,
+            # ASR/STS ≈0.3 GiB) run unaccounted exactly like the system the
+            # stress suite was validated on; only TTS-class transients reserve.
             yield
             return
         # Engines self-reserve with their model_name (a full PATH); _entries is
@@ -2362,7 +2186,6 @@ class EnginePool:
         # they silently no-op and the op can wait on its OWN drain (2026-06-02).
         model_id = self._resolve_reservation_key(model_id)
         reserved = False
-        contended = False  # §P6: this admit ran over budget
         try:
             while True:
                 async with self._tracked_lock("reserve_inference"):
@@ -2372,78 +2195,37 @@ class EnginePool:
                         reserved = True
                         break
                     victim = self._pick_inference_victim(model_id)  # pinned-/self-safe
-                    if victim is not None and self._victim_busy(victim):
-                        # §P3: deterministic drain DIRECTION for busy victims.
-                        # Two concurrent over-budget ops on different busy
-                        # models used to pick EACH OTHER, start mutual drains,
-                        # and park on each other's drain_complete — neither
-                        # drain can finish while both ops hold their leases (a
-                        # 300s standoff that ends with BOTH decoding over the
-                        # wall). Only the op whose pool key sorts smaller may
-                        # drain a busy victim; the other falls through to the
-                        # wait/yield paths below.
-                        if model_id < victim:
+                    if victim is not None:
+                        if self._victim_busy(victim):
                             self._start_drain(victim)
                             ev = self._entries[victim].drain_complete
                         else:
-                            victim = None  # disallowed direction — no drain
-                    elif victim is not None:
-                        # Phase-1 unload: flips engine=None + schedules the
-                        # DEFERRED cleanup; weights stay counted until the
-                        # unload_complete event fires (so we await it below,
-                        # outside the lock, before re-checking — we do NOT
-                        # admit best-effort while the victim is still
-                        # committed). Mirrors _prepare_memory_for.
-                        await self._unload_engine(
-                            victim, reason="evict_for_inference"
-                        )
-                        ev = self._entries[victim].unload_complete
-                    if victim is None:
-                        # Nothing evictable in OUR power (pinned + self only,
-                        # or a busy victim in the disallowed §P3 direction).
-                        # Wait on an INDEPENDENT reclaim already underway if
-                        # one exists (excludes self, so it can never wait on
-                        # us — cycle-free even while our own model drains).
+                            # Phase-1 unload: flips engine=None + schedules the
+                            # DEFERRED cleanup; weights stay counted until the
+                            # unload_complete event fires (so we await it below,
+                            # outside the lock, before re-checking — we do NOT
+                            # admit best-effort while the victim is still
+                            # committed). Mirrors _prepare_memory_for.
+                            await self._unload_engine(
+                                victim, reason="evict_for_inference"
+                            )
+                            ev = self._entries[victim].unload_complete
+                    else:
                         ev = self._pending_reclaim_event(model_id)
                         if ev is None:
-                            # CONTENDED ADMIT, margin-bounded (§P2/§P3+). The
-                            # wall budget already excludes the inference
-                            # margin, so over-budget ops may dip INTO that
-                            # margin — never past the raw cap: admit while the
-                            # TOTAL outstanding transients stay within
-                            # _overshoot_allowance() (small forwards keep
-                            # interleaving under over-commit; a SECOND
-                            # TTS-sized transient parks — two stacked is the
-                            # 2-TTS Metal panic, re-confirmed 2026-06-09 when
-                            # an evict_for_memory drain made BOTH queued TTS
-                            # ops yield within 20ms). inflight==0 always
-                            # admits (SOLO overshoot — with nothing running
-                            # there is no pulse to wait for, and one bounded
-                            # overshoot is the old-world behavior; also what
-                            # unblocks a drain waiting on OUR lease). The
-                            # waiters park on the release pulse: reservation
-                            # holders are by construction RUNNING, never
-                            # parked, so a pulse always comes — no deadlock,
-                            # and the winner's drain completes as the chain's
-                            # leases drop one by one.
-                            if (
-                                self._inflight_reservations == 0
-                                or self._inflight_reservations + est_bytes
-                                <= self._overshoot_allowance()
-                            ):
-                                self._inflight_reservations += est_bytes
-                                reserved = True
-                                contended = True
-                                self._note_contended_admit()  # §P6 corrector
-                                logger.warning(
-                                    "reserve_inference: %s over budget, "
-                                    "nothing reclaimable — contended admit "
-                                    "within the margin (outstanding %s)",
-                                    model_id,
-                                    format_size(self._inflight_reservations),
-                                )
-                                break
-                            ev = self._reservation_released
+                            # Only pinned models + self remain and nothing is
+                            # freeing: last-resort best-effort. Log loudly; the
+                            # config's single op + pinned weights already
+                            # exceed the wall (a model too large to serve
+                            # safely). Never reached on an evictable config.
+                            self._inflight_reservations += est_bytes
+                            reserved = True
+                            logger.warning(
+                                "reserve_inference: %s over budget, nothing "
+                                "reclaimable; best-effort (Metal may OOM)",
+                                model_id,
+                            )
+                            break
                 # ---- outside the lock: await the reclaim, then re-loop ----
                 # We only ever wait on ANOTHER model's reclaim — the victim we
                 # just evicted, or a reclaim already underway. We NEVER wait on
@@ -2464,8 +2246,6 @@ class EnginePool:
                     async with self._tracked_lock("reserve_inference"):
                         self._inflight_reservations += est_bytes
                         reserved = True
-                        contended = True
-                        self._note_contended_admit()  # §P6 corrector
                     break
                 # Re-acquire, recompute _reservable_free: the victim may now be
                 # fully UNLOADED (weights dropped from _committed_memory).
@@ -2478,24 +2258,12 @@ class EnginePool:
                 # acquire, and _tracked_lock's 60s acquire timeout raises
                 # EnginePoolError — either skips the decrement and leaks a
                 # multi-GB reservation forever (no reconciliation exists).
-                # All mutators run on the event loop, so plain int
-                # arithmetic between awaits is atomic; the scheduler's
-                # cross-thread reader was always a lock-free GIL-atomic load.
+                # All mutators run on the event loop, so plain int arithmetic
+                # between awaits is atomic; the scheduler's cross-thread
+                # reader was always a lock-free GIL-atomic load.
                 self._inflight_reservations = max(
                     0, self._inflight_reservations - est_bytes
                 )
-                if contended:
-                    # §P6: the corrector loop exits on its own once this hits
-                    # 0 (or the budget fits again). Plain int — same lock-free
-                    # rationale as the decrement above.
-                    self._contended_admits = max(0, self._contended_admits - 1)
-                # §P2 release pulse: wake waiters parked on "a transient will
-                # clear in seconds". Swap-then-set (all sync — still safe in
-                # this lock-free finally): waiters that grabbed the OLD event
-                # wake now; later waiters grab the fresh one.
-                released_pulse = self._reservation_released
-                self._reservation_released = asyncio.Event()
-                released_pulse.set()
 
     def is_engine_actively_held(self, entry: EngineEntry) -> bool:
         """Strict check: handler currently holds a lease OR scheduler is running.
@@ -3010,10 +2778,6 @@ class EnginePool:
         starting while we're tearing down.  This is acceptable because
         shutdown is a terminal operation — no new requests should arrive.
         """
-        # §P6: stop the budget corrector first (it takes the same lock).
-        task = self._budget_corrector_task
-        if task is not None and not task.done():
-            task.cancel()
         async with self._tracked_lock("shutdown"):
             for model_id in list(self._entries.keys()):
                 entry = self._entries.get(model_id)
