@@ -710,7 +710,7 @@ class TestDrainingSelfNoDeadlock:
         ran = {"v": False}
 
         async def _op():
-            async with pool.reserve_inference("m1", 1 * GiB):
+            async with pool.reserve_inference("m1", 2 * GiB):
                 ran["v"] = True
 
         # Must complete promptly (guard reserves-and-runs); a regression blocks
@@ -732,7 +732,7 @@ class TestDrainingSelfNoDeadlock:
         ran = {"v": False}
 
         async def _op():
-            async with pool.reserve_inference("m1", 1 * GiB):
+            async with pool.reserve_inference("m1", 2 * GiB):
                 ran["v"] = True
 
         await asyncio.wait_for(_op(), timeout=2.0)
@@ -773,7 +773,7 @@ class TestDrainingSelfNoDeadlock:
         ran = {"v": False}
 
         async def _op():
-            async with pool.reserve_inference("/fake/m1", 1 * GiB):  # full PATH
+            async with pool.reserve_inference("/fake/m1", 2 * GiB):  # full PATH
                 ran["v"] = True
 
         await asyncio.wait_for(_op(), timeout=2.0)
@@ -798,7 +798,7 @@ class TestDrainingSelfNoDeadlock:
         # committed 38+6+4 = 48 > budget 46 → must evict 'embed', not bypass.
 
         async def _op():
-            async with pool.reserve_inference("/fake/tts", 1 * GiB):  # full PATH
+            async with pool.reserve_inference("/fake/tts", 2 * GiB):  # full PATH (>threshold)
                 return "ran"
 
         task = asyncio.create_task(_op())
@@ -840,7 +840,7 @@ class TestDrainingSelfNoDeadlock:
         # committed 38+8+4 = 50 > 46 → over budget, but 'embed' is still LOADING.
 
         async def _op():
-            async with pool.reserve_inference("/fake/tts", 1 * GiB):
+            async with pool.reserve_inference("/fake/tts", 2 * GiB):  # > threshold
                 return "ran"
 
         task = asyncio.create_task(_op())
@@ -925,30 +925,52 @@ class TestReservationReleaseWait:
         assert pool._inflight_reservations == 0
 
     @pytest.mark.asyncio
-    async def test_small_forwards_interleave_within_the_margin(self, monkeypatch):
-        """Within the allowance, contended admits still INTERLEAVE — small
-        encoder forwards (≈0.5 GiB) must not serialize one-at-a-time under
-        over-commit (the workload this box ran un-reserved for months)."""
+    async def test_small_forwards_bypass_the_reservation_lane(self, monkeypatch):
+        """Margin-absorbed transients (est ≤ margin/4) run UNACCOUNTED — no
+        reservation, no eviction, no waiting. Reserving them is what turned
+        the passing system into the 2026-06-09 churn crashes: with a big
+        pinned model resident every op is over budget, so each small forward
+        became an eviction + reload + 2× load-transient spike."""
         pool = _make_pool()
-        _patch_cap(monkeypatch, 50 * GiB)  # budget 46, margin (allowance) 4
+        _patch_cap(monkeypatch, 50 * GiB)  # margin 4 → threshold 1 GiB
+        _add_entry(pool, "pinned-big", size=42 * GiB, is_pinned=True)
+        _add_entry(pool, "embed", size=4 * GiB, busy=True)  # self
+        # committed 46 — zero weight-free room; the bypass must not care.
+        pool._unload_engine = AsyncMock(
+            side_effect=AssertionError("small forwards must never evict")
+        )
+        pool._start_drain = MagicMock(
+            side_effect=AssertionError("small forwards must never drain")
+        )
+        async with pool.reserve_inference("embed", int(0.6 * GiB)):
+            assert pool._inflight_reservations == 0  # unaccounted by design
+        assert pool._inflight_reservations == 0
+
+    @pytest.mark.asyncio
+    async def test_above_threshold_ops_interleave_within_the_margin(self, monkeypatch):
+        """Within the allowance, RESERVED contended admits still INTERLEAVE —
+        bounded stacking, not one-at-a-time serialization."""
+        pool = _make_pool()
+        _patch_cap(monkeypatch, 50 * GiB)  # budget 46, allowance 4, threshold 1
         _add_entry(pool, "pinned-big", size=42 * GiB, is_pinned=True)
         _add_entry(pool, "embed", size=4 * GiB, busy=True)  # self
         # committed 46 — zero weight-free room: every op is contended.
         gate = asyncio.Event()
         peak = {"v": 0}
+        est = int(1.5 * GiB)  # above the 1 GiB threshold → reserved lane
 
         async def _op():
-            async with pool.reserve_inference("embed", 1 * GiB):
+            async with pool.reserve_inference("embed", est):
                 peak["v"] = max(peak["v"], pool._inflight_reservations)
                 await gate.wait()
 
-        tasks = [asyncio.create_task(_op()) for _ in range(3)]
+        tasks = [asyncio.create_task(_op()) for _ in range(2)]
         await asyncio.sleep(0.05)
-        # All three fit the 4 GiB allowance together (1+1+1).
-        assert pool._inflight_reservations == 3 * GiB
+        # Both fit the 4 GiB allowance together (1.5 + 1.5 = 3).
+        assert pool._inflight_reservations == 2 * est
         gate.set()
         await asyncio.gather(*tasks)
-        assert peak["v"] == 3 * GiB
+        assert peak["v"] == 2 * est
         assert pool._inflight_reservations == 0
 
     @pytest.mark.asyncio
@@ -981,7 +1003,7 @@ class TestReservationReleaseWait:
         _patch_cap(monkeypatch, 50 * GiB)
         _add_entry(pool, "m", size=1 * GiB)
         before = pool._reservation_released
-        async with pool.reserve_inference("m", 1 * GiB):
+        async with pool.reserve_inference("m", 2 * GiB):  # > small-transient threshold
             pass
         after = pool._reservation_released
         assert before.is_set() and not after.is_set()

@@ -370,6 +370,23 @@ class EnginePool:
             return 0
         return max(0, cap - self._inference_margin_bytes(cap))
 
+    def _small_transient_threshold(self) -> int:
+        """Transients at or below this run UNACCOUNTED (margin-absorbed).
+
+        A quarter of the inference margin (≈1 GiB on a 64 GB Mac): the margin
+        exists to absorb estimate drift + small unaccounted transients, so the
+        single-forward encoders (embedding ≈0.6 GiB, ASR/STS ≈0.3 GiB) bypass
+        the reservation lane entirely — exactly the economics of the system
+        that passed the stress suite — while TTS-class transients (≥2.4 GiB)
+        still reserve, wait, and evict through the full §P2/§P3 lane. 0 when
+        there is no Metal cap (everything already no-ops).
+        """
+        from .process_memory_enforcer import get_effective_metal_cap_bytes
+        cap = get_effective_metal_cap_bytes()
+        if cap <= 0:
+            return 0
+        return self._inference_margin_bytes(cap) // 4
+
     def _overshoot_allowance(self) -> int:
         """Sanctioned TOTAL of outstanding transients under contention (§P3+).
 
@@ -2255,8 +2272,19 @@ class EnginePool:
         / ``_unload_engine`` / ``_start_drain`` machinery.
 
         Strict no-op (no lock, no state) when there is no Metal cap
-        (``_wall_budget() == 0``) or the op declares no transient
-        (``est_bytes <= 0``) — §5.
+        (``_wall_budget() == 0``), the op declares no transient
+        (``est_bytes <= 0``) — §5 — or the transient is SMALL
+        (``est_bytes <= _small_transient_threshold()``): absorbing small
+        unaccounted transients is the inference MARGIN's designed job, and
+        reserving them is actively harmful. With a large pinned model
+        resident, every op is "over budget" by definition, so reserving a
+        0.3–0.6 GiB forward turned each one into an admission event — victim
+        evictions (``evict_for_inference``), reloads whose mlx load
+        temporaries spike ~2× the model size (#429), and synchronized
+        wake-ups at release boundaries. The 2026-06-09 stress campaign
+        crashed four ways on that churn while the un-reserved system passed
+        16/16 at the same wall: the §3d goal is to stop TWO BIG transients
+        stacking, not to meter noise the margin already covers.
 
         Args:
             model_id: The model whose engine is performing the op. Never
@@ -2269,7 +2297,7 @@ class EnginePool:
         a reservation and wedge admission.
         """
         budget = self._wall_budget()
-        if est_bytes <= 0 or budget <= 0:
+        if est_bytes <= self._small_transient_threshold() or budget <= 0:
             # Non-Apple / no cap / no estimate: strict no-op (§5).
             yield
             return

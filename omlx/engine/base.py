@@ -374,7 +374,14 @@ class BaseNonStreamingEngine(ABC):
             return
         if est_bytes is None:
             est_bytes = self.estimate_working_set_bytes()
-        if est_bytes > 0:
+        # Margin-absorbed SMALL transients bypass the reservation lane inside
+        # reserve_inference (EnginePool._small_transient_threshold) — so they
+        # must also skip the §P4 queue ping: parking an embedding forward
+        # behind a 35B generation's scheduler steps would be pure added
+        # latency for an admission decision that is a no-op anyway.
+        _threshold_fn = getattr(pool, "_small_transient_threshold", None)
+        _reserve_floor = _threshold_fn() if callable(_threshold_fn) else 0
+        if est_bytes > max(0, _reserve_floor):
             # §P4: reserve at QUEUE-HEAD, not at method entry. The MLX
             # executor is single-threaded; under a burst, K queued ops each
             # used to hold their full reservation through the queue WAIT —
